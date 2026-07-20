@@ -1,0 +1,7 @@
+.*
+!.gitattributes
+!.gitignore
+*.py[cod]
+__pycache__/
+.smart-env/
+log/
