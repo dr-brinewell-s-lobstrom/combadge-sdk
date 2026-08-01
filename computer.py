@@ -43,10 +43,10 @@ terminal session on this machine by voice, is built entirely out of ACK
 commands; see VIBE_COMMANDS below and sdk/VIBE.md.
 
 Two recognizers, not one.  The small model matches commands on every tap.
-Pass a large model as well and two DICTATION TRIGGERS become available —
-`captain's log ...` and, while Vibe Control holds a window, `computer
-transcribe ...`.  A trigger switches the recognizer mid-utterance and
-captures free-form speech until you stop talking.  See detect_trigger() and
+Pass a large model as well and DICTATION TRIGGERS become available —
+`captain's log ...` always, plus `computer transcribe ...` while Vibe Control
+holds a window.  A trigger switches the recognizer mid-utterance and captures
+free-form speech until you stop talking.  See detect_trigger() and
 handle_large_vocab_phase() below, and §11 of sdk/README.md.
 
 TTS (text-to-speech) is handled automatically per platform:
@@ -315,17 +315,15 @@ COMMANDS = {
 # ---------------------------------------------------------------------------
 # VIBE_COMMANDS — the Vibe Control vocabulary (sdk/VIBE.md).
 #
-# EXCLUSIVE REPLACEMENT, not an overlay: while Vibe Control is active this
-# dict replaces COMMANDS entirely.  That is the single most important
-# structural choice in the feature, and it is a safety property as much as an
-# accuracy one — a mode that types into a terminal should be able to do almost
-# nothing else.  Recognition also gets sharper, because there are ~15 live
-# phrases instead of the whole vocabulary.
+# AN OVERLAY, not a replacement: while Vibe Control is active these phrases
+# are added to COMMANDS, and everything already there keeps working.  See
+# active_commands() for the merge and for why this SDK diverges from the full
+# system, which suspends its normal vocabulary outright while the mode is up.
 #
-# Hails are NOT suppressed: they are matched before COMMANDS in
+# Hails are likewise not suppressed: they are matched before any command in
 # handle_connection(), so an incoming call still reaches its badge whatever
 # mode this desk is in.  A comms system that goes deaf in a submode is a
-# broken comms system.  Deliberate; do not "fix" the inconsistency.
+# broken comms system.
 #
 # Every entry returns ACK (chirp, no speech) except activation and
 # deactivation, which speak — activation because its reply is DYNAMIC (it
@@ -341,8 +339,9 @@ COMMANDS = {
 # phrase in an earlier version of this vocabulary had to be renamed because it
 # was misheard as "computer proceed" often enough to matter — both carry the
 # same stressed "pro-" onset, and a constrained recognizer still has to pick
-# one.  When adding a phrase here, check it against the OTHER PHRASES IN THIS
-# DICT: while the mode is active, those are the only ones still loaded.
+# one.  When adding a phrase here, check it against BOTH dicts — these phrases
+# and COMMANDS are live simultaneously, so a collision with either one is a
+# collision you will hear.
 # ---------------------------------------------------------------------------
 
 def _vibe(action, *args):
@@ -723,12 +722,28 @@ def wav_from_pcm(pcm_bytes):
 def active_commands():
     """The vocabulary currently in force.
 
-    Vibe Control REPLACES the vocabulary rather than adding to it: while it is
-    active, COMMANDS is entirely suspended.  See VIBE_COMMANDS for why that is
-    the right shape, and sdk/VIBE.md for the whole design.
+    Vibe Control ADDS its phrases to the normal vocabulary rather than
+    replacing it: while the mode is latched everything in COMMANDS still
+    works, and VIBE_COMMANDS is available on top.
+
+    THIS IS A DELIBERATE DIVERGENCE from the full system, which suspends its
+    normal vocabulary entirely while the mode is up.  That gate is worth
+    having *there* — that system has a large vocabulary, and narrowing it to
+    ~15 phrases both sharpens recognition and stops a stray command firing
+    while you are concentrating on a terminal.  Neither argument survives the
+    trip here: this vocabulary is a handful of phrases to begin with, so there
+    is little to sharpen and little to fire by accident, and suspending it
+    only means you cannot ask the time without dropping the latch.
+    (Captain's call, 2026-08-01.)
+
+    VIBE_COMMANDS is merged FIRST so its phrases win on a tie — while the mode
+    is latched, the mode's meaning of a phrase is the operative one.  Rebuilt
+    per call rather than cached because main() adds entries to COMMANDS at
+    startup; a snapshot taken at import time would miss them.  It is a
+    ~25-entry dict, so this is not a cost worth engineering around.
     """
     if vibekeys is not None and vibekeys.is_active():
-        return VIBE_COMMANDS
+        return {**VIBE_COMMANDS, **COMMANDS}
     return COMMANDS
 
 
@@ -778,21 +793,16 @@ def respond(conn, response, mac):
 # So triggers are checked ahead of match_command() in the recognition loop,
 # and their handler takes over the connection rather than returning a string.
 #
-# WHY EACH TRIGGER IS GATED ON THE VIBE MODE.  The two are mutually exclusive
-# by design, not by accident:
+# AVAILABILITY.  `captain's log` is live in both states.  `computer
+# transcribe` needs Vibe Control latched, because it pastes into the latched
+# window — with no latch there is nowhere for the text to go.
 #
-#   `computer transcribe` pastes into the terminal window Vibe Control has
-#   latched onto.  With no latch there is nowhere for the text to go, so it is
-#   offered ONLY while the mode is active.
-#
-#   `captain's log` is a normal-vocabulary feature, and Vibe Control's central
-#   rule is that activating it suspends the normal vocabulary entirely (see
-#   VIBE_COMMANDS).  Dictation is the one exception carved out of that rule,
-#   and the exception is deliberately narrow: the dictation you can reach
-#   while driving a terminal is the one that types INTO the terminal.
-#
-# Net effect: exactly one dictation trigger is live at any moment, and which
-# one depends only on whether Vibe Control is latched.
+# That is a REAL DEPENDENCY, and it is the only reason either trigger is ever
+# unavailable.  An earlier version also suspended `captain's log` during Vibe
+# Control, mirroring the full system, where activating the mode replaces the
+# whole vocabulary.  That gating was removed: this SDK merges the vocabularies
+# instead (see active_commands()), and a log entry writes a file and touches
+# no window, so nothing about driving a terminal makes it unsafe to reach.
 # ---------------------------------------------------------------------------
 
 # Vosk's small model renders the possessive inconsistently depending on how
@@ -814,17 +824,23 @@ def detect_trigger(text):
     would drop real commands.  Consistent with match_command(), which is
     substring-matched for the same reason.
     """
-    vibe_on = vibekeys is not None and vibekeys.is_active()
+    if large_model is None:
+        return None
 
-    if vibe_on:
-        if large_model is not None and TRANSCRIBE_PHRASE in text:
-            return ("transcribe", TRANSCRIBE_PHRASE)
-        return None   # every other trigger is suspended with the vocabulary
+    # Transcribe is checked first and is available ONLY while the mode is
+    # latched — it pastes into the latched window, so with no latch there is
+    # nowhere for the text to go.  That is a genuine dependency, unlike the
+    # suspension of captain's log, which was only ever a vocabulary rule.
+    if vibekeys is not None and vibekeys.is_active() and TRANSCRIBE_PHRASE in text:
+        return ("transcribe", TRANSCRIBE_PHRASE)
 
-    if large_model is not None:
-        for phrase in CAPTAINSLOG_PHRASES:
-            if phrase in text:
-                return ("captains_log", phrase)
+    # Captain's log is available in BOTH states — see active_commands() for
+    # why this SDK does not suspend the normal vocabulary during Vibe Control.
+    # It writes a file and touches no window, so nothing about driving a
+    # terminal makes it unsafe to reach.
+    for phrase in CAPTAINSLOG_PHRASES:
+        if phrase in text:
+            return ("captains_log", phrase)
     return None
 
 
@@ -2046,28 +2062,22 @@ def main():
     if large_model is None:
         print(f"[computer] dictation: OFF (pass a large model dir as the 2nd argument)")
     else:
-        # Which trigger is live depends on the Vibe Control latch, so print
-        # both with that condition attached rather than a flat list that would
-        # be wrong half the time.
         print(f"[computer] dictation: \"{CAPTAINSLOG_PHRASES[0]} ...\" -> {CAPTAINSLOG_FILE}")
         print(f"[computer]   playback: \"{REPLAY_LOG_PHRASE}\"")
         if vibekeys is not None:
-            print(f"[computer]   while vibe control is active, instead: "
-                  f"\"{TRANSCRIBE_PHRASE} ...\" -> pasted into the latched window")
+            # The one phrase whose availability really is conditional: it
+            # pastes into the latched window, so it needs a latch.
+            print(f"[computer]   \"{TRANSCRIBE_PHRASE} ...\" -> latched window "
+                  f"(vibe control only)")
     if vibekeys is not None:
-        # Named explicitly at startup because activating it SUSPENDS every
-        # command printed above — a mode that silently swaps the vocabulary
-        # should announce that it exists.
-        #
         # The ACTIVATION phrase leads this block even though it belongs to
         # COMMANDS and has therefore already been printed above.  This is the
         # line you read when you want the mode, and a listing of a mode's
         # vocabulary that omits the way IN to it sends you hunting through the
-        # general command list for it.  Repeating one phrase is cheaper than
-        # that.  The rest are live only while the mode is active, hence the
-        # "then:".
+        # general command list for it.  Repeating one phrase is cheaper.
         print(f"[computer] vibe control available: {VIBE_ACTIVATE}")
-        print(f"[computer]   then: {' | '.join(VIBE_COMMANDS)} (see sdk/VIBE.md)")
+        print(f"[computer]   adds: {' | '.join(VIBE_COMMANDS)} (see sdk/VIBE.md)")
+        print(f"[computer]   the commands above stay live while it is latched")
 
     # Server console: `badges` and `hail <mac> [text]` — see console_loop().
     threading.Thread(target=console_loop, daemon=True).start()

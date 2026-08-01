@@ -72,7 +72,8 @@ Spoken in the normal vocabulary, to enter the mode:
 | `computer activate vibe control` | Run the gate, latch, and **speak what it latched onto** |
 | `computer wake up` | Shift + a net-zero mouse nudge — recover a blanked display |
 
-Spoken while the mode is active — **these are the only commands recognized**:
+Spoken while the mode is active — these are **added to** the normal
+vocabulary, which stays live (see [Modal takeover](#modal-takeover)):
 
 | Phrase | Key(s) |
 |---|---|
@@ -105,27 +106,39 @@ system that goes deaf in a submode is a broken comms system. This is deliberate
 
 ## Modal takeover {#modal-takeover}
 
-While Vibe Control is active, `COMMANDS` is **replaced**, not extended:
+While Vibe Control is active, `VIBE_COMMANDS` is **added to** `COMMANDS`.
+Everything you could say before, you can still say:
 
 ```python
 def active_commands():
     if vibekeys is not None and vibekeys.is_active():
-        return VIBE_COMMANDS
+        return {**VIBE_COMMANDS, **COMMANDS}   # vibe phrases win ties
     return COMMANDS
 ```
 
-That single branch is the most important structural choice in the feature, and
-it buys two things at once:
+**This is a deliberate divergence from the system this was distilled from,**
+which replaces the vocabulary outright while the mode is up. That version of
+this branch bought two things:
 
-- **Accuracy.** A handful of live phrases instead of your whole vocabulary. In
-  a larger deployment this is the difference between reliable and infuriating.
-- **Safety.** A mode that types into a terminal should be able to do almost
-  nothing *else*. The takeover is a containment boundary, not just tidiness.
+- **Accuracy.** A handful of live phrases instead of a whole vocabulary. In a
+  large deployment that is the difference between reliable and infuriating.
+- **Containment.** A mode that types into a terminal being able to do almost
+  nothing *else*.
 
-`computer wake up` is the one phrase deliberately present in **both**
-dictionaries, so a blanked screen can be recovered whether or not the mode is
-up. Duplication is correct there rather than a smell: with the vocabulary fully
-swapped, a single copy in either dict would be unreachable from the other mode.
+Neither argument survives the trip into an SDK whose vocabulary is four
+phrases long. There is little to sharpen, little to fire by accident, and the
+only thing suspension actually achieved here was preventing you from asking
+the time — or recording a log entry — without dropping the latch and re-running
+the single-instance gate to get it back. If you grow this vocabulary to the
+point where the accuracy argument bites, the one-line change back is above.
+
+Two consequences worth knowing:
+
+- **Check new phrases against both dicts.** They are live simultaneously, so a
+  collision with either is a collision you will hear.
+- `computer wake up` appears in both dictionaries. Harmless — the merge keeps
+  one entry and both map to the same action — and it stays duplicated so the
+  phrase is still reachable if the vocabularies are ever separated again.
 
 ## The single-instance gate {#the-single-instance-gate}
 
@@ -386,10 +399,10 @@ unattended operation: Vibe Control adds **reach**, not independence. The human
 is not removed from the loop — the loop is extended across the room.
 
 The deliberate choices that keep it that way: the mode is entered and left only
-by voice; the injector is inert until armed; every injected key is logged; the
-vocabulary takeover means the desk can do almost nothing else while it is up;
-and when the target is ambiguous the system **refuses and hands the decision
-back** rather than picking one.
+by voice; the injector is inert until armed; every injected key is logged; a
+dictated prompt is never auto-submitted, so nothing runs that you have not read
+first; and when the target is ambiguous the system **refuses and hands the
+decision back** rather than picking one.
 
 **Be precise about which of those is the guarantee.** A display is an aid, not a
 safeguard — no software can force a human to read a screen, and claiming

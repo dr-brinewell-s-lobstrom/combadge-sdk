@@ -584,7 +584,7 @@ computer deactivate vibe control   → "Vibe control released."
 
 Three things about it are worth knowing before you read <VIBE.md>:
 
-- **It replaces the vocabulary rather than extending it.** While active, `COMMANDS` is entirely suspended and only the phrases above are recognized. That sharpens recognition *and* contains the mode — something that types into a terminal should be able to do almost nothing else. Hails are the deliberate exception: an incoming call still reaches the badge.
+- **It extends the vocabulary rather than replacing it.** While active, the phrases above are added to `COMMANDS` and everything already there keeps working — you can still ask the time without dropping the latch. (The full system does the opposite and suspends its normal vocabulary outright. That gate earns its keep there, where the vocabulary is large: narrowing it sharpens recognition and stops a stray command firing while you concentrate on a terminal. With a handful of phrases there is little to sharpen and little to fire by accident, so here it was only a restriction.) Hails are never suppressed either: an incoming call reaches the badge in any mode.
 - **It refuses rather than guesses.** Exactly one target session may be running at activation; zero or several and it declines out loud, with no state left behind. Sessions are **counted** by process and **targeted** by window class + title, and the two counts must agree — a title rule that has silently stopped matching fails loudly instead of latching onto the wrong window.
 - **Commands that act, chirp — they don't talk.** `computer.py` grew an `ACK` sentinel for this: return it from any command to acknowledge with the badge's short chirp instead of a synthesized sentence. A spoken reply after every keystroke would make the mode unusable, and it's the right answer for any command whose effect you can already see.
 
@@ -622,16 +622,16 @@ This is the one decision in the feature that is not a preference. Loading `vosk-
 
 Paying it once at startup is what makes the switch feel instantaneous. The cost is a slower launch and a resident ~2 GB; if you do not want either, omit the argument and the feature is simply not there.
 
-### Which trigger is live depends on Vibe Control
+### Availability
 
-Exactly one dictation trigger is available at any moment, and the latch decides which:
+| Trigger | Vibe Control inactive | Vibe Control latched | Where the text goes |
+|---|---|---|---|
+| `captain's log …` | ✅ | ✅ | appended to `captainslog.txt` |
+| `computer transcribe …` | — | ✅ | pasted into the latched window |
 
-| Vibe Control | Live trigger | Where the text goes |
-|---|---|---|
-| inactive | `captain's log …` | appended to `captainslog.txt` |
-| **active** | `computer transcribe …` | pasted into the latched window |
+`computer transcribe` needs a latch because it pastes into the window Vibe Control has latched onto — with no latch there is nowhere for the text to go. That is a real dependency, not a policy.
 
-That is not an arbitrary pairing. `computer transcribe` pastes into the window Vibe Control has latched onto — with no latch there is nowhere for the text to go. And Vibe Control's central rule (§10) is that activating it suspends the normal vocabulary entirely; dictation is the one exception carved out of that rule, and the exception is deliberately narrow: **the dictation you can reach while driving a terminal is the one that types into the terminal.**
+`captain's log` has no such dependency: it writes a file and touches no window, so it stays available in both states. (The full system suspends it during Vibe Control, as part of suspending its whole normal vocabulary — see §10 for why that trade doesn't carry over to a vocabulary this small.)
 
 `computer transcribe` **does not press Enter.** The prompt lands in the composer and sits there until you read it and say `computer proceed`. That separation is the whole safety argument for letting a voice pipeline type into a terminal — recognition *will* occasionally mishear, and the review step is what makes that a nuisance rather than an incident. It is also why this works with no display: the terminal you are dictating into is the display.
 
