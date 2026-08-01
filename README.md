@@ -32,11 +32,11 @@ While AI was obviously used for generating code - EVERY prompt was human-written
 9. [Known Gotchas](#known-gotchas)
 10. [Vibe Control — driving a terminal by voice](#vibe-control)
 
-## -1.  AI Assisted Quick Start (#ai-assisTed-quick-start)
+## <a name="ai-assisted-quick-start"></a>-1.  AI Assisted Quick Start
 
 Point your AI at this repo and `make it so`.  Note that this approach is technically a 'permissible license violation' with remediation steps described within <LICENSE.md> (in short: If you scan this with AI, you have to admit you did so, to avoid being in violation of the license, since this was made for humans. :)
 
-## 0. Quick Start {#quick-start}
+## <a name="quick-start"></a>0. Quick Start
 
 Two terminal windows are all you need. The **relay host** is the Linux machine the badge is paired to. The **server** (running `computer.py`) can be the same machine or any other machine on the same network — Linux, macOS, or Windows.
 
@@ -119,7 +119,7 @@ The three scripts in this folder (`transceiver.py`, `listener.py`, `computer.py`
 
 ---
 
-## 1. Overview {#overview}
+## <a name="overview"></a>1. Overview
 
 The TNG combadge presents itself to a Linux Bluetooth host as **two devices in one**:
 
@@ -145,7 +145,7 @@ Two processes on the relay host, one on the server:
 
 `transceiver.py` is split off from `listener.py` for one reason: connection management requires root (for `runuser` and `sg input`); audio capture and `pw-play` require the user's session bus. Splitting them lets each run with the correct privileges.
 
-## 2. Prerequisites {#prerequisites}
+## <a name="prerequisites"></a>2. Prerequisites
 
 **Hardware:**
 - Combadge (or compatible HFP/HID Bluetooth badge).
@@ -180,7 +180,7 @@ You can verify it works independently:
 espeak-ng -v en-us -w /tmp/test.wav "Acknowledged."
 ```
 
-## 3. Pairing and Connecting the Badge {#pairing-and-connecting}
+## <a name="pairing-and-connecting"></a>3. Pairing and Connecting the Badge
 
 Pair once interactively with `bluetoothctl`. Power the badge on (long-press until it chirps) and run:
 
@@ -240,7 +240,7 @@ sudo systemctl restart bluetooth
 systemctl --user restart wireplumber
 ```
 
-## 4. Minimal `transceiver.py` — Connection Manager {#transceiver-py}
+## <a name="transceiver-py"></a>4. Minimal `transceiver.py` — Connection Manager
 
 `transceiver.py` runs as **root** and does four things in a loop:
 
@@ -262,7 +262,7 @@ sudo SDK_SERVER_HOST=192.168.50.5 SDK_SERVER_PORT=1701 python3 transceiver.py
 
 See `transceiver.py` in this folder for the runnable minimal version.
 
-## 5. Minimal `listener.py` — Tap and Audio Handler {#listener-py}
+## <a name="listener-py"></a>5. Minimal `listener.py` — Tap and Audio Handler
 
 `listener.py` runs as the **logged-in user** (in the `input` group, courtesy of `transceiver.py`'s `sg input`). It does five things:
 
@@ -349,7 +349,7 @@ def ensure_hfp_profile():
 
 See `listener.py` in this folder for the runnable minimal version.
 
-## 6. Minimal `computer.py` — Receive, Recognize, Respond {#computer-py}
+## <a name="computer-py"></a>6. Minimal `computer.py` — Receive, Recognize, Respond
 
 `computer.py` listens on a TCP port (1701 by default; pick anything) and serves each connection on its own thread — multiple badges never block each other. The Vosk `Model` is shared across threads; each connection builds its own `KaldiRecognizer`. A `b'h'`+MAC connection registers as that badge's **persistent downlink** (held open with `b'k'` keepalives; the server can push `b'v'` voice frames down it at any time). A background console thread reads stdin: `badges` lists every badge seen; `hail <mac> [text]` pushes synthesized speech to a badge's downlink — unsolicited playback on that badge, `<mac>` accepting any unique substring. For each `b'1'` tap connection:
 
@@ -414,7 +414,7 @@ python3 computer.py /path/to/vosk-model-small-en-us-0.15
 
 See `computer.py` in this folder for the runnable minimal version.
 
-## 7. Badge Playback {#badge-playback}
+## <a name="badge-playback"></a>7. Badge Playback
 
 When the relay receives `b'v'`, it reads `<4-byte size><WAV>` off the socket, writes the WAV to a temp file, and plays it through the badge speaker:
 
@@ -497,7 +497,7 @@ card:    bluez_card.AA_BB_CC_DD_EE_FF         (underscores, no suffix)
 
 Yes, the source uses colons even though the sink and card use underscores. Yes, this is real and not a typo. PipeWire inherits the inconsistency from BlueZ.
 
-## 8. The Voice Command Pipeline at a Glance {#complete-loop}
+## <a name="complete-loop"></a>8. The Voice Command Pipeline at a Glance
 
 ```
    BADGE             listener.py                         computer.py
@@ -527,7 +527,7 @@ Yes, the source uses colons even though the sink and card use underscores. Yes, 
 
 End-to-end latency on a healthy adapter: ~1.5–2 s tap-to-chirp, ~300–800 ms recognition after end-of-speech, ~400 ms playback start. Most of the tap-to-chirp time is SCO link setup, not your code.
 
-## 9. Known Gotchas {#known-gotchas}
+## <a name="known-gotchas"></a>9. Known Gotchas
 
 **WirePlumber seat-monitoring on headless systems.** Covered in §3. If `bluetoothctl show` doesn't list `Handsfree Audio Gateway`, this is almost certainly the problem.
 
@@ -555,7 +555,7 @@ End-to-end latency on a healthy adapter: ~1.5–2 s tap-to-chirp, ~300–800 ms 
 
 **TCP framing is positional, not length-prefixed (mostly).** The 18-byte handshake (`b'1'` + 17-byte MAC) and the WAV stream are framed by position and the WAV header. The voice response is the only length-prefixed frame: `b'v'` then 4 BE bytes then exactly that many bytes. Don't `recv(4096)` for the size — read exactly 4, then loop on the body until you've received the full count.
 
-## 10. Vibe Control — driving a terminal by voice {#vibe-control}
+## <a name="vibe-control"></a>10. Vibe Control — driving a terminal by voice
 
 **Optional, Windows-only.** Full design in <VIBE.md>.
 
