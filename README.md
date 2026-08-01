@@ -74,10 +74,11 @@ sudo SDK_USER=$USER SDK_SERVER_HOST=192.168.x.x python3 transceiver.py
 **Launcher scripts (optional, recommended):** the two commands above are wrapped
 in one-line launchers so the full invocation isn't retyped each session:
 
-- `computer.sh` (server host) — `python computer.py ../.vosk/vosk-model-small-en-us-0.15`.
+- `computer.sh` (server host) — runs `computer.py` with the small model.
   As shipped it expects the unpacked Vosk model in a `.vosk/` directory one level
-  above this folder — edit the path to wherever yours lives. To enable dictation,
-  append the large model as a second path on that same line.
+  above this folder — edit the path to wherever yours lives. If the **large**
+  model is sitting beside it, the launcher passes that too and dictation
+  ([§11](#large-vocab)) switches itself on; if it isn't, nothing changes.
 - `transceiver.sh` (relay host) — `sudo SDK_SERVER_HOST=<server-ip-or-hostname> python transceiver.py`.
   The env var **must** be inline on the sudo command line: `sudo` resets the
   environment by default, so a prior `export SDK_SERVER_HOST=...` is silently
