@@ -5,3 +5,9 @@
 __pycache__/
 .smart-env/
 log/
+
+# Recorded captain's log entries (README §11).  Personal dictation, written
+# beside the code by default — this keeps a stray `git add -A` from
+# publishing it.  Point SDK_CAPTAINSLOG_FILE outside the repo if you would
+# rather it never land here at all.
+captainslog.txt
