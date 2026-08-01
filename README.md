@@ -30,6 +30,7 @@ While AI was obviously used for generating code - EVERY prompt was human-written
 7. [Badge Playback](#badge-playback)
 8. [The Voice Command Pipeline at a Glance](#complete-loop)
 9. [Known Gotchas](#known-gotchas)
+10. [Vibe Control — driving a terminal by voice](#vibe-control)
 
 ## -1.  AI Assisted Quick Start (#ai-assisTed-quick-start)
 
@@ -113,6 +114,8 @@ Edit the `COMMANDS` dict in `computer.py` to add your own phrases and responses.
 ---
 
 The three scripts in this folder (`transceiver.py`, `listener.py`, `computer.py`) are deliberately minimal and heavily commented. They carry only the voice command pipeline (badge tap > command execution > voice response to badge) and the intercom — no user identity, no command-file dispatch, no dictation modes — so every piece that remains is essential and understandable. Read a section here for context, then read the corresponding file for the code. They are a foundation to build on, not a framework to configure.
+
+(`vibewin.py` and `vibekeys.py` are a fourth, **optional** piece — Vibe Control, §10. They are Windows-only, `computer.py` imports them defensively, and nothing else depends on them.)
 
 ---
 
@@ -552,6 +555,30 @@ End-to-end latency on a healthy adapter: ~1.5–2 s tap-to-chirp, ~300–800 ms 
 
 **TCP framing is positional, not length-prefixed (mostly).** The 18-byte handshake (`b'1'` + 17-byte MAC) and the WAV stream are framed by position and the WAV header. The voice response is the only length-prefixed frame: `b'v'` then 4 BE bytes then exactly that many bytes. Don't `recv(4096)` for the size — read exactly 4, then loop on the body until you've received the full count.
 
-## 10.  More Info
+## 10. Vibe Control — driving a terminal by voice {#vibe-control}
+
+**Optional, Windows-only.** Full design in <VIBE.md>.
+
+Vibe Control turns the badge into a remote control for a terminal session running on the **server** machine. Tap, say *"computer proceed"*, and an Enter lands in the window it is latched to. The reference target is a Claude Code session, so you can supervise a long-running interactive program from across the room — screen cast to a television, no keyboard in reach. It does not know or care what is running there; it sends Enter, Escape, Right Arrow, digits, and pasted text at whatever window the target rule matches.
+
+```
+computer activate vibe control     → "Vibe control latched to sunshine. Ready."
+computer proceed                   → Enter
+computer continue / carry on       → Right Arrow, then Enter (accept the suggestion, submit)
+computer cancel                    → Escape, twice
+computer option one … nine         → 1 … 9
+computer wake up                   → recover a blanked display
+computer deactivate vibe control   → "Vibe control released."
+```
+
+Three things about it are worth knowing before you read <VIBE.md>:
+
+- **It replaces the vocabulary rather than extending it.** While active, `COMMANDS` is entirely suspended and only the phrases above are recognized. That sharpens recognition *and* contains the mode — something that types into a terminal should be able to do almost nothing else. Hails are the deliberate exception: an incoming call still reaches the badge.
+- **It refuses rather than guesses.** Exactly one target session may be running at activation; zero or several and it declines out loud, with no state left behind. Sessions are **counted** by process and **targeted** by window class + title, and the two counts must agree — a title rule that has silently stopped matching fails loudly instead of latching onto the wrong window.
+- **Commands that act, chirp — they don't talk.** `computer.py` grew an `ACK` sentinel for this: return it from any command to acknowledge with the badge's short chirp instead of a synthesized sentence. A spoken reply after every keystroke would make the mode unusable, and it's the right answer for any command whose effect you can already see.
+
+On a non-Windows server the import fails, the phrases are absent, and everything else is unchanged.
+
+## 11.  More Info
 
 This SDK is the distilled foundation of a much larger system — the Terran Operating System (TOS), the author's full starship-computer environment built on this same voice command pipeline (voice-print identity, command vocabularies, dictation, an AI main computer, and more). To see where this foundation can lead, visit https://tos.md.

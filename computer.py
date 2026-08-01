@@ -36,6 +36,12 @@ Response signals back to listener.py:
     b'f'                       — no match      (no audio, badge plays NACK chirp)
     b'v' + 4-byte size + WAV   — voice response (badge plays the WAV)
 
+A command returns either a string (spoken back) or the ACK sentinel (acted
+on, chirp only — for commands that DO something rather than answer
+something).  Vibe Control, an optional Windows-only mode that drives a
+terminal session on this machine by voice, is built entirely out of ACK
+commands; see VIBE_COMMANDS below and sdk/VIBE.md.
+
 TTS (text-to-speech) is handled automatically per platform:
     Linux / macOS  →  espeak-ng   (sudo apt install espeak-ng)
     Windows        →  PowerShell System.Speech (built-in, no install required)
@@ -68,6 +74,16 @@ import time
 import wave
 
 from vosk import KaldiRecognizer, Model, SetLogLevel
+
+# Vibe Control — drive a terminal session on THIS machine by voice (see
+# sdk/VIBE.md).  Windows-only and entirely optional: vibekeys raises
+# ImportError on other platforms, and this server runs anywhere Python and
+# Vosk run.  A failed import is not an error — it just means the Vibe Control
+# commands are omitted from the vocabulary and everything else is unaffected.
+try:
+    import vibekeys
+except ImportError:
+    vibekeys = None
 
 SetLogLevel(-1)   # silence Vosk's verbose initialization chatter
 
@@ -194,12 +210,107 @@ def _time_phrase():
     return f"{t.tm_hour} {t.tm_min} hours."
 
 
+# ACK — return this from a command instead of a string to act WITHOUT
+# speaking.  The badge plays its short "command executed" chirp (signal byte
+# b'c') and nothing is synthesized.
+#
+# The distinction matters as soon as commands DO things rather than answer
+# questions.  A spoken "Acknowledged." after every keystroke of Vibe Control
+# would make the mode unusable — you would hear a sentence for every Enter.
+# It is also the right answer for anything whose effect you can already see:
+# lights, media, a script.
+#
+# None still means NO MATCH, so a distinct sentinel is required; the two are
+# genuinely different outcomes (chirp vs. failure chirp).
+ACK = object()
+
+
 COMMANDS = {
     "computer hello":   "Hello.",
     "computer status":  "All systems nominal.",
     "computer time":    _time_phrase,   # e.g. "sixteen eleven hours."
     "computer goodbye": "Acknowledged.",
 }
+
+
+# ---------------------------------------------------------------------------
+# VIBE_COMMANDS — the Vibe Control vocabulary (sdk/VIBE.md).
+#
+# EXCLUSIVE REPLACEMENT, not an overlay: while Vibe Control is active this
+# dict replaces COMMANDS entirely.  That is the single most important
+# structural choice in the feature, and it is a safety property as much as an
+# accuracy one — a mode that types into a terminal should be able to do almost
+# nothing else.  Recognition also gets sharper, because there are ~15 live
+# phrases instead of the whole vocabulary.
+#
+# Hails are NOT suppressed: they are matched before COMMANDS in
+# handle_connection(), so an incoming call still reaches its badge whatever
+# mode this desk is in.  A comms system that goes deaf in a submode is a
+# broken comms system.  Deliberate; do not "fix" the inconsistency.
+#
+# Every entry returns ACK (chirp, no speech) except activation and
+# deactivation, which speak — activation because its reply is DYNAMIC (it
+# names the session it latched onto, or explains why it refused), and
+# deactivation to confirm the release.
+#
+# NUMBER WORDS, NOT DIGITS.  Vosk's small model has no token for "1"; a phrase
+# containing a bare digit becomes unmatchable by voice.  Hence "computer
+# option one" ... "computer option nine".
+#
+# PHONETIC DISTANCE IS NOT FREE.  A small vocabulary reduces confusions but
+# cannot invent acoustic distance that isn't there.  A "computer prompt"
+# phrase in an earlier version of this vocabulary had to be renamed because it
+# was misheard as "computer proceed" often enough to matter — both carry the
+# same stressed "pro-" onset, and a constrained recognizer still has to pick
+# one.  When adding a phrase here, check it against the OTHER PHRASES IN THIS
+# DICT: while the mode is active, those are the only ones still loaded.
+# ---------------------------------------------------------------------------
+
+def _vibe(action, *args):
+    """Run a vibekeys action and ACK.  ACK regardless of outcome: the failure
+    detail is on the server console, and the badge chirp only reports that the
+    command was heard and dispatched.  A refusal to inject is not a
+    recognition failure, and reporting it as one would be misleading."""
+    action(*args)
+    return ACK
+
+
+VIBE_COMMANDS = {} if vibekeys is None else {
+    "computer deactivate vibe control": lambda: vibekeys.deactivate(),
+
+    # Enter.
+    "computer proceed":   lambda: _vibe(vibekeys.press_enter),
+
+    # Right Arrow then Enter: accept the suggested next action and submit it.
+    "computer continue":  lambda: _vibe(vibekeys.press_continue),
+    "computer carry on":  lambda: _vibe(vibekeys.press_continue),
+
+    # Escape, sent TWICE — a single press does not clear Claude Code's box.
+    "computer cancel":    lambda: _vibe(vibekeys.press_escape),
+
+    # Screensaver / blanked-display recovery.  Also in COMMANDS below, so a
+    # blank screen is recoverable whether or not the mode is up — the one
+    # phrase deliberately present in both vocabularies.
+    "computer wake up":   lambda: _vibe(vibekeys.wake),
+
+    # Explicit selection.  Nine is the ceiling; Claude Code offers 3-4.
+    "computer option one":   lambda: _vibe(vibekeys.press_digit, 1),
+    "computer option two":   lambda: _vibe(vibekeys.press_digit, 2),
+    "computer option three": lambda: _vibe(vibekeys.press_digit, 3),
+    "computer option four":  lambda: _vibe(vibekeys.press_digit, 4),
+    "computer option five":  lambda: _vibe(vibekeys.press_digit, 5),
+    "computer option six":   lambda: _vibe(vibekeys.press_digit, 6),
+    "computer option seven": lambda: _vibe(vibekeys.press_digit, 7),
+    "computer option eight": lambda: _vibe(vibekeys.press_digit, 8),
+    "computer option nine":  lambda: _vibe(vibekeys.press_digit, 9),
+}
+
+if vibekeys is not None:
+    # Entry point and the wake exemption live in the NORMAL vocabulary.
+    # Activation speaks a dynamic phrase — the session it latched onto, or the
+    # reason it refused — so activation always produces a spoken outcome.
+    COMMANDS["computer activate vibe control"] = lambda: vibekeys.activate()
+    COMMANDS["computer wake up"] = lambda: _vibe(vibekeys.wake)
 
 
 # ---------------------------------------------------------------------------
@@ -516,17 +627,49 @@ def wav_from_pcm(pcm_bytes):
     return buf.getvalue()
 
 
-def match_command(text):
-    """Return the response for the first COMMANDS phrase found in `text`, or None.
+def active_commands():
+    """The vocabulary currently in force.
 
-    Iterates COMMANDS in insertion order (Python 3.7+ dict guarantee) and
-    returns the first match.  Calls the value if it's callable (lambda),
-    otherwise returns it directly as a string.
+    Vibe Control REPLACES the vocabulary rather than adding to it: while it is
+    active, COMMANDS is entirely suspended.  See VIBE_COMMANDS for why that is
+    the right shape, and sdk/VIBE.md for the whole design.
     """
-    for phrase, response in COMMANDS.items():
+    if vibekeys is not None and vibekeys.is_active():
+        return VIBE_COMMANDS
+    return COMMANDS
+
+
+def match_command(text):
+    """Return the response for the first matching phrase in `text`, or None.
+
+    Iterates the active vocabulary in insertion order (Python 3.7+ dict
+    guarantee) and returns the first match.  Calls the value if it's callable
+    (lambda), otherwise returns it directly as a string.
+
+    Three distinct outcomes, and they must not be conflated:
+        None      no phrase matched      → caller keeps listening / sends b'f'
+        ACK       matched, acted, silent → caller sends b'c'
+        a string  matched, speak this    → caller synthesizes and sends b'v'
+    """
+    for phrase, response in active_commands().items():
         if phrase in text:
             return response() if callable(response) else response
     return None
+
+
+def respond(conn, response, mac):
+    """Deliver a matched command's outcome to the badge.
+
+    ACK sends the bare b'c' signal — the badge plays its short "command
+    executed" chirp and nothing is synthesized.  Anything else is spoken.
+    Factored out because both the real-time match and the final-flush match
+    need identical handling, and letting them drift would mean a command
+    behaved differently depending on how fast it was recognized.
+    """
+    if response is ACK:
+        conn.sendall(b"c")
+    else:
+        send_voice(conn, response, mac)
 
 
 # ---------------------------------------------------------------------------
@@ -688,7 +831,7 @@ def handle_connection(conn, addr, model):
                 response = match_command(accumulated)
                 if response is not None:
                     print(f"[computer] [{mac}] match on {accumulated!r} -> {response!r}")
-                    send_voice(conn, response, mac)
+                    respond(conn, response, mac)
                     return   # done — serve_connection() drains and closes
 
         # --- final flush after stream ends or timeout ---
@@ -709,7 +852,7 @@ def handle_connection(conn, addr, model):
                 return
             response = match_command(final)
             if response is not None:
-                send_voice(conn, response, mac)
+                respond(conn, response, mac)
                 return
             # "<self-alias> to <name>" with an unknown name → say so, rather
             # than a bare failure chirp.  Final text only (see the helper).
@@ -1438,6 +1581,12 @@ def main():
     print(f"[computer] commands: {' | '.join(COMMANDS)}")
     print(f"[computer] tap badge → speak one of the above → voice response plays through badge")
     print(f"[computer] console: badges | hail <mac> [text]")
+    if vibekeys is not None:
+        # Named explicitly at startup because activating it SUSPENDS every
+        # command printed above — a mode that silently swaps the vocabulary
+        # should announce that it exists.
+        print(f"[computer] vibe control available: "
+              f"{' | '.join(VIBE_COMMANDS)} (see sdk/VIBE.md)")
 
     # Server console: `badges` and `hail <mac> [text]` — see console_loop().
     threading.Thread(target=console_loop, daemon=True).start()
