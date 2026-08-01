@@ -340,10 +340,12 @@ this feature: a Tk window created with `overrideredirect(True)` and
 `SW_SHOWNOACTIVATE`, **still took foreground** on Windows 11 — on the initial
 show and on every subsequent update. Do not assume that flag is sufficient.
 
-**Dictated prose is not code.** If you extend this with dictation (see below),
-expect the recognizer to mangle identifiers, paths, punctuation, and camelCase.
-Voice is for prose instructions — *"try the other approach"*, *"explain what you
-just changed"*. Anything requiring exact syntax still wants a keyboard.
+**Dictated prose is not code.** With dictation enabled (`computer transcribe`,
+README §11), expect the recognizer to mangle identifiers, paths, punctuation,
+and camelCase. Voice is for prose instructions — *"try the other approach"*,
+*"explain what you just changed"*. Anything requiring exact syntax still wants a
+keyboard. This is the practical reason the prompt is never auto-submitted: you
+read what was actually heard before it runs.
 
 **Latency.** Each command costs a tap plus relay latency plus recognition —
 comfortably fine for approve/choose/cancel, and nobody will want to drive a text
@@ -351,11 +353,16 @@ editor this way. It is not meant for that.
 
 ## Extending it {#extending-it}
 
-**Dictation** is the obvious next step and the pieces are already here.
-`paste_text()` stages text on the clipboard and Ctrl+V's it into the latched
-window without pressing Enter; no shipped phrase calls it. To use it: switch to
-a large Vosk model for the utterance, capture free-form speech, and hand the
-result to `paste_text()`. **Do not make it press Enter** — see below.
+**Dictation is now shipped** — it was listed here as the obvious next step, and
+it is built: `computer transcribe <anything>` switches to a large Vosk model for
+the utterance, captures free-form speech, and hands the result to
+`paste_text()`, which stages it on the clipboard and Ctrl+V's it into the
+latched window. See **README §11**. It is available only while Vibe Control is
+active, because a latched window is the only place the text could go.
+
+**It does not press Enter, and must not be made to.** The prompt sits in the
+composer until you read it and say `computer proceed`. That separation is the
+entire safety argument for this mode — see Philosophy below.
 
 **More keys** belong in `vibekeys.py` as named actions, never as a generic
 "send this key" function. Scroll keys (`computer page up`) are harmless. Ctrl+C

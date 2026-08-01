@@ -42,12 +42,22 @@ something).  Vibe Control, an optional Windows-only mode that drives a
 terminal session on this machine by voice, is built entirely out of ACK
 commands; see VIBE_COMMANDS below and sdk/VIBE.md.
 
+Two recognizers, not one.  The small model matches commands on every tap.
+Pass a large model as well and two DICTATION TRIGGERS become available —
+`captain's log ...` and, while Vibe Control holds a window, `computer
+transcribe ...`.  A trigger switches the recognizer mid-utterance and
+captures free-form speech until you stop talking.  See detect_trigger() and
+handle_large_vocab_phase() below, and §11 of sdk/README.md.
+
 TTS (text-to-speech) is handled automatically per platform:
     Linux / macOS  →  espeak-ng   (sudo apt install espeak-ng)
     Windows        →  PowerShell System.Speech (built-in, no install required)
 
 Usage:
-    python3 computer.py /path/to/vosk-model-small-en-us-0.15
+    python3 computer.py <small-model-dir> [large-model-dir]
+
+    python3 computer.py ~/vosk-model-small-en-us-0.15
+    python3 computer.py ~/vosk-model-small-en-us-0.15 ~/vosk-model-en-us-0.22
 
 Vosk model: download vosk-model-small-en-us-0.15 (~40 MB) from
     https://alphacephei.com/vosk/models
@@ -61,6 +71,7 @@ no host overrides.  Single-tap command loop plus the persistent downlink
 and server console (sdk/INTERCOM.md Phase 2).
 """
 import array
+import datetime
 import io
 import json
 import os
@@ -89,6 +100,74 @@ SetLogLevel(-1)   # silence Vosk's verbose initialization chatter
 
 PORT      = int(os.environ.get("SDK_SERVER_PORT", "1701"))
 TIMEOUT_S = 10    # max wall-clock seconds to wait for speech before sending b'f'
+
+
+# ---------------------------------------------------------------------------
+# The large-vocabulary model — free-form dictation (§11).
+#
+# Two models, two jobs.  The SMALL model runs every tap: it is fast, loads in
+# a couple of seconds, and is accurate enough to pick a known phrase out of a
+# handful of candidates.  It is poor at open dictation, because a 3 MB
+# vocabulary has to guess at words it does not really know.  The LARGE model
+# (vosk-model-en-us-0.22, ~1.8 GB unpacked) transcribes arbitrary English
+# well, but is far too heavy to be the everyday recognizer.
+#
+# So the server keeps both and SWITCHES between them: small for command
+# matching, large for the span of one dictation, then back.  That is the whole
+# mechanism behind `captain's log` and `computer transcribe`.
+#
+# LOADED EAGERLY AT STARTUP, NEVER ON DEMAND.  This is the single most
+# important decision in the feature and it is not negotiable:
+#
+#   * Loading the large model takes tens of seconds and gigabytes of RAM.
+#   * A dictation begins INSIDE a live badge transaction — the relay is
+#     already recording, and listener.py gives up RECORD_MAX_S (13 s) after
+#     the last keepalive.
+#
+# Loading lazily on first use would therefore blow the recording window every
+# time, and the badge would fail the very command that triggered the load.
+# Paying the cost once at startup is what makes the switch feel instant.
+#
+# OPTIONAL.  The path is the second positional argument.  Omit it and the
+# server runs exactly as before, minus the two dictation commands — the same
+# defensive shape as the vibekeys import above.  Nobody should have to
+# download 1.8 GB to run the quick start.
+#
+# `large_model` is assigned once in main(), before the listening socket is
+# opened, and only ever read afterwards — so no lock is needed despite the
+# per-connection threads.
+# ---------------------------------------------------------------------------
+
+large_model = None
+
+# Where `captain's log` entries are appended.  A plain text file beside this
+# script, one timestamped line per entry.
+CAPTAINSLOG_FILE = os.environ.get(
+    "SDK_CAPTAINSLOG_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "captainslog.txt"))
+
+# End of dictation: seconds without a NEW recognized word.  Two different
+# values because the two features are spoken differently, both inherited from
+# the full system's measured tuning rather than guessed:
+#
+#   A log entry is composed before you start talking and delivered in one go,
+#   so a short gap means you are finished.  1.5 s (4 s and 1.0 s were both
+#   tried there; 1.0 s clipped mid-thought on Vosk's partial latency).
+#
+#   A prompt is THOUGHT OUT WHILE SPEAKING.  You stop to consider the next
+#   clause, and 1.5 s would paste half a sentence into the terminal.  6 s.
+DICTATION_SILENCE_S = float(os.environ.get("SDK_DICTATION_SILENCE_S", "1.5"))
+PROMPT_SILENCE_S    = float(os.environ.get("SDK_PROMPT_SILENCE_S", "6"))
+
+# Hard cap on one dictation, whatever the silence gate is doing — the backstop
+# for a room noisy enough to keep resetting it.
+DICTATION_MAX_S     = float(os.environ.get("SDK_DICTATION_MAX_S", "110"))
+
+# Keepalive cadence during dictation.  MANDATORY, not an optimization:
+# listener.py stops recording RECORD_MAX_S (13 s) after the last byte from us,
+# and a dictation routinely runs longer than that.  Each b'k' slides its
+# deadline.  Same 4 s cadence the hail capture loop uses.
+DICTATION_KEEPALIVE_S = 4
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +383,14 @@ VIBE_COMMANDS = {} if vibekeys is None else {
     "computer option eight": lambda: _vibe(vibekeys.press_digit, 8),
     "computer option nine":  lambda: _vibe(vibekeys.press_digit, 9),
 }
+
+# Playback of the last captain's log entry.  An ORDINARY command, not a
+# trigger — a fixed phrase with a spoken answer, which is exactly what
+# COMMANDS is for; only the recording half needs the large model.  Registered
+# in main() alongside the dictation feature all the same, so the log commands
+# appear and disappear together rather than offering playback of entries this
+# server has no way to record.
+REPLAY_LOG_PHRASE = "computer replay last log entry"
 
 # The entry point is a named constant because it is the one Vibe Control
 # phrase that does NOT live in VIBE_COMMANDS, and it therefore has to be
@@ -679,6 +766,319 @@ def respond(conn, response, mac):
 
 
 # ---------------------------------------------------------------------------
+# Large-vocabulary triggers — the dictation vocabulary (§11).
+#
+# A TRIGGER IS NOT A COMMAND, and the difference is why these cannot live in
+# COMMANDS.  A command is a fixed phrase that maps to a fixed outcome; the
+# whole utterance is the command.  A trigger is a PREFIX followed by open
+# speech that nobody can enumerate in advance — "captain's log, stardate
+# forty-seven six three four, the away team has returned".  Matching it does
+# not end the transaction; it CHANGES THE RECOGNIZER and keeps listening.
+#
+# So triggers are checked ahead of match_command() in the recognition loop,
+# and their handler takes over the connection rather than returning a string.
+#
+# WHY EACH TRIGGER IS GATED ON THE VIBE MODE.  The two are mutually exclusive
+# by design, not by accident:
+#
+#   `computer transcribe` pastes into the terminal window Vibe Control has
+#   latched onto.  With no latch there is nowhere for the text to go, so it is
+#   offered ONLY while the mode is active.
+#
+#   `captain's log` is a normal-vocabulary feature, and Vibe Control's central
+#   rule is that activating it suspends the normal vocabulary entirely (see
+#   VIBE_COMMANDS).  Dictation is the one exception carved out of that rule,
+#   and the exception is deliberately narrow: the dictation you can reach
+#   while driving a terminal is the one that types INTO the terminal.
+#
+# Net effect: exactly one dictation trigger is live at any moment, and which
+# one depends only on whether Vibe Control is latched.
+# ---------------------------------------------------------------------------
+
+# Vosk's small model renders the possessive inconsistently depending on how
+# clearly the "s" lands, and unlike the full system this server runs the small
+# model UNCONSTRAINED (no grammar), so we cannot force one spelling.  Accept
+# both rather than lose a log entry to an apostrophe.
+CAPTAINSLOG_PHRASES = ("captain's log", "captains log")
+TRANSCRIBE_PHRASE   = "computer transcribe"
+
+
+def detect_trigger(text):
+    """Return (trigger_type, matched_phrase) for a dictation trigger in `text`,
+    or None.
+
+    Substring containment, not startswith.  The full system anchors these to
+    the start of the utterance because its recognizer is grammar-constrained
+    and its text is therefore clean.  This server runs the small model open,
+    so a stray decoded syllable ahead of the trigger is ordinary — anchoring
+    would drop real commands.  Consistent with match_command(), which is
+    substring-matched for the same reason.
+    """
+    vibe_on = vibekeys is not None and vibekeys.is_active()
+
+    if vibe_on:
+        if large_model is not None and TRANSCRIBE_PHRASE in text:
+            return ("transcribe", TRANSCRIBE_PHRASE)
+        return None   # every other trigger is suspended with the vocabulary
+
+    if large_model is not None:
+        for phrase in CAPTAINSLOG_PHRASES:
+            if phrase in text:
+                return ("captains_log", phrase)
+    return None
+
+
+def strip_trigger(text, phrases):
+    """Remove the trigger phrase and everything before it from `text`.
+
+    Located with find() rather than sliced at a known offset because the LARGE
+    model re-transcribes the audio from the beginning and may render the
+    trigger differently than the small model matched it — a different
+    possessive, a swallowed word.
+
+    ALL spellings are tried, not just the one that matched.  The two models
+    disagree independently: the small model can match "captains log" on audio
+    the large model renders "captain's log", and searching only for what
+    matched would then leave the trigger sitting in the entry.  Earliest hit
+    wins, so a trigger word that also occurs later in the dictation cannot
+    truncate it.
+
+    If none is found the whole transcript is returned rather than nothing — a
+    log entry with a stray leading word beats one that silently lost its first
+    sentence.
+    """
+    if isinstance(phrases, str):
+        phrases = (phrases,)
+    best_idx, best_len = -1, 0
+    for p in phrases:
+        idx = text.find(p)
+        if idx >= 0 and (best_idx < 0 or idx < best_idx):
+            best_idx, best_len = idx, len(p)
+    if best_idx < 0:
+        return text.strip()
+    return text[best_idx + best_len:].strip()
+
+
+def handle_large_vocab_phase(conn, mac, pcm, trigger_type, phrase):
+    """Switch to the large model and capture free-form speech to completion.
+
+    The mode switch itself is three lines — a fresh KaldiRecognizer on the
+    large model, then replay every buffered chunk into it.  THE REPLAY IS THE
+    POINT: the trigger is only recognized partway through the utterance, so
+    the audio that carried the trigger (and often the first words after it)
+    has already been consumed by the small recognizer.  Feeding the buffer
+    back means the large model transcribes the utterance from the tap, and
+    nothing spoken before the switch is lost.
+
+    Capture then continues on the live socket until the silence gate closes
+    it, exactly like the hail capture loop above.
+    """
+    print(f"[computer] [{mac}] large-vocab trigger: {trigger_type}")
+    # Opens the live-transcription line written inside the capture loop.  No
+    # newline: the words stream onto the end of this prefix as they arrive.
+    sys.stdout.write(f"[computer] [{mac}] > ")
+    sys.stdout.flush()
+
+    rec = KaldiRecognizer(large_model, 16000)
+    for chunk in pcm:
+        rec.AcceptWaveform(chunk)
+
+    silence_s = PROMPT_SILENCE_S if trigger_type == "transcribe" else DICTATION_SILENCE_S
+
+    conn.settimeout(0.3)
+    start          = time.time()
+    last_partial   = ""
+    last_progress  = time.time()
+    last_keepalive = time.time()
+
+    # The live-transcription line stays open across the whole loop, so every
+    # exit has to close it BEFORE printing anything else — otherwise the
+    # reason for finishing gets spliced onto the end of the dictation and
+    # reads as if it were spoken.  Idempotent, so the exits do not have to
+    # care whether some earlier path already closed it.
+    line_open = True
+
+    def close_line():
+        nonlocal line_open
+        if line_open:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            line_open = False
+
+    while True:
+        # Silence finalize, GATED ON HAVING HEARD SOMETHING.  Until the first
+        # word is recognized the timer is held open, so a pause between the
+        # tap and the first syllable never ends the capture — only a gap
+        # BETWEEN words does.  Continuous speech with sub-second gaps runs as
+        # long as you like, up to the hard cap.
+        if last_partial and time.time() - last_progress >= silence_s:
+            close_line()
+            print(f"[computer] [{mac}] silence {silence_s}s — finalizing")
+            break
+        if time.time() - start >= DICTATION_MAX_S:
+            close_line()
+            print(f"[computer] [{mac}] dictation cap {DICTATION_MAX_S}s reached")
+            break
+        if time.time() - last_keepalive >= DICTATION_KEEPALIVE_S:
+            try:
+                conn.sendall(b"k")   # slide listener.py's recording deadline
+            except OSError:
+                break                # relay gone — finalize what we have
+            last_keepalive = time.time()
+
+        try:
+            data = conn.recv(4096)
+        except socket.timeout:
+            continue                 # no audio this beat; recheck the timers
+        except OSError:
+            break
+        if not data:
+            break                    # stream ended
+
+        rec.AcceptWaveform(data)
+        partial = json.loads(rec.PartialResult()).get("partial", "").strip()
+        if partial and partial != last_partial:
+            # Live transcription to the console, word by word as it lands.
+            # This server has no display of its own, so the console IS the
+            # readout — you watch the words arrive and know the dictation is
+            # working long before the final text exists.
+            #
+            # Vosk REVISES its hypothesis: a partial does not always extend
+            # the previous one, it can rewrite words already emitted.  So the
+            # cheap `partial[len(last_partial):]` delta is only valid when the
+            # new hypothesis still starts with the old one.  When it does not,
+            # break the line and reprint the corrected hypothesis whole —
+            # otherwise a revision splices a fragment mid-word and the console
+            # shows text that was never spoken.
+            if partial.startswith(last_partial):
+                sys.stdout.write(partial[len(last_partial):])
+            else:
+                sys.stdout.write("\n           " + partial)
+            sys.stdout.flush()
+            last_partial  = partial
+            last_progress = time.time()
+
+    # Close it for the exits that did not (EOF, socket error) — including the
+    # case where nothing was ever recognized, or the dangling "> " prefix
+    # would swallow the next message.
+    close_line()
+
+    text = json.loads(rec.FinalResult()).get("text", "").strip()
+    # Strip against every spelling of THIS trigger, not just the one the small
+    # model happened to match — see strip_trigger().
+    body = strip_trigger(text, CAPTAINSLOG_PHRASES
+                         if trigger_type == "captains_log" else TRANSCRIBE_PHRASE)
+
+    if trigger_type == "transcribe":
+        finish_transcribe(conn, mac, body)
+    else:
+        finish_captains_log(conn, mac, text, body)
+
+
+def finish_transcribe(conn, mac, body):
+    """Paste the dictated prompt into the latched terminal window.
+
+    ENTER IS NOT PRESSED.  The prompt lands in the composer and sits there
+    until you read it and say "computer proceed".  That separation is the
+    entire safety argument for letting a voice pipeline type into a terminal:
+    recognition WILL occasionally mishear, and the review step is what makes
+    that a nuisance instead of an incident.  Do not add a submit here.
+    """
+    if not body:
+        print(f"[computer] [{mac}] transcribe: nothing recognized")
+        send_voice(conn, "No prompt recognized.", mac)
+        return
+    print(f"[computer] [{mac}] transcribe: {len(body.split())} words -> paste")
+    vibekeys.paste_text(body)
+    # ACK, not speech: the words are already on screen in the composer, which
+    # is a better confirmation than any sentence we could synthesize.
+    conn.sendall(b"c")
+
+
+_MONTHS = ("January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December")
+
+
+def replay_last_log():
+    """Speak the most recent captain's log entry back, with its date and time.
+
+    A stored line is `[2026-08-01 14:30:00] captain's log, the away team...`.
+    Reading that aloud verbatim would say the timestamp as digits and
+    punctuation, so the stamp is re-rendered as spoken English and the entry
+    follows it.
+
+    The stored entry KEEPS its trigger phrase (see finish_captains_log), and
+    this announcement already opens with "Captain's log" — so a leading
+    "captain's log" is stripped from the body before speaking, or every replay
+    would say it twice.  The full system's shell version has that stutter;
+    there is no reason to port a wart.
+    """
+    try:
+        with open(CAPTAINSLOG_FILE, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    except OSError:
+        lines = []
+    if not lines:
+        return "There are no log entries on file."
+
+    m = re.match(r"^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):\d{2}\]\s*(.*)$",
+                 lines[-1])
+    if not m:
+        return lines[-1]   # unparseable stamp — speak the line as it stands
+    year, mon, day, hour, minute, entry = m.groups()
+
+    for phrase in CAPTAINSLOG_PHRASES:
+        if entry.lower().startswith(phrase):
+            entry = entry[len(phrase):].lstrip(" ,.")
+            break
+
+    hour, minute, day = int(hour), int(minute), int(day)
+    if minute == 0:
+        spoken_time = f"{hour} hundred hours"
+    elif minute < 10:
+        spoken_time = f"{hour} oh {minute}"
+    else:
+        spoken_time = f"{hour} {minute}"
+    return (f"Captain's log, {_MONTHS[int(mon) - 1]} {day}, {year}, "
+            f"{spoken_time}. {entry}")
+
+
+def finish_captains_log(conn, mac, text, body):
+    """Append one timestamped entry to CAPTAINSLOG_FILE.
+
+    The trigger phrase is kept in the stored entry — a log that opens
+    "captain's log, stardate..." reads the way it should, and the phrase is
+    part of the dictation rather than a command that preceded it.  `body` is
+    used only to decide whether anything was actually said after the trigger.
+
+    The full system signals this with its own byte (b'l', which its relay
+    answers with a spoken "Log recorded."); this SDK's listener.py knows only
+    c/f/v/O, so the confirmation is an ordinary voice response.  One less
+    moving part, and no listener change to run the feature.
+    """
+    if not body:
+        print(f"[computer] [{mac}] captain's log: no content after trigger")
+        send_voice(conn, "No log content recognized.", mac)
+        return
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(CAPTAINSLOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{stamp}] {text}\n")
+    except OSError as e:
+        print(f"[computer] [{mac}] captain's log write failed: {e}")
+        send_voice(conn, "Unable to record log.", mac)
+        return
+    # The full system suppresses log content on its console — it has a
+    # teleprompter to render dictation on, so the console can stay discreet.
+    # This server has no second display, so suppressing here would mean
+    # dictating blind; the capture loop streams the words live instead
+    # (Captain's call, 2026-08-01).  Worth knowing if you run this server
+    # somewhere other people can see the terminal: your log is on that screen.
+    print(f"[computer] [{mac}] captain's log recorded ({len(text.split())} words)")
+    send_voice(conn, "Log recorded.", mac)
+
+
+# ---------------------------------------------------------------------------
 # Per-connection handler
 # ---------------------------------------------------------------------------
 
@@ -834,6 +1234,16 @@ def handle_connection(conn, addr, model):
                 if hit:
                     handle_hail(conn, mac, hit[1], hit[0], rec, pcm, mac_to_aliases)
                     return
+                # Dictation triggers next, BEFORE match_command: a trigger is
+                # a prefix with open speech behind it, so waiting for the
+                # utterance to finish would mean transcribing it with the
+                # small model — the one thing the mode switch exists to
+                # avoid.  Firing mid-utterance is what makes the replay in
+                # handle_large_vocab_phase necessary, and sufficient.
+                trig = detect_trigger(accumulated)
+                if trig:
+                    handle_large_vocab_phase(conn, mac, pcm, trig[0], trig[1])
+                    return
                 response = match_command(accumulated)
                 if response is not None:
                     print(f"[computer] [{mac}] match on {accumulated!r} -> {response!r}")
@@ -855,6 +1265,14 @@ def handle_connection(conn, addr, model):
             hit = match_hail(final, hails)
             if hit:
                 handle_hail(conn, mac, hit[1], hit[0], rec, pcm, mac_to_aliases)
+                return
+            # Late trigger catch — a short dictation spoken fast enough that
+            # the stream ended before the real-time loop saw the trigger.  The
+            # replay still works; the capture loop just finds the socket at
+            # EOF and finalizes immediately on the buffered audio alone.
+            trig = detect_trigger(final)
+            if trig:
+                handle_large_vocab_phase(conn, mac, pcm, trig[0], trig[1])
                 return
             response = match_command(final)
             if response is not None:
@@ -1575,18 +1993,67 @@ def console_loop():
 # ---------------------------------------------------------------------------
 
 def main():
+    global large_model
+
+    # Force UTF-8 on the console.  On Windows, Python picks the ANSI code page
+    # (cp1252) whenever stdout is a pipe or a file rather than a terminal, and
+    # cp1252 cannot encode the arrows and dashes in the banner below — so
+    # `python computer.py MODEL > server.log` died on startup with
+    # UnicodeEncodeError before it ever bound the socket.  Live transcription
+    # makes this sharper still: it prints whatever the recognizer produced,
+    # which is not ours to constrain.  errors="replace" means an unencodable
+    # character degrades to "?" instead of killing a dictation in progress.
+    #
+    # line_buffering forces a flush per line.  Piping to a log file otherwise
+    # switches stdout to block buffering, and a long-running server's output
+    # then appears in 8 KB lurches — or is lost entirely if it is killed
+    # before the buffer fills, which is exactly how a server usually ends.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace",
+                               line_buffering=True)
+    except (AttributeError, OSError):
+        pass   # non-standard stdout (embedded, captured) — leave it alone
+
     if len(sys.argv) < 2:
-        sys.exit("Usage: computer.py /path/to/vosk-model-small-en-us-0.15")
+        sys.exit("Usage: computer.py <small-model-dir> [large-model-dir]\n"
+                 "  small: vosk-model-small-en-us-0.15  (required — command matching)\n"
+                 "  large: vosk-model-en-us-0.22        (optional — enables dictation)")
     model_path = sys.argv[1]
     if not os.path.isdir(model_path):
         sys.exit(f"Model dir not found: {model_path}")
+    large_path = sys.argv[2] if len(sys.argv) > 2 else None
+    # Fail NOW if the path is wrong, not on the first dictation twenty minutes
+    # from now.  A mistyped model path is a startup error.
+    if large_path and not os.path.isdir(large_path):
+        sys.exit(f"Large model dir not found: {large_path}")
 
     print(f"[computer] loading Vosk model {model_path}...")
     model = Model(model_path)   # takes ~1–3 s; model is reused for all connections
+    if large_path:
+        # Tens of seconds and gigabytes.  Announced because the server is
+        # unresponsive while it happens and silence here looks like a hang.
+        print(f"[computer] loading LARGE Vosk model {large_path} (slow, one time)...")
+        large_model = Model(large_path)
+        # Registered BEFORE the commands banner below, so it appears in it.
+        # Playback needs no large model itself, but pairing it with the
+        # recording half keeps the log commands appearing and disappearing
+        # together.
+        COMMANDS[REPLAY_LOG_PHRASE] = replay_last_log
     print(f"[computer] listening on 0.0.0.0:{PORT}")
     print(f"[computer] commands: {' | '.join(COMMANDS)}")
     print(f"[computer] tap badge → speak one of the above → voice response plays through badge")
     print(f"[computer] console: badges | hail <mac> [text]")
+    if large_model is None:
+        print(f"[computer] dictation: OFF (pass a large model dir as the 2nd argument)")
+    else:
+        # Which trigger is live depends on the Vibe Control latch, so print
+        # both with that condition attached rather than a flat list that would
+        # be wrong half the time.
+        print(f"[computer] dictation: \"{CAPTAINSLOG_PHRASES[0]} ...\" -> {CAPTAINSLOG_FILE}")
+        print(f"[computer]   playback: \"{REPLAY_LOG_PHRASE}\"")
+        if vibekeys is not None:
+            print(f"[computer]   while vibe control is active, instead: "
+                  f"\"{TRANSCRIBE_PHRASE} ...\" -> pasted into the latched window")
     if vibekeys is not None:
         # Named explicitly at startup because activating it SUSPENDS every
         # command printed above — a mode that silently swaps the vocabulary

@@ -31,6 +31,7 @@ While AI was obviously used for generating code - EVERY prompt was human-written
 8. [The Voice Command Pipeline at a Glance](#complete-loop)
 9. [Known Gotchas](#known-gotchas)
 10. [Vibe Control — driving a terminal by voice](#vibe-control)
+11. [Large-Vocabulary Dictation — captain's log and computer transcribe](#large-vocab)
 
 ## <a name="ai-assisted-quick-start"></a>-1.  AI Assisted Quick Start
 
@@ -51,6 +52,14 @@ sudo apt install espeak-ng       # Linux — skip on Windows (SAPI built-in)
 python3 computer.py /path/to/vosk-model-small-en-us-0.15
 ```
 
+The small model is all you need for commands. A **second, optional** argument
+enables free-form dictation — see [§11](#large-vocab):
+
+```bash
+python3 computer.py /path/to/vosk-model-small-en-us-0.15 \
+                    /path/to/vosk-model-en-us-0.22
+```
+
 **Step 2 — Start the relay** (Linux relay host, must be root):
 ```bash
 pip install evdev
@@ -67,7 +76,8 @@ in one-line launchers so the full invocation isn't retyped each session:
 
 - `computer.sh` (server host) — `python computer.py ../.vosk/vosk-model-small-en-us-0.15`.
   As shipped it expects the unpacked Vosk model in a `.vosk/` directory one level
-  above this folder — edit the path to wherever yours lives.
+  above this folder — edit the path to wherever yours lives. To enable dictation,
+  append the large model as a second path on that same line.
 - `transceiver.sh` (relay host) — `sudo SDK_SERVER_HOST=<server-ip-or-hostname> python transceiver.py`.
   The env var **must** be inline on the sudo command line: `sudo` resets the
   environment by default, so a prior `export SDK_SERVER_HOST=...` is silently
@@ -579,6 +589,117 @@ Three things about it are worth knowing before you read <VIBE.md>:
 
 On a non-Windows server the import fails, the phrases are absent, and everything else is unchanged.
 
-## 11.  More Info
+## <a name="large-vocab"></a>11. Large-Vocabulary Dictation — `captain's log` and `computer transcribe`
+
+**Optional.** Enabled by passing a second model path; absent otherwise.
+
+Everything up to this point matches a phrase you defined in advance. Dictation is the opposite problem: capturing a sentence nobody can enumerate ahead of time. That needs a different recognizer, and switching to it mid-utterance is the entire mechanism behind both features here.
+
+```
+computer.py <small-model> <large-model>
+
+  captain's log <anything>       → timestamped line appended to captainslog.txt
+  computer transcribe <anything> → pasted into the Vibe Control window, unsubmitted
+  computer replay last log entry → speaks the most recent entry back
+```
+
+The first two are *triggers*; the third is an ordinary command (see below).
+
+### Two models, one switch
+
+The **small** model (~40 MB) runs on every tap. It loads in seconds and is accurate enough to pick a known phrase out of a handful of candidates, but it is poor at open dictation — a small vocabulary has to guess at words it does not really know. The **large** model (`vosk-model-en-us-0.22`, ~1.8 GB unpacked) transcribes arbitrary English well and is far too heavy to run on every tap.
+
+So the server keeps both. `detect_trigger()` watches the small model's running hypothesis for a trigger phrase; when one appears, `handle_large_vocab_phase()` builds a fresh recognizer on the large model and **replays every buffered audio chunk into it**.
+
+That replay is the part worth understanding. The trigger is only recognized *partway through* the sentence — by the time "captain's log" has been decoded, you are already several words into the entry, and that audio has been consumed by the small recognizer. `computer.py` was already buffering the raw PCM of each tap (the intercom needs it, to deliver a hail in the caller's actual voice), so the fix is to feed the buffer back: the large model transcribes the utterance from the tap, and nothing spoken before the switch is lost.
+
+Capture then continues on the live socket until you stop talking.
+
+### The large model is loaded at startup, never on demand
+
+This is the one decision in the feature that is not a preference. Loading `vosk-model-en-us-0.22` takes tens of seconds and gigabytes of RAM, and a dictation begins **inside a live badge transaction** — the relay is already recording, and `listener.py` gives up `RECORD_MAX_S` (13 s) after the last byte from the server. Loading on first use would therefore blow the recording window every time, and the badge would fail the very command that triggered the load.
+
+Paying it once at startup is what makes the switch feel instantaneous. The cost is a slower launch and a resident ~2 GB; if you do not want either, omit the argument and the feature is simply not there.
+
+### Which trigger is live depends on Vibe Control
+
+Exactly one dictation trigger is available at any moment, and the latch decides which:
+
+| Vibe Control | Live trigger | Where the text goes |
+|---|---|---|
+| inactive | `captain's log …` | appended to `captainslog.txt` |
+| **active** | `computer transcribe …` | pasted into the latched window |
+
+That is not an arbitrary pairing. `computer transcribe` pastes into the window Vibe Control has latched onto — with no latch there is nowhere for the text to go. And Vibe Control's central rule (§10) is that activating it suspends the normal vocabulary entirely; dictation is the one exception carved out of that rule, and the exception is deliberately narrow: **the dictation you can reach while driving a terminal is the one that types into the terminal.**
+
+`computer transcribe` **does not press Enter.** The prompt lands in the composer and sits there until you read it and say `computer proceed`. That separation is the whole safety argument for letting a voice pipeline type into a terminal — recognition *will* occasionally mishear, and the review step is what makes that a nuisance rather than an incident. It is also why this works with no display: the terminal you are dictating into is the display.
+
+### Playing a log back
+
+`computer replay last log entry` speaks the most recent entry, re-rendering the
+stored timestamp as spoken English rather than reading digits and brackets aloud:
+
+```
+[2026-08-01 14:30:00] captain's log, the away team has returned
+   ↓
+"Captain's log, August 1, 2026, 14 30. the away team has returned."
+```
+
+This one is an ordinary `COMMANDS` entry, not a trigger — a fixed phrase with a
+spoken answer, which is what `COMMANDS` is for. Only the *recording* half needs
+the large model. It is registered alongside the dictation feature anyway, so the
+log commands appear and disappear together rather than offering playback of
+entries this server has no way to record.
+
+A stored entry keeps its `captain's log` prefix, and the announcement above
+already opens with it, so the prefix is stripped before speaking — otherwise
+every replay would say it twice.
+
+### Watching it work
+
+Both features stream the running hypothesis to the server console, word by word, as you speak:
+
+```
+[computer] [AA:BB:CC:DD:EE:FF] large-vocab trigger: captains_log
+[computer] [AA:BB:CC:DD:EE:FF] > captain's log stardate forty seven six three four
+[computer] [AA:BB:CC:DD:EE:FF] silence 1.5s — finalizing
+[computer] [AA:BB:CC:DD:EE:FF] captain's log recorded (9 words)
+```
+
+Vosk *revises* its hypothesis as it goes, so a partial does not always extend the previous one. When it does not, the line breaks and the corrected hypothesis is reprinted whole rather than splicing a fragment into the middle of a word.
+
+Note the privacy consequence: the full system routes log content to a separate display and keeps its server console discreet. This SDK has no second display, so the log appears on the server terminal. If that terminal is visible to other people, so is your log.
+
+### Tuning
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SDK_DICTATION_SILENCE_S` | `1.5` | end of a log entry — seconds without a new word |
+| `SDK_PROMPT_SILENCE_S` | `6` | end of a transcribed prompt |
+| `SDK_DICTATION_MAX_S` | `110` | hard cap on one dictation |
+| `SDK_CAPTAINSLOG_FILE` | `captainslog.txt` | where log entries are appended |
+
+The two silence gates differ because the two features are *spoken* differently, and both numbers are inherited from measured use rather than guessed. A log entry is composed before you start talking and delivered in one go, so a short gap means you are done. A prompt is thought out while speaking — you stop to consider the next clause, and 1.5 s would paste half a sentence into a terminal. The hard cap is the backstop for a room noisy enough to keep resetting the gate.
+
+The silence timer does not start until the first word is recognized, so a pause between the tap and your first syllable never ends the capture — only a gap *between* words does.
+
+### Adding your own
+
+A trigger is a prefix with open speech behind it, which is why these cannot live in `COMMANDS` (a fixed phrase mapping to a fixed outcome). To add one: return a new type from `detect_trigger()`, and handle it at the bottom of `handle_large_vocab_phase()`. The capture loop itself is generic.
+
+Two things to keep:
+
+- **Every word of your trigger phrase must exist in the small model's vocabulary**, because the small model is what recognizes it. A phrase the small model cannot decode is unreachable by voice no matter how good the large model is.
+- **Strip the trigger with `find()`, not a fixed slice.** The large model re-transcribes from the beginning and may render the trigger differently than the small model matched it. `strip_trigger()` does this, and falls back to returning the whole transcript rather than nothing — a stray leading word beats a silently truncated first sentence.
+
+### Known gotchas
+
+**The apostrophe.** Vosk renders the possessive inconsistently, and unlike the full system this server runs the small model *unconstrained* (no grammar), so the spelling cannot be forced. Both `captain's log` and `captains log` are accepted; a trigger of your own with a possessive in it should do the same.
+
+**Keepalives are mandatory, not an optimization.** `listener.py` stops recording 13 s after the last byte from the server, and a dictation routinely runs longer. The capture loop sends `b'k'` every 4 s to slide that deadline. Remove it and every dictation truncates at 13 seconds.
+
+**Triggers are matched as substrings, not anchored to the start.** The full system anchors them, because its recognizer is grammar-constrained and its text is therefore clean. This server runs the small model open, where a stray decoded syllable ahead of the trigger is ordinary — anchoring would drop real commands.
+
+## 12.  More Info
 
 This SDK is the distilled foundation of a much larger system — the Terran Operating System (TOS), the author's full starship-computer environment built on this same voice command pipeline (voice-print identity, command vocabularies, dictation, an AI main computer, and more). To see where this foundation can lead, visit https://tos.md.
