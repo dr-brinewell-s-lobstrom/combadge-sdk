@@ -305,11 +305,17 @@ VIBE_COMMANDS = {} if vibekeys is None else {
     "computer option nine":  lambda: _vibe(vibekeys.press_digit, 9),
 }
 
+# The entry point is a named constant because it is the one Vibe Control
+# phrase that does NOT live in VIBE_COMMANDS, and it therefore has to be
+# mentioned separately wherever the mode is listed.  A literal repeated in
+# those places would be free to drift from the key that actually dispatches.
+VIBE_ACTIVATE = "computer activate vibe control"
+
 if vibekeys is not None:
     # Entry point and the wake exemption live in the NORMAL vocabulary.
     # Activation speaks a dynamic phrase — the session it latched onto, or the
     # reason it refused — so activation always produces a spoken outcome.
-    COMMANDS["computer activate vibe control"] = lambda: vibekeys.activate()
+    COMMANDS[VIBE_ACTIVATE] = lambda: vibekeys.activate()
     COMMANDS["computer wake up"] = lambda: _vibe(vibekeys.wake)
 
 
@@ -1585,8 +1591,16 @@ def main():
         # Named explicitly at startup because activating it SUSPENDS every
         # command printed above — a mode that silently swaps the vocabulary
         # should announce that it exists.
-        print(f"[computer] vibe control available: "
-              f"{' | '.join(VIBE_COMMANDS)} (see sdk/VIBE.md)")
+        #
+        # The ACTIVATION phrase leads this block even though it belongs to
+        # COMMANDS and has therefore already been printed above.  This is the
+        # line you read when you want the mode, and a listing of a mode's
+        # vocabulary that omits the way IN to it sends you hunting through the
+        # general command list for it.  Repeating one phrase is cheaper than
+        # that.  The rest are live only while the mode is active, hence the
+        # "then:".
+        print(f"[computer] vibe control available: {VIBE_ACTIVATE}")
+        print(f"[computer]   then: {' | '.join(VIBE_COMMANDS)} (see sdk/VIBE.md)")
 
     # Server console: `badges` and `hail <mac> [text]` — see console_loop().
     threading.Thread(target=console_loop, daemon=True).start()
