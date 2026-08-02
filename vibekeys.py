@@ -74,6 +74,10 @@ def _gap_s(env_key, default_ms):
 
 ESCAPE_GAP_S = _gap_s("SDK_VIBE_ESCAPE_GAP_MS", "80")
 CONTINUE_GAP_S = _gap_s("SDK_VIBE_CONTINUE_GAP_MS", "80")
+# Pause after TAKING the foreground, before the keys go out — a terminal can
+# swallow a key delivered while its window is still activating.  Paid only when
+# focus actually had to be acquired.  See _focus().
+FOCUS_SETTLE_S = _gap_s("SDK_VIBE_FOCUS_SETTLE_MS", "60")
 
 _u32 = ctypes.WinDLL("user32", use_last_error=True)
 _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -94,6 +98,9 @@ MAPVK_VK_TO_VSC = 0
 SW_RESTORE = 9
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
+
+SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000
+SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +238,17 @@ _u32.ShowWindow.argtypes = [w.HWND, ctypes.c_int]
 _u32.IsIconic.argtypes = [w.HWND]
 _u32.AttachThreadInput.argtypes = [w.DWORD, w.DWORD, w.BOOL]
 _u32.GetWindowThreadProcessId.argtypes = [w.HWND, ctypes.POINTER(w.DWORD)]
+_u32.BringWindowToTop.argtypes = [w.HWND]
+_u32.SystemParametersInfoW.argtypes = [w.UINT, w.UINT, ctypes.c_void_p, w.UINT]
+_u32.SystemParametersInfoW.restype = w.BOOL
+# SwitchToThisWindow is exported but UNDOCUMENTED — resolve it defensively so a
+# future Windows that drops it costs one focus rung rather than an
+# AttributeError at import time.
+try:
+    _SwitchToThisWindow = _u32.SwitchToThisWindow
+    _SwitchToThisWindow.argtypes = [w.HWND, w.BOOL]
+except AttributeError:
+    _SwitchToThisWindow = None
 _u32.OpenClipboard.argtypes = [w.HWND]
 _u32.SetClipboardData.argtypes = [w.UINT, w.HANDLE]
 _u32.SetClipboardData.restype = w.HANDLE
@@ -260,41 +278,151 @@ def foreground_hwnd():
     return _u32.GetForegroundWindow() or 0
 
 
-def _focus(hwnd):
-    """Bring the target forward and CONFIRM it actually got focus.
+def foreground_lock_timeout():
+    """SPI_GETFOREGROUNDLOCKTIMEOUT in milliseconds, or -1 if unreadable.
 
-    SetForegroundWindow is silently refused for processes without recent user
-    input, so its return value is not trustworthy on its own; AttachThreadInput
-    is the standard workaround.  The verification loop is the point — an
-    unverified focus is treated as failure.
+    Logged on a focus abort because it is the single most useful number for
+    diagnosing one, and it is not guessable: a machine may carry anything from
+    the 200000 default to 0x7FFFFFFF (INT_MAX — the lock NEVER expires on its
+    own, measured on one Windows 11 desktop).  Where it is large, the "lock
+    timeout has expired" grant that SetForegroundWindow documents is
+    permanently closed, which is the whole reason rung 3 below exists.
     """
-    if _u32.IsIconic(w.HWND(hwnd)):
-        _u32.ShowWindow(w.HWND(hwnd), SW_RESTORE)
-    _u32.SetForegroundWindow(w.HWND(hwnd))
-    if foreground_hwnd() == hwnd:
-        return True
+    v = w.DWORD()
+    ok = _u32.SystemParametersInfoW(
+        SPI_GETFOREGROUNDLOCKTIMEOUT, 0,
+        ctypes.cast(ctypes.byref(v), ctypes.c_void_p), 0)
+    return v.value if ok else -1
 
+
+def _foreground_settles_on(hwnd, timeout_s):
+    """Poll GetForegroundWindow until it is hwnd, or the timeout expires.
+
+    Focus changes are asynchronous — SetForegroundWindow posts an activation
+    message and returns, so an immediate read can miss a switch that is about
+    to happen.  Every rung below verifies through here rather than trusting a
+    return value: on these APIs, returning TRUE and actually changing the
+    foreground window are different claims.
+    """
+    deadline = time.time() + timeout_s
+    while True:
+        if foreground_hwnd() == hwnd:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
+def _focus_plain(hwnd):
+    """Rung 1: just ask.  Works whenever the foreground lock is not in force."""
+    _u32.SetForegroundWindow(w.HWND(hwnd))
+    return _foreground_settles_on(hwnd, 0.05)
+
+
+def _focus_attach(hwnd):
+    """Rung 2: share an input queue with the current foreground thread.
+
+    A thread attached to the foreground thread's input queue inherits its right
+    to set the foreground window — the long-standing workaround for the lock.
+    """
     cur = _k32.GetCurrentThreadId()
     fg = foreground_hwnd()
-    # 0 when nothing holds focus — attaching to thread 0 is meaningless, so
-    # skip straight to the plain retry rather than pairing a bogus
-    # attach/detach.
+    # 0 when nothing holds focus — attaching to thread 0 is meaningless, and
+    # rung 1 already covered the plain retry.
     other = _u32.GetWindowThreadProcessId(w.HWND(fg), None) if fg else 0
     target = _u32.GetWindowThreadProcessId(w.HWND(hwnd), None)
     attached = [t for t in (other, target) if t and t != cur]
+    if not attached:
+        return False
     for t in attached:
         _u32.AttachThreadInput(cur, t, True)
     try:
         _u32.SetForegroundWindow(w.HWND(hwnd))
+        _u32.BringWindowToTop(w.HWND(hwnd))
+        # Verified while STILL ATTACHED: detaching first can hand activation
+        # back before the switch has settled.
+        return _foreground_settles_on(hwnd, 0.2)
     finally:
         for t in attached:
             _u32.AttachThreadInput(cur, t, False)
 
-    for _ in range(20):                      # up to ~200ms for the switch to settle
-        if foreground_hwnd() == hwnd:
-            return True
-        time.sleep(0.01)
-    return False
+
+def _focus_unlock(hwnd):
+    """Rung 3: zero the foreground lock timeout for the length of one call.
+
+    SetForegroundWindow is granted when "the foreground lock timeout has
+    expired".  Setting that timeout to zero makes it expired by definition,
+    which is the one lever that reliably moves the foreground window from a
+    process that has received no user input — exactly this process's situation,
+    since every keystroke here originates as a badge tap across the room.
+
+    fWinIni is deliberately 0: no SPIF_UPDATEINIFILE and no SPIF_SENDCHANGE, so
+    only the running value changes.  Nothing is written to the user's profile
+    and no broadcast goes out.  The original is restored in a finally, so the
+    window in which the machine's setting differs is one acquisition, ~10 ms.
+    """
+    old = w.DWORD()
+    got = _u32.SystemParametersInfoW(
+        SPI_GETFOREGROUNDLOCKTIMEOUT, 0,
+        ctypes.cast(ctypes.byref(old), ctypes.c_void_p), 0)
+    # The SET form takes the new value IN the pvParam slot, not a pointer to it.
+    _u32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0,
+                               ctypes.c_void_p(0), 0)
+    try:
+        _u32.SetForegroundWindow(w.HWND(hwnd))
+        _u32.BringWindowToTop(w.HWND(hwnd))
+        return _foreground_settles_on(hwnd, 0.2)
+    finally:
+        if got:
+            _u32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0,
+                                       ctypes.c_void_p(old.value), 0)
+
+
+def _focus_switch(hwnd):
+    """Rung 4: SwitchToThisWindow — the Alt-Tab path.
+
+    Undocumented, present since Windows 2000, and not subject to the same
+    refusal as SetForegroundWindow.  Last resort precisely because it is the
+    only rung whose behavior is not contractual.
+    """
+    if _SwitchToThisWindow is None:
+        return False
+    _SwitchToThisWindow(w.HWND(hwnd), True)
+    return _foreground_settles_on(hwnd, 0.2)
+
+
+_FOCUS_RUNGS = (("setforegroundwindow", _focus_plain),
+                ("attachthreadinput", _focus_attach),
+                ("lock-timeout override", _focus_unlock),
+                ("switchtothiswindow", _focus_switch))
+
+
+def _focus(hwnd):
+    """Bring the target forward and CONFIRM it actually got focus.
+
+    Returns (ok, how) — how names the rung that succeeded, or "already" when
+    the window was foreground to begin with, so the log records not merely that
+    focus was obtained but by what means.
+
+    SendInput goes to whatever window holds the foreground.  There is no "send
+    to this HWND", so acquiring focus IS the targeting mechanism, and this is
+    the step that decides where a keystroke lands.  SetForegroundWindow alone
+    is not enough: Windows refuses it, silently, for a process that has not
+    recently received user input — and this process never has.  Hence a ladder
+    of increasingly forceful, individually verified attempts.
+
+    An unverified focus is failure.  Nothing here ever falls back to "type into
+    whatever is focused now" — that is the one outcome this guard exists to
+    prevent, and a wrong window is worse than a dropped keystroke.
+    """
+    if foreground_hwnd() == hwnd:
+        return True, "already"
+    if _u32.IsIconic(w.HWND(hwnd)):
+        _u32.ShowWindow(w.HWND(hwnd), SW_RESTORE)
+    for name, rung in _FOCUS_RUNGS:
+        if rung(hwnd):
+            return True, name
+    return False, "failed"
 
 
 def _key_events(vk, down=True, up=True, extended=False):
@@ -352,14 +480,26 @@ def _guarded_send(batches, label, gap_s=0.0, before_send=None):
         if hwnd is None:
             _log(f"REFUSED {label}: no valid target window")
             return False
-        if not _focus(hwnd):
+        focused, how = _focus(hwnd)
+        if not focused:
             # foreground=0 means no foreground window at all — usually the
             # screensaver or a locked/secure desktop, i.e. nothing was going
             # to be typed anywhere.  Logged so the condition is named rather
-            # than guessed at.
+            # than guessed at; lock_timeout is included because it is the one
+            # number that explains a refusal and cannot be guessed.
             _log(f"ABORTED {label}: could not confirm focus on hwnd={hwnd} "
-                 f"(foreground={foreground_hwnd()})")
+                 f"(foreground={foreground_hwnd()}, "
+                 f"lock_timeout={foreground_lock_timeout()}) "
+                 f"— all {len(_FOCUS_RUNGS)} focus rungs declined")
             return False
+        if how != "already":
+            # Which rung won is the record of how hard Windows made us work for
+            # the foreground, and the first thing to read if keystrokes start
+            # going missing again.
+            _log(f"focus taken via {how} for {label} -> hwnd={hwnd}")
+            # The window was activating a moment ago; a terminal can drop a key
+            # delivered mid-transition.  Only on the path that changed focus.
+            time.sleep(FOCUS_SETTLE_S)
         if before_send is not None and not before_send():
             _log(f"FAILED {label}: pre-send action")
             return False
@@ -513,6 +653,11 @@ def _report():
     print(f"sizeof(INPUT)  : {ctypes.sizeof(_INPUT)}  (must be 40 on x64)")
     print(f"escape gap     : {ESCAPE_GAP_S:.3f}s")
     print(f"continue gap   : {CONTINUE_GAP_S:.3f}s")
+    print(f"focus settle   : {FOCUS_SETTLE_S:.3f}s")
+    # Large or INT_MAX means the "lock timeout has expired" grant never opens on
+    # this machine, so rung 3 is the one carrying the feature.  Worth seeing
+    # before wondering why keystrokes only land on an already-focused window.
+    print(f"fg lock timeout: {foreground_lock_timeout()} ms")
     print(f"armed          : {is_active()}  (always False in a fresh process)")
     print()
     return vibewin._report()

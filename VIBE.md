@@ -23,6 +23,7 @@ something else and it drives that instead.
 - [The single-instance gate](#the-single-instance-gate)
 - [Detecting the candidates](#detecting-the-candidates)
 - [Keystroke injection](#keystroke-injection)
+  - [Taking the foreground](#taking-focus)
 - [Guardrails](#guardrails)
 - [Configuration](#configuration)
 - [Known gotchas](#known-gotchas)
@@ -230,7 +231,7 @@ stable since Windows 2000.
 | Key codes | `VK_RETURN`, `VK_ESCAPE`, `VK_RIGHT`, `VK_1`…`VK_9`, `VK_CONTROL`, `VK_V`, `VK_SHIFT` → scancode via `MapVirtualKeyW` |
 | Wake nudge | `SendInput` with `INPUT_MOUSE`, `MOUSEEVENTF_MOVE`, relative `+1` then `−1` |
 | Find window | `EnumWindows` + `GetWindowTextW` + `GetClassNameW` + `IsWindowVisible` |
-| Focus | `SetForegroundWindow`, **verified** with `GetForegroundWindow`; `AttachThreadInput` + `ShowWindow(SW_RESTORE)` fallback |
+| Focus | A four-rung ladder, every rung **verified** with `GetForegroundWindow`: `SetForegroundWindow` → `AttachThreadInput` → `SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0)` → `SwitchToThisWindow`. Plus `ShowWindow(SW_RESTORE)` when minimized. See [Taking the foreground](#taking-focus) |
 | Clipboard | `OpenClipboard` / `EmptyClipboard` / `GlobalAlloc` / `SetClipboardData(CF_UNICODETEXT)` / `CloseClipboard` |
 
 **Scancodes, not virtual keys** — console hosts and terminal emulators read
@@ -239,6 +240,51 @@ scancodes far more reliably than synthesized VK-only events.
 `sizeof(INPUT)` must be **40** on x64. A wrong size makes `SendInput` fail
 *silently* by returning 0, so `python vibekeys.py` prints it rather than
 assuming it.
+
+### Taking the foreground {#taking-focus}
+
+**`SendInput` goes to whatever window holds the foreground.** There is no "send
+to this HWND", so acquiring focus *is* the targeting mechanism, and `_focus()`
+is the step that decides where a keystroke lands.
+
+**`SetForegroundWindow` alone will not do it.** Windows refuses it, silently,
+for a process that has not recently received user input — and this process never
+has: the input is a badge tap across the room. The documented escape hatch is
+the foreground lock timeout (`SPI_GETFOREGROUNDLOCKTIMEOUT`), and that value is
+**not something you can assume**. It defaults to 200000 ms but is commonly
+tuned; one Windows 11 desktop measured `2147483647` — INT_MAX, meaning the lock
+never expires on its own and the "timeout expired" grant is permanently closed
+there. On such a machine, keystrokes land only when the target window already
+happens to be focused, which defeats the entire point of the feature.
+
+So focus is acquired by a ladder, in order, each rung verified by polling
+`GetForegroundWindow` rather than by trusting a return value — on these APIs,
+returning TRUE and actually changing the foreground are different claims:
+
+| # | Rung | Why it might win |
+|---|---|---|
+| 1 | `SetForegroundWindow` | Whenever the lock is not in force. Free, ~11 ms |
+| 2 | `AttachThreadInput` to the foreground thread, then set + `BringWindowToTop` | A thread sharing the foreground thread's input queue inherits its right. Verified **while still attached** — detaching first can hand activation back before the switch settles |
+| 3 | Zero `SPI_SETFOREGROUNDLOCKTIMEOUT` for the length of one call | Makes "the lock timeout has expired" true by definition. The rung that answers a large or infinite timeout, and the one expected to do the real work |
+| 4 | `SwitchToThisWindow(hwnd, TRUE)` | The Alt-Tab path. Undocumented, hence last, and resolved with `getattr` so a future Windows that drops it costs one rung rather than an import error |
+
+**Rung 3 persists nothing.** `fWinIni` is deliberately **0** — no
+`SPIF_UPDATEINIFILE`, no `SPIF_SENDCHANGE` — so only the running value changes;
+nothing is written to the user's profile and no broadcast goes out. The original
+is restored in a `finally`, so the window in which the machine's setting differs
+is one acquisition, ~10 ms.
+
+**The refusal path is absolute and unchanged.** If all four rungs decline, the
+send is **aborted** and nothing is injected anywhere. There is no fallback to
+"type into whatever is focused now" — a wrong window is worse than a dropped
+keystroke. The abort line carries `lock_timeout=` alongside `foreground=`,
+because that number explains most refusals and cannot be guessed.
+
+`SDK_VIBE_FOCUS_SETTLE_MS` (default 60) pauses after the foreground actually
+*changes*, before the keys go out: a terminal can swallow a key delivered
+mid-activation. It is paid only on the path that had to acquire focus. Which
+rung won is logged (`focus taken via lock-timeout override for enter`) and only
+when a rung was needed — an already-foreground window stays quiet.
 
 ### Waking a blanked display {#wake}
 
@@ -283,9 +329,10 @@ Every one of these is load-bearing:
   re-check of class and title, because an HWND can be recycled).
 - **Focus is verified, never assumed.** `SetForegroundWindow` is silently
   refused for processes without recent user input, so the return value is not
-  trustworthy on its own. If focus cannot be confirmed the send is **aborted,
-  never redirected** — that is what stops a stray Enter from landing in another
-  application.
+  trustworthy on its own — and one attempt is not enough either, hence the
+  four-rung ladder in [Taking the foreground](#taking-focus). If focus cannot be
+  confirmed the send is **aborted, never redirected** — that is what stops a
+  stray Enter from landing in another application.
 - **One injection at a time.** Connection handlers run on their own threads;
   overlapping sends would fight over the foreground window.
 - **Every injection is logged** to the server console with the target HWND. The
@@ -304,6 +351,7 @@ All environment variables, read at import, all optional:
 | `SDK_VIBE_NAME_MAX_WORDS` | `6` | Cap on the spoken session name |
 | `SDK_VIBE_ESCAPE_GAP_MS` | `80` | Gap between the two ESC presses |
 | `SDK_VIBE_CONTINUE_GAP_MS` | `80` | Gap between Right Arrow and Enter |
+| `SDK_VIBE_FOCUS_SETTLE_MS` | `60` | Pause after *taking* the foreground, before the keys go out |
 
 **To drive something other than Claude Code**, set the first three. Run `python
 vibewin.py` to see every window of your chosen class and which ones the title
@@ -345,9 +393,11 @@ re-validation.
 survived testing because the test hit an earlier `return` and never reached the
 validation. When testing a refusal, confirm *which* check did the refusing.
 
-**Focus stealing is real.** `SendInput` goes to the foreground window, so
-injection must focus the target first — which is why `_focus()` verifies rather
-than hopes. Relatedly, if you are tempted to add an always-on-top overlay for
+**Focus stealing is real, and it is harder than it looks.** `SendInput` goes to
+the foreground window, so injection must focus the target first — which is why
+`_focus()` verifies rather than hopes, and why one call to `SetForegroundWindow`
+is not the whole story ([Taking the foreground](#taking-focus)). Relatedly, if
+you are tempted to add an always-on-top overlay for
 this feature: a Tk window created with `overrideredirect(True)` and
 `WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW`, shown via
 `SW_SHOWNOACTIVATE`, **still took foreground** on Windows 11 — on the initial
