@@ -6,6 +6,8 @@ See <LICENSE.md>.  This SDK is essentially a component of TOS and subject to its
 
 Turn a Bluetooth combadge into a working communicator and control system with a "main computer" behind it.
 
+(While this SDK was primarily designed with the Fametek TNG Combadge in mind, it's built on Linux & Windows and is wired into the Bluetooth stack, and therefore can work with any bluetooth headset with a standard HFP button - essentially compatible with any two-way communication device (mic+speakers) with a standard Play/Pause button, such as the Sony WH1000XM3, as one of countless examples of devices with this capability.)
+
 The FameTek Star Trek: TNG combadge pairs as an ordinary Bluetooth Hands-Free headset — out of the box it can answer your phone (bi-directional comms), play audio (music, notification sounds), and it has a single- and double-tap button for interaction.  What I see in this device is the 24th century modality of human-computer interaction brought to life.  Thank you, Fametek:  As far as building the rest of the ship:  I'll take it from here.  :)
 
 This SDK gives the badge what it always implied: a computer on the other end. Three small Python scripts turn a badge tap into a complete voice command pipeline — tap the badge, hear a chirp, speak a phrase, and a synthesized voice answers back through the badge speaker. What a phrase *does* is yours to define in a plain Python dict: report the time, run a shell command, hit an API, switch the lights — anything the server machine can reach.
