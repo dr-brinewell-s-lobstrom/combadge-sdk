@@ -255,12 +255,85 @@ systemctl --user restart wireplumber
 
 ## <a name="transceiver-py"></a>4. Minimal `transceiver.py` — Connection Manager
 
-`transceiver.py` runs as **root** and does four things in a loop:
+`transceiver.py` runs as **root** and runs **two loops, not one** (see *Why two loops* below — it is the most important design point in the file):
 
-1. Find a paired device whose name contains `TNG COMBADGE` via `bluetoothctl paired-devices`.
-2. Issue `bluetoothctl connect <MAC>`. Poll `pactl list cards short` until `bluez_card.<MAC>` appears (up to ~15 s).
-3. Set the card profile to `headset-head-unit` so the HFP source and sink are exposed.
-4. Spawn `listener.py` as the invoking user, in the `input` group, with the user's session environment.
+**DETECT loop** (main thread, every `SDK_DETECT_INTERVAL`, default 2 s) — cheap, and never blocks:
+
+1. Find **all** paired devices whose name contains `TNG COMBADGE` via `bluetoothctl paired-devices` (cached 60 s), optionally narrowed by `SDK_BADGE_MAC`.
+2. Ask which of them is connected — one `bluetoothctl devices Connected` query for all of them (falls back to `info <MAC>` on BlueZ < 5.65).
+3. On a **new link, however it was established**: poll `pactl list cards short` until `bluez_card.<MAC>` appears, set the card profile to `headset-head-unit` so the HFP source and sink are exposed, wait for the sink.
+4. Spawn `listener.py` as the invoking user, in the `input` group, with the user's session environment. Restart it if it exits; stop it when the badge goes away.
+
+**PAGE loop** (background thread, every `SDK_PAGE_GAP`, default 5 s, only while disconnected):
+
+5. `bluetoothctl connect <MAC>` — reach out to a badge that has not reached out to us.
+
+### Why two loops
+
+The obvious design is one loop that checks, then connects, then sleeps. **Do not write that.** It is what this file used to be, and it is slow for a reason that is invisible until you measure it.
+
+`bluetoothctl connect` against a badge that is switched off or out of range does **not** fail fast. It blocks for the controller's **page timeout** — BlueZ's default is `0x2000` slots × 0.625 ms = **5.12 s** — before reporting failure. Checking whether a badge is connected, by contrast, is a D-Bus property read costing milliseconds.
+
+Put both in one loop and the cheap operation is held hostage by the expensive one. That matters more than it sounds, because **a badge often connects itself**: powering it on makes it page the host it was last paired with. Measured in the reference TOS deployment over 8,951 retry cycles, **24% of all links were badge-initiated** — and for every one of those, the connect attempt was pointless while the badge sat unnoticed for a mean of 8 s behind a loop busy paging a badge that was already on the line.
+
+Split them and detection costs whatever you set `SDK_DETECT_INTERVAL` to, while paging carries on in the background at its own pace.
+
+| | Before (one loop) | After (split) |
+|---|---|---|
+| Badge connects itself | mean 8 s, worst 16 s | **≤ ~2 s** |
+| Badge must be paged | mean 8 s | mean ~7.5 s |
+| Wasted card-poll per failed retry | **15 s** | 0 |
+
+### Bugs worth learning from
+
+All of these were live in this file. They are stated plainly because every one of them is easy to write again, and because four of the five fail *silently* — the system does the wrong thing without ever reporting an error:
+
+1. **Never poll for the side effect of an operation you did not confirm succeeded.** The old `connect_badge()` issued `bluetoothctl connect`, *ignored the result*, then polled up to 15 s for an audio card that cannot appear when the connect just failed. Every failed retry cost ~20 s of dead time on top of the 5 s page timeout. `page_badge()` now returns a checked boolean.
+2. **Post-connection setup must not live inside the connect path.** A badge that connects itself never calls your connect function, so any HFP setup hidden in there is skipped — leaving roughly a quarter of links on A2DP, where the badge microphone does not exist. `ensure_audio_ready()` is therefore called by the *detect* loop, for every link, however it was established.
+3. **Identity is the MAC, not the name.** Every TNG COMBADGE reports the same device *name*, so `find_paired_badges()` used to return the first name match and stop — which is whichever badge `bluetoothctl` happened to print first, not the one that is switched on. Pair two, carry one, and the transceiver pages the badge in the drawer forever while the badge in your hand is never even looked at. It now collects every match and the caller tries each.
+4. **A privileged helper must be given the target user's session, and omitting it fails as silence.** This one cost the most time, so it is worth the detail. `transceiver.py` runs under `sudo`, which **strips `XDG_RUNTIME_DIR`**; `runuser` without `-l` does not create a login session, so it does not restore it. A `pactl` launched that way looks for a PipeWire socket in a directory that does not belong to the target user, finds nothing, and reports **no cards and no error**. From the caller's side that is indistinguishable from a badge with no audio card.
+
+   Observed on PAN, 2026-08-08: a badge that `bluetoothctl info` showed as `Connected: yes`, `Bonded: yes`, `Trusted: yes`, `UUID: Handsfree`, battery 50% — a perfectly healthy badge — was being written off as unusable, repeatedly, because `pactl` was querying the wrong session. Every `pactl` and `systemctl --user` call now goes through `run_as_user()`, which attaches `XDG_RUNTIME_DIR=/run/user/<uid>`. If `pactl` works for you in a terminal but returns nothing from a root helper, this is why. `ensure_audio_ready()` now also says so explicitly when it sees *no cards at all*, rather than blaming the badge.
+
+5. **"Connected" and "usable" are not the same thing — and confusing them livelocks the split.** BlueZ can hold an ACL link open to a badge whose audio profile never came up (`br-connection-profile-unavailable`): it reports `Connected: yes` while no `bluez_card.<MAC>` ever appears. The detect loop then keeps selecting that badge and waiting out its 15 s card poll, while the page loop — correctly told "a badge is connected" — stands down and never pages any other badge.
+
+   **Note the shape of this failure: the split makes the two loops depend on one shared boolean, so any state that is neither cleanly connected nor cleanly absent can wedge both.** That is the structural cost of splitting the loops, and it is worth paying, but it has to be handled. The fix is `quarantine()`: a badge that connects but yields no audio card is disconnected, stood down for 60 s, and the connected flag cleared so paging resumes on the others — after the audio stack has been restarted and the badge retried once, because a dead session (bug 4) looks exactly like a dead badge from here, and the badge is the more expensive thing to discard wrongly.
+
+### Two badges, one at a time
+
+Pair as many badges as you like. The transceiver discovers **all** of them and connects to **whichever one is switched on** — so you can swap badges freely without restarting anything:
+
+```
+[transceiver] badge online: 1B:B8:82:88:2F:60
+   …switch that badge off, switch the other on…
+[transceiver] 1B:B8:82:88:2F:60 disconnected, stopping listener.py
+[transceiver] paging 2C:F2:DF:45:EC:28...
+[transceiver] badge changed: 1B:B8:82:88:2F:60 -> 2C:F2:DF:45:EC:28
+```
+
+`listener.py` is restarted with the new `BADGE_MAC`, so audio, taps and the server handshake all follow the badge you are actually holding.
+
+The **expected pattern is one badge on at a time.** Two badges connected to a single transceiver simultaneously is out of scope: there is one `listener.py`, so the first-connected badge wins and the second is ignored until the first goes away. (Two badges *do* work in TOS proper — but as two separate relay hosts, which is what the intercom needs; see `INTERCOM.md`.)
+
+Swap speed: a sweep pages each badge in turn, and an absent badge costs ~5 s of page timeout. The sweep **rotates which badge it tries first** — without that, the badge you just switched off would always be paged first and always burn its full timeout before the badge you just switched on was even tried, making the most common operation the slowest one.
+
+### Pinning one badge (`SDK_BADGE_MAC`)
+
+Optional. Leave it unset to accept any paired TNG COMBADGE — that is the right default, and it is what makes swapping work. Set it only when you want to *exclude* a badge (a faulty one, or one you have moved to another host):
+
+```bash
+sudo SDK_BADGE_MAC=1B:B8:82:88:2F:60 python3 transceiver.py
+```
+
+Comma-separate for several (`SDK_BADGE_MAC=1B:B8:82:88:2F:60,2C:F2:DF:45:EC:28`). Matching is case-insensitive. Find your badge's MAC with `bluetoothctl paired-devices`. The transceiver prints its active filter on startup, and says so explicitly if the pinned badge is not paired — rather than silently waiting forever.
+
+### Battery — which battery
+
+A natural worry is that a faster loop drains the badge. It does not, and the reason is worth internalising before tuning anything:
+
+- **Paging costs the host, not the badge.** `bluetoothctl connect` transmits page trains from the *host* radio. The badge sits in page scan at a duty cycle fixed by its own firmware and cannot tell how often you page it.
+- **What costs the badge is SCO** — bringing the audio link up, playing through its speaker, tearing it down. That is its highest-power activity by a wide margin. To save badge battery, look at how often you play audio to it, not at how often you poll.
+- **What costs the host is `SDK_DETECT_INTERVAL`.** Each pass forks a subprocess and does a D-Bus round trip. At 2 s that is negligible; at 0 it is a busy loop that keeps a core warm permanently. On a battery-powered relay host (Pi, laptop) keep it ≥ 0.5. For genuinely instant detection at zero idle cost the answer is not a tighter poll but a D-Bus signal subscription on `org.bluez.Device1`'s `Connected` property.
 
 **Why root?** `runuser` (drop privileges into the user's session for `pactl`/`pw-play`) requires root. `sg input -c …` (so `listener.py` can open `/dev/input/eventX`) likewise requires root unless the caller is already in `input`. `bluetoothctl` itself does **not** require root — it talks to BlueZ over D-Bus.
 
@@ -272,6 +345,12 @@ Run it as:
 ```bash
 sudo SDK_SERVER_HOST=192.168.50.5 SDK_SERVER_PORT=1701 python3 transceiver.py
 ```
+
+Tuning knobs (all optional; intervals shown at their defaults):
+```bash
+sudo SDK_DETECT_INTERVAL=2 SDK_PAGE_GAP=5 SDK_BADGE_MAC=1B:B8:82:88:2F:60 python3 transceiver.py
+```
+`SDK_DETECT_INTERVAL` is the reconnect latency you feel. `SDK_PAGE_GAP` is the wait *between* connect attempts — each attempt against an absent badge costs ~5 s of page timeout regardless, so the effective retry period is roughly `5 + SDK_PAGE_GAP`. `SDK_BADGE_MAC` pins a specific badge; see *Choosing a badge* above.
 
 See `transceiver.py` in this folder for the runnable minimal version.
 
