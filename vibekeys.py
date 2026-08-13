@@ -73,7 +73,11 @@ def _gap_s(env_key, default_ms):
 
 
 ESCAPE_GAP_S = _gap_s("SDK_VIBE_ESCAPE_GAP_MS", "80")
-CONTINUE_GAP_S = _gap_s("SDK_VIBE_CONTINUE_GAP_MS", "80")
+CONTINUE_GAP_S = _gap_s("SDK_VIBE_CONTINUE_GAP_MS", "250")
+# Gap between a Ctrl+V and an Enter that submits it.  MUST NOT be zero — see
+# paste_and_submit() for the full account of why, and why the zero it replaced
+# looked correct.
+PASTE_GAP_S = _gap_s("SDK_VIBE_PASTE_GAP_MS", "250")
 # Pause after TAKING the foreground, before the keys go out — a terminal can
 # swallow a key delivered while its window is still activating.  Paid only when
 # focus actually had to be acquired.  See _focus().
@@ -468,9 +472,17 @@ def _guarded_send(batches, label, gap_s=0.0, before_send=None):
     """The only path to SendInput.  Armed -> target -> focus -> verify -> send.
 
     batches: list of event lists.  Multiple batches are sent through a SINGLE
-    focus acquisition, separated by gap_s — used by the double-ESC and the
-    continue pair, where the presses must be distinct in time but must not
-    race a focus change between them.
+    focus acquisition, separated by gap_s — used by the double-ESC, the
+    continue pair and the paste/submit pair, where the presses must be distinct
+    in time but must not race a focus change between them.
+
+    Whenever a gap is taken, the foreground is RE-CHECKED before the next batch
+    goes out.  Sleeping inside a send is a window in which focus can move, so
+    without this a LONGER gap would mean more exposure to a stray Enter landing
+    in whatever stole the foreground — and every gap here has had to grow at
+    some point to fix a dropped keystroke.  With the re-check, a gap costs
+    nothing but time: if focus moved we abort mid-sequence instead of finishing
+    the send somewhere it was never aimed (2026-08-13).
     """
     if not is_active():
         _log(f"REFUSED {label}: vibe control is not active")
@@ -505,8 +517,14 @@ def _guarded_send(batches, label, gap_s=0.0, before_send=None):
             return False
         ok = True
         for i, events in enumerate(batches):
-            if i:
+            if i and gap_s > 0:
                 time.sleep(gap_s)
+                fg = foreground_hwnd()
+                if fg != hwnd:
+                    _log(f"ABORTED {label}: foreground moved to hwnd={fg} "
+                         f"during the {gap_s:.3f}s gap before batch {i + 1} of "
+                         f"{len(batches)} — remaining batches not sent")
+                    return False
             ok = _send(events) and ok
         _log(f"{'sent' if ok else 'FAILED'} {label} -> hwnd={hwnd}")
         return ok
@@ -583,11 +601,19 @@ def press_continue():
     keys go through ONE focus acquisition, so the Enter cannot race a focus
     change and land somewhere the Right Arrow did not.
 
-    The gap between them is SDK_VIBE_CONTINUE_GAP_MS (default 80 ms), NOT the
+    The gap between them is SDK_VIBE_CONTINUE_GAP_MS (default 250 ms), NOT the
     escape gap — it exists for a different reason and must be tunable apart
     from it.  Here it gives the TUI time to accept the completion and re-render
     before Enter arrives; an Enter that beat the autocomplete would submit an
     empty composer.
+
+    Raised 80 ms -> 250 ms on 2026-08-13 alongside the paste fix in
+    paste_and_submit().  Same class of fault: 80 was chosen as "comfortably more
+    than zero" rather than measured against how long a TUI actually takes to
+    accept a completion and re-render through ConPTY, and the symptom of it
+    being short is intermittent rather than reproducible.  The gap is covered by
+    the foreground re-check in _guarded_send(), so the extra 170 ms costs
+    nothing but 170 ms.
 
     This is the one place the Right Arrow is reachable at all: it is half of a
     fixed pair, never a standalone verb, so the "no arbitrary keys" property
@@ -663,11 +689,30 @@ def paste_and_submit(text):
     keeps the autocomplete.
 
     Both batches go through ONE focus acquisition, so the Enter cannot race a
-    focus change and land somewhere the paste did not.  No gap between them:
-    keystrokes are delivered in input-queue order, so an Enter cannot overtake
-    a paste the way it can overtake an autocomplete — which is the race
-    CONTINUE_GAP_S exists for.  If an empty composer is ever submitted, that
-    is the knob.
+    focus change and land somewhere the paste did not.  They are separated by
+    SDK_VIBE_PASTE_GAP_MS (default 250 ms).
+
+    THAT GAP USED TO BE ZERO, and the argument for zero is worth preserving
+    because it is wrong in an instructive way: "keystrokes are delivered in
+    input-queue order, so an Enter cannot overtake a paste."  Delivery order is
+    genuinely guaranteed, and it is genuinely not what decides this.  The
+    question is whether the receiving TUI PROCESSES the '\r' as a submit
+    keypress, and it does not always get the chance to.  Ctrl+V reaches the
+    application as a bracketed-paste burst (ESC[200~ ... ESC[201~) through the
+    terminal and, on Windows, ConPTY; TUI input layers coalesce stdin that
+    arrives within one tick into a single chunk.  A '\r' caught inside that
+    chunk is absorbed into the pasted TEXT as a literal newline instead of
+    being dispatched as a key.  The text lands in the composer and nothing is
+    submitted.
+
+    Because it turns on terminal and renderer scheduling, this fails
+    INTERMITTENTLY — the Captain's report was that "computer continue"
+    sometimes types the word without submitting and sometimes works
+    (2026-08-13).  An intermittent no-op is the expensive shape for a voice
+    command: from across the room a silent failure is indistinguishable from
+    the model still thinking, so it costs a repeat and a doubt about whether
+    the badge heard anything.  250 ms is well past any plausible coalescing
+    window and invisible next to the badge dispatch that precedes it.
 
     Distinct from paste_text() on purpose, and the two must stay distinct.
     That one is the dictation hook and deliberately never presses Enter;
@@ -688,6 +733,7 @@ def paste_and_submit(text):
              + _key_events(VK_CONTROL, down=False))
     return _guarded_send([paste, _key_events(VK_RETURN)],
                          f"paste ({len(text)} chars), enter",
+                         gap_s=PASTE_GAP_S,
                          before_send=lambda: set_clipboard(text))
 
 
@@ -697,6 +743,7 @@ def _report():
     print(f"sizeof(INPUT)  : {ctypes.sizeof(_INPUT)}  (must be 40 on x64)")
     print(f"escape gap     : {ESCAPE_GAP_S:.3f}s")
     print(f"continue gap   : {CONTINUE_GAP_S:.3f}s")
+    print(f"paste gap      : {PASTE_GAP_S:.3f}s  (must be > 0 — see paste_and_submit)")
     print(f"focus settle   : {FOCUS_SETTLE_S:.3f}s")
     # Large or INT_MAX means the "lock timeout has expired" grant never opens on
     # this machine, so rung 3 is the one carrying the feature.  Worth seeing

@@ -366,7 +366,8 @@ All environment variables, read at import, all optional:
 | `SDK_VIBE_REQUIRE_AGREEMENT` | `true` | Refuse when the window and process counts disagree |
 | `SDK_VIBE_NAME_MAX_WORDS` | `6` | Cap on the spoken session name |
 | `SDK_VIBE_ESCAPE_GAP_MS` | `80` | Gap between the two ESC presses |
-| `SDK_VIBE_CONTINUE_GAP_MS` | `80` | Gap between Right Arrow and Enter |
+| `SDK_VIBE_CONTINUE_GAP_MS` | `250` | Gap between Right Arrow and Enter (`computer carry on`) |
+| `SDK_VIBE_PASTE_GAP_MS` | `250` | Gap between Ctrl+V and the Enter that submits it (`computer continue`). **Never set this to 0** — see below |
 | `SDK_VIBE_FOCUS_SETTLE_MS` | `60` | Pause after *taking* the foreground, before the keys go out |
 
 **To drive something other than Claude Code**, set the first three. Run `python
@@ -374,6 +375,34 @@ vibewin.py` to see every window of your chosen class and which ones the title
 pattern matches — that report is the tuning instrument.
 
 ## Known gotchas {#known-gotchas}
+
+**A paste and the Enter that submits it must not share a tick.** This is why
+`SDK_VIBE_PASTE_GAP_MS` exists and why it must never be zero. It *was* zero
+until 2026-08-13, on an argument that sounds airtight — *`SendInput` delivers in
+input-queue order, so an Enter cannot overtake a paste*. Delivery order is
+genuinely guaranteed and genuinely not the issue. What matters is whether the
+receiving TUI **processes** the `\r` as a submit keypress:
+
+- Ctrl+V arrives as a **bracketed-paste burst** (`ESC[200~` … `ESC[201~`),
+  through the terminal and, on Windows, ConPTY.
+- TUI input layers **coalesce** stdin arriving within one tick into one chunk.
+- A `\r` caught inside that chunk is absorbed into the pasted **text** as a
+  literal newline rather than dispatched as a key. The text appears in the
+  composer and nothing is submitted.
+
+Because it turns on terminal and renderer scheduling, it fails
+**intermittently** — the report that prompted the fix was that `computer
+continue` sometimes typed the word without submitting and sometimes worked.
+Budget generously: 250 ms is far past any plausible coalescing window and
+invisible next to the badge dispatch that precedes it. If you retarget this SDK
+at a different TUI, this is the first knob to suspect and the last one to trim.
+
+**Gaps are safe to lengthen, because the foreground is re-checked across them.**
+Any sleep inside a send is a window in which focus can move, so lengthening a
+gap would otherwise trade a dropped keystroke for a misdirected one — strictly
+worse. `_guarded_send` re-reads `GetForegroundWindow` after every gap it takes
+and aborts the remaining batches if the window moved, naming where it went in
+the log. Keep that check if you add gaps of your own.
 
 **The Right Arrow is an extended key, and getting it wrong is silent.**
 `MapVirtualKeyW` returns the *same* scancode `0x4D` for `VK_RIGHT` and for
