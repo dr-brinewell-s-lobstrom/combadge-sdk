@@ -670,6 +670,42 @@ Three things about it are worth knowing before you read <VIBE.md>:
 - **It refuses rather than guesses.** Exactly one target session may be running at activation; zero or several and it declines out loud, with no state left behind. Sessions are **counted** by process and **targeted** by window class + title, and the two counts must agree — a title rule that has silently stopped matching fails loudly instead of latching onto the wrong window.
 - **Commands that act, chirp — they don't talk.** `computer.py` grew an `ACK` sentinel for this: return it from any command to acknowledge with the badge's short chirp instead of a synthesized sentence. A spoken reply after every keystroke would make the mode unusable, and it's the right answer for any command whose effect you can already see.
 
+### Tuning
+
+Vibe Control's settings are listed in full in <VIBE.md>; three of them are gaps
+*inside* a fixed key pair, and they are the ones to know about here because they
+are the first things to reach for if you retarget this at a TUI other than the
+reference one:
+
+| Variable | Default | Gap between |
+|---|---|---|
+| `SDK_VIBE_ESCAPE_GAP_MS` | `80` | the two Escapes of `computer cancel` |
+| `SDK_VIBE_CONTINUE_GAP_MS` | `250` | Right Arrow and Enter (`computer carry on`) |
+| `SDK_VIBE_PASTE_GAP_MS` | `250` | Ctrl+V and the Enter that submits it (`computer continue`) |
+
+`python vibekeys.py` prints the values in force, which is quicker than reasoning
+about whether the environment reached the process.
+
+**Never set the paste gap to 0**, and be generous with the other two. It is
+tempting to argue the gap away — `SendInput` delivers in input-queue order, so
+an Enter cannot overtake a paste. Delivery order really is guaranteed and really
+is not what decides this: what matters is whether the receiving TUI *processes*
+the `\r` as a submit keypress. Ctrl+V arrives as a bracketed-paste burst
+(`ESC[200~` … `ESC[201~`) through the terminal and, on Windows, ConPTY, and TUI
+input layers coalesce stdin arriving within one tick into a single chunk — a
+`\r` caught inside that chunk is absorbed into the pasted *text* as a literal
+newline instead of being dispatched as a key. The text lands in the composer and
+nothing is submitted. Because it turns on terminal and renderer scheduling it
+fails **intermittently**, which is the expensive shape for a voice command: from
+across the room a silent no-op is indistinguishable from the program still
+thinking.
+
+Lengthening these costs nothing but the milliseconds. A sleep inside a send is
+normally a window for focus to move — trading a dropped keystroke for a
+misdirected one, which is worse — but the injector re-reads the foreground
+window after every gap and **aborts the rest of the sequence** if it moved,
+rather than finishing the send somewhere it was never aimed.
+
 On a non-Windows server the import fails, the phrases are absent, and everything else is unchanged.
 
 ## <a name="large-vocab"></a>11. Large-Vocabulary Dictation — `captain's log` and `computer transcribe`
