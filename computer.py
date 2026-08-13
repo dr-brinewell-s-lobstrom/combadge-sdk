@@ -359,8 +359,15 @@ VIBE_COMMANDS = {} if vibekeys is None else {
     # Enter.
     "computer proceed":   lambda: _vibe(vibekeys.press_enter),
 
+    # Types the literal word "continue" and submits it.  Depends on nothing
+    # being on screen, so it advances the work whether or not Claude Code has
+    # offered a suggestion — unlike "carry on" below, which no-ops silently
+    # when there is no ghost text to accept.
+    "computer continue":  lambda: _vibe(vibekeys.paste_and_submit, "continue"),
+
     # Right Arrow then Enter: accept the suggested next action and submit it.
-    "computer continue":  lambda: _vibe(vibekeys.press_continue),
+    # NOT an alias of "computer continue" — the two do different things, and
+    # this is the only phrase here that both accepts AND submits in one go.
     "computer carry on":  lambda: _vibe(vibekeys.press_continue),
 
     # Escape, sent TWICE — a single press does not clear Claude Code's box.

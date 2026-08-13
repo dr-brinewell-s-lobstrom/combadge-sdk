@@ -79,7 +79,8 @@ vocabulary, which stays live (see [Modal takeover](#modal-takeover)):
 | Phrase | Key(s) |
 |---|---|
 | `computer proceed` | Enter |
-| `computer continue` / `computer carry on` | Right Arrow, then Enter |
+| `computer continue` | paste the literal `continue`, then Enter |
+| `computer carry on` | Right Arrow, then Enter |
 | `computer cancel` | Escape, twice |
 | `computer option one` … `computer option nine` | `1` … `9` |
 | `computer wake up` | as above |
@@ -89,11 +90,26 @@ vocabulary, which stays live (see [Modal takeover](#modal-takeover)):
 highlighted entry — the first by default. That covers "just take the default"
 with no special-casing, and it submits a composed prompt too.
 
-**`computer continue` is the two-key one.** When Claude Code settles it offers a
+**`computer carry on` is the two-key one.** When Claude Code settles it offers a
 recommended next action as ghost text in the composer: Right Arrow autocompletes
 it, Enter submits it. Both keys go through **one** focus acquisition, so the
 Enter cannot race a focus change and land somewhere the Right Arrow did not.
-`computer carry on` is an alias for the same action.
+
+**`computer continue` advances unconditionally.** It pastes the literal word
+`continue` and submits it, via `paste_and_submit()`. Nothing about it reads the
+screen, so it behaves the same whether or not a suggestion is showing — which is
+the point. `carry on` is a **silent no-op** when there is no ghost text to
+accept: the Right Arrow only moves the cursor in an empty composer and the Enter
+then submits nothing, while the badge has already chirped the command as
+dispatched. The two phrases were one alias until that failure mode made the
+reliable case worth its own verb.
+
+`paste_and_submit()` is deliberately **not** `paste_text()`. That one is the
+dictation path and never presses Enter, because keeping submission a separate
+act is the whole safety argument for dictation (see [Philosophy](#philosophy)).
+A fixed literal declared in `VIBE_COMMANDS` is not dictation — you chose the
+words when you wrote the command, not by speaking into a recognizer — so
+submitting it here leaves that invariant intact. Keep them separate.
 
 **Number words, not digits.** Vosk's small model has no token for `1`. A phrase
 containing a bare digit becomes unmatchable by voice — hence `computer option

@@ -628,23 +628,67 @@ def set_clipboard(text):
 def paste_text(text):
     """Stage text on the clipboard and Ctrl+V it into the latched window.
 
-    Enter is deliberately NOT pressed.  No voice command in the shipped
-    vocabulary calls this — it is the hook for anyone adding dictation on top
-    of the SDK: swap the recognizer to a large model, capture free-form
-    speech, and land it in the composer with this.  Keeping submission a
-    SEPARATE, deliberate act is the whole safety argument for that feature;
-    see sdk/VIBE.md -> Philosophy.
+    Enter is deliberately NOT pressed.  This is where dictation lands —
+    finish_transcribe() in computer.py hands `computer transcribe` results
+    here — and keeping submission a SEPARATE, deliberate act is the whole
+    safety argument for that feature; see sdk/VIBE.md -> Philosophy.
+
+    The clipboard is written from before_send, i.e. only once every guard has
+    passed and the paste is about to land.  Writing it up front would destroy
+    whatever the user had copied even when the injection is then refused —
+    window closed, focus declined, mode not active — and it would do so
+    silently, because a refusal is not something the speaker hears.  The same
+    check also aborts rather than Ctrl+V'ing stale clipboard content if the
+    write itself fails.
     """
     if not text.strip():
         _log("REFUSED paste: empty text")
         return False
-    if not set_clipboard(text):
-        _log("FAILED paste: clipboard write failed")
-        return False
     events = (_key_events(VK_CONTROL, up=False)
               + _key_events(VK_V)
               + _key_events(VK_CONTROL, down=False))
-    return _guarded_send([events], f"paste ({len(text)} chars)")
+    return _guarded_send([events], f"paste ({len(text)} chars)",
+                         before_send=lambda: set_clipboard(text))
+
+
+def paste_and_submit(text):
+    """Paste a literal from the vocabulary into the latched window, and submit.
+
+    The deterministic counterpart to press_continue().  It reads nothing off
+    the screen, so it behaves identically whether or not Claude Code has
+    settled with a suggestion.  press_continue() is a silent no-op when no
+    ghost text is showing — the Right Arrow only moves the cursor in an empty
+    composer and the Enter then submits nothing — which is why the shipped
+    "computer continue" is built on this instead, and "computer carry on"
+    keeps the autocomplete.
+
+    Both batches go through ONE focus acquisition, so the Enter cannot race a
+    focus change and land somewhere the paste did not.  No gap between them:
+    keystrokes are delivered in input-queue order, so an Enter cannot overtake
+    a paste the way it can overtake an autocomplete — which is the race
+    CONTINUE_GAP_S exists for.  If an empty composer is ever submitted, that
+    is the knob.
+
+    Distinct from paste_text() on purpose, and the two must stay distinct.
+    That one is the dictation hook and deliberately never presses Enter;
+    keeping submission out of it is the entire safety argument for dictation
+    (sdk/VIBE.md -> Philosophy).  A fixed literal declared in the vocabulary
+    is not dictation — you chose those words when you wrote the command, not
+    by speaking into a recognizer — so submitting it here leaves that
+    invariant untouched.
+
+    The clipboard is written from before_send, so a refused injection does not
+    clobber it — same as paste_text() above.
+    """
+    if not text.strip():
+        _log("REFUSED paste_and_submit: empty text")
+        return False
+    paste = (_key_events(VK_CONTROL, up=False)
+             + _key_events(VK_V)
+             + _key_events(VK_CONTROL, down=False))
+    return _guarded_send([paste, _key_events(VK_RETURN)],
+                         f"paste ({len(text)} chars), enter",
+                         before_send=lambda: set_clipboard(text))
 
 
 def _report():

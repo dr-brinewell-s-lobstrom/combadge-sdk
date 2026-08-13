@@ -656,7 +656,8 @@ Vibe Control turns the badge into a remote control for a terminal session runnin
 ```
 computer activate vibe control     → "Vibe control latched to sunshine. Ready."
 computer proceed                   → Enter
-computer continue / carry on       → Right Arrow, then Enter (accept the suggestion, submit)
+computer continue                  → paste the word "continue", then Enter (advance regardless)
+computer carry on                  → Right Arrow, then Enter (accept the suggestion, submit)
 computer cancel                    → Escape, twice
 computer option one … nine         → 1 … 9
 computer wake up                   → recover a blanked display
