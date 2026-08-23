@@ -662,12 +662,14 @@ computer cancel                    → Escape, twice
 computer option one … nine         → 1 … 9
 computer wake up                   → recover a blanked display
 computer deactivate vibe control   → "Vibe control released."
+(the latched window closes)        → "Vibe control target closed. Vibe control released."
 ```
 
-Three things about it are worth knowing before you read <VIBE.md>:
+Four things about it are worth knowing before you read <VIBE.md>:
 
 - **It extends the vocabulary rather than replacing it.** While active, the phrases above are added to `COMMANDS` and everything already there keeps working — you can still ask the time without dropping the latch. (The full system does the opposite and suspends its normal vocabulary outright. That gate earns its keep there, where the vocabulary is large: narrowing it sharpens recognition and stops a stray command firing while you concentrate on a terminal. With a handful of phrases there is little to sharpen and little to fire by accident, so here it was only a restriction.) Hails are never suppressed either: an incoming call reaches the badge in any mode.
 - **It refuses rather than guesses.** Exactly one target session may be running at activation; zero or several and it declines out loud, with no state left behind. Sessions are **counted** by process and **targeted** by window class + title, and the two counts must agree — a title rule that has silently stopped matching fails loudly instead of latching onto the wrong window.
+- **The target's death ends the mode, and it never re-acquires one.** Close the latched window and Vibe Control releases: the vocabulary comes back and the badge says so out loud rather than chirping as though your keystroke landed. To drive a different session, activate again at it. This is worth stating because the obvious convenience — the bound window died, so rebind to whatever single session exists now — is a mistarget wearing a helpful face. A latch is consent to drive *one* session; a session that appears later is a different one you never pointed at. The SDK used to rebind lazily at send time and no longer does (2026-08-23); the full system had the same idea in a background loop, and it eventually armed the injector at a terminal opened twenty hours later for something else entirely.
 - **Commands that act, chirp — they don't talk.** `computer.py` grew an `ACK` sentinel for this: return it from any command to acknowledge with the badge's short chirp instead of a synthesized sentence. A spoken reply after every keystroke would make the mode unusable, and it's the right answer for any command whose effect you can already see.
 
 ### Tuning
