@@ -1082,8 +1082,14 @@ def _stream_and_handle_response():
         print(f"[listener] cannot reach server {SERVER_HOST}:{SERVER_PORT} — "
               f"is computer.py running there? ({e})")
         sock.close()
-        if ffmpeg.poll() is None:
-            ffmpeg.terminate()
+        # REAP IT, don't just signal it. A bare terminate() returns immediately
+        # and ffmpeg can still hold bluez_input for tens of milliseconds after
+        # SIGTERM. This path RETURNS without tearing SCO down, so a lingering
+        # capture is still open when the next tap starts its own ffmpeg on the
+        # same source -- two consumers on one SCO link, which is a documented
+        # way to produce corrupted-packet floods. The finally block below
+        # already reaps properly; this early exit did not.
+        terminate_ffmpeg(ffmpeg)
         return
 
     # --- Step 6: select() loop — stream audio and watch for server response ---

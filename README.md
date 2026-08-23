@@ -646,6 +646,24 @@ End-to-end latency on a healthy adapter: ~1.5–2 s tap-to-chirp, ~300–800 ms 
 
 **CRLF in shell scripts.** If you edit `.sh` files on Windows and run them on Linux, the kernel will look for `/bin/bash\r` and tell you "required file not found". Fix: `sed 's/\r//' f.sh > f.sh.tmp && mv f.sh.tmp f.sh`. Note: `sed -i` is unsafe on Windows bash (MSYS2) — use the temp-file form.
 
+**The SDK and the full TOS build share port 1701 AND the wire protocol — so a listener will happily talk to the wrong server.** `SDK_SERVER_PORT` defaults to 1701, which is also what TOS's `maincomputer.py` binds, and the two dialects are deliberately compatible (this SDK was distilled from that code). Point a listener at a host where the *other* server is running and nothing fails: the handshake succeeds, the command matches, a voice response comes back. The only symptom is that the answer arrives in the other system's voice, from the other system's vocabulary — which is easy to mistake for a TTS bug in the SDK. Observed 2026-08-23. If you run both, give one of them its own port (`SDK_SERVER_PORT=1702` on both `computer.sh` and `transceiver.sh`), or check the *server's* log to see which one actually answered.
+
+**`Bluetooth: hciN: corrupted SCO packet` — reboot the relay host before you change anything.** A few a day is background noise on cheap adapters. **Hundreds a second is a fault**, and on the one occasion it was chased to ground (2026-08-23) the cause was **stale driver/stack state**, not configuration: a reboot cleared it with no config change surviving, and the same stale state later produced total silence — SCO reporting "established" while zero packets flowed. It survived a badge power-cycle, a relay restart, a config revert and disabling USB autosuspend. Only the reboot fixed it. Investigate *after* a reboot has failed to clear it, not before.
+
+**Don't blame the codec, and check the live alt setting rather than the descriptors.** mSBC/wideband (`Air mode: Transparent (0x03)` in `btmon`) was verified working with zero corruption on a dongle whose `lsusb -v` shows **no alt setting 6** — its largest isoc packet is 49 bytes against a 60-byte mSBC frame. That looks impossible and isn't: `btusb_work()` falls back to alt 1 and reassembles across packets, and its own comment says so — *"Alt 1 appears to work for all adapters that do not have alt 6."* What the descriptors tell you is what the hardware *could* do; what you need is what it *is* doing:
+
+```bash
+cat /sys/bus/usb/devices/<dev>:1.1/bAlternateSetting   # read DURING a live SCO
+```
+
+A value the driver would never select for the negotiated codec means stale state.
+
+**Two different SCO messages, one benign.** `corrupted SCO packet` comes from `btusb_isoc_complete()` in the USB driver — an isoc URB that couldn't be parsed. `SCO packet for unknown connection handle N` comes from `hci_scodata_packet()` in the core stack — a packet arriving for a handle already removed, i.e. packets in flight at teardown. A handful of the second around a disconnect is normal. Don't conflate them.
+
+**Never restart PipeWire/WirePlumber with the badge connected.** Doing so left a badge silent in both directions while every layer above looked healthy: profile set, source present, `Mute: no`, volume 100%, SCO negotiating successfully — and pure digital silence in the captured stream (`max_volume: -91.0 dB`). Removing the config change that prompted the restart did not undo it. If you must change bluez5 settings, drop the file in and **reboot**.
+
+**Reap your ffmpeg, don't just signal it.** `terminate()` returns immediately and the process can hold `bluez_input` for tens of milliseconds after SIGTERM. If the next tap opens the same source, or a playback starts on the same SCO link, you have two consumers on one link. Always SIGTERM, wait with a timeout, escalate to SIGKILL, and reap — `terminate_ffmpeg()` in `listener.py`. Watch the *early return* paths especially; the happy path is easy to get right and the error paths are where a bare `terminate()` hides.
+
 **TCP framing is positional, not length-prefixed (mostly).** The 18-byte handshake (`b'1'` + 17-byte MAC) and the WAV stream are framed by position and the WAV header. The voice response is the only length-prefixed frame: `b'v'` then 4 BE bytes then exactly that many bytes. Don't `recv(4096)` for the size — read exactly 4, then loop on the body until you've received the full count.
 
 ## <a name="vibe-control"></a>10. Vibe Control — driving a terminal by voice

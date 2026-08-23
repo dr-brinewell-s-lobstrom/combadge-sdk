@@ -2228,6 +2228,38 @@ def main():
     # Server console: `badges` and `hail <mac> [text]` — see console_loop().
     threading.Thread(target=console_loop, daemon=True).start()
 
+    # IS SOMETHING ALREADY ANSWERING ON THIS PORT?  Ask before binding, because
+    # on Windows the bind below will NOT tell you.
+    #
+    # SO_REUSEADDR does not mean the same thing on both platforms. On Linux it
+    # only permits reusing a port in TIME_WAIT, so a second listener gets
+    # EADDRINUSE and you find out at once. On WINDOWS it permits binding a port
+    # another socket already holds in LISTEN state: the bind SUCCEEDS, silently,
+    # two listeners exist, and connections go to whichever one the OS picks.
+    #
+    # That matters here more than it would elsewhere, because this SDK shares
+    # both its default port (1701) and its wire protocol with the full TOS build
+    # it was distilled from. A relay pointed at the wrong one gets a complete,
+    # working conversation with a server you did not mean to test -- the only
+    # symptom being an answer in the other system's voice, from the other
+    # system's vocabulary. Observed on Windows, 2026-08-23, with both servers
+    # bound to 1701 on the same machine and neither reporting anything.
+    #
+    # A warning, not a refusal: two servers on two machines is a legitimate
+    # setup, and only the local port is knowable from here. The full build
+    # solves it properly with a PID file (MAINCOMPUTER.md -> singleton guard);
+    # this is the cheap version, and it beats silence.
+    try:
+        _probe = socket.create_connection(("127.0.0.1", PORT), timeout=0.5)
+        _probe.close()
+        print(f"[computer] *** WARNING: something is ALREADY listening on port {PORT}. ***")
+        print( "[computer]     On Windows the bind below succeeds anyway, leaving TWO")
+        print( "[computer]     servers up with taps going to either one.")
+        print( "[computer]     Stop the other server, or set SDK_SERVER_PORT to")
+        print( "[computer]     something else on BOTH computer.sh and transceiver.sh.")
+    except OSError:
+        pass          # nothing there -- the normal case
+
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # SO_REUSEADDR: allow restarting the server immediately after a crash or
     # Ctrl-C without waiting ~60 s for the OS to reclaim the port.
