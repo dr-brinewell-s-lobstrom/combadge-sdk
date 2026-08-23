@@ -34,6 +34,7 @@ While AI was obviously used for generating code - EVERY prompt was human-written
 9. [Known Gotchas](#known-gotchas)
 10. [Vibe Control — driving a terminal by voice](#vibe-control)
 11. [Large-Vocabulary Dictation — captain's log and computer transcribe](#large-vocab)
+12. [Game Mode — the tap as a mouse click](#game-mode)
 
 ## <a name="ai-assisted-quick-start"></a>-1.  AI Assisted Quick Start
 
@@ -128,7 +129,7 @@ Edit the `COMMANDS` dict in `computer.py` to add your own phrases and responses.
 
 The three scripts in this folder (`transceiver.py`, `listener.py`, `computer.py`) are deliberately minimal and heavily commented. They carry only the voice command pipeline (badge tap > command execution > voice response to badge) and the intercom — no user identity, no command-file dispatch, no dictation modes — so every piece that remains is essential and understandable. Read a section here for context, then read the corresponding file for the code. They are a foundation to build on, not a framework to configure.
 
-(`vibewin.py` and `vibekeys.py` are a fourth, **optional** piece — Vibe Control, §10. They are Windows-only, `computer.py` imports them defensively, and nothing else depends on them.)
+(`vibewin.py` and `vibekeys.py` are a fourth, **optional** piece — Vibe Control, §10 — and `clicker.py` is a fifth, Game Mode, §12. All three are Windows-only, `computer.py` imports them defensively, and nothing else depends on them. On any other platform the imports fail, the phrases are simply absent, and the rest is unchanged.)
 
 ---
 
@@ -821,6 +822,56 @@ Two things to keep:
 
 **Triggers are matched as substrings, not anchored to the start.** The full system anchors them, because its recognizer is grammar-constrained and its text is therefore clean. This server runs the small model open, where a stray decoded syllable ahead of the trigger is ordinary — anchoring would drop real commands.
 
-## 12.  More Info
+## <a name="game-mode"></a>12. Game Mode — the tap as a mouse click
+
+**Optional, Windows-only.** `clicker.py`; imported defensively, absent everywhere else.
+
+Every other command in this SDK treats the tap as *"I am about to say something."* Game Mode treats the tap as the thing itself: while it is on, a single tap is dispatched as a **mouse click at the pointer** and no speech is recognized at all. It was built for a game whose teleport commits on right-click-down — aim with the mouse, tap the badge, go.
+
+```
+computer activate game mode   → "Game mode engaged. Badge taps send right-click
+                                 until game mode is stopped from the server console."
+(tap)                         → right-click at the pointer, ACK chirp
+game off        (console)     → "Game mode released."
+```
+
+### It is a tap takeover, not a vocabulary takeover
+
+Vibe Control changes *which phrases* are in force. Game Mode never gets that far: `handle_connection()` checks it immediately after the answer-tap check, sends `b'c'` and clicks, and returns — before a recognizer is built. So "which commands are active during Game Mode" is a question that is never asked, because nothing is listened to.
+
+Answering with the signal byte at once is deliberate. `listener.py` streams audio until it reads one, so replying immediately collapses the tap cycle instead of holding the microphone open for the full timeout. A trigger that goes deaf for ten seconds after each use is not a trigger.
+
+The check sits **after** the pending-hail answer, on purpose: a hail has someone waiting at the other end, and playing a game does not make an unanswered hail the right outcome.
+
+### The way out is the console, and it has to be
+
+While Game Mode is on, a tap never becomes speech — so *no spoken phrase can end it*, including the obvious one. There is deliberately no `computer deactivate game mode` command; a phrase that could never reach the dispatcher would be a lie in the vocabulary listing.
+
+`activate()` therefore prints a banner to the server console saying exactly how to stop it, and `game off` there does. This is the same problem the full TOS build solves with a separate visible holder window, and the SDK gets a cheaper answer because its badge dispatcher and its console are **the same process** — the server is already a window you can see and type into.
+
+### The mode cannot be stranded
+
+State is in-process, as it is for Vibe Control, and here that buys something extra: kill the server by any means — Ctrl-C, a crash, a closed window — and the armed flag dies with it. There is no such thing as a Game Mode that outlived its server, so there is nothing to detect and nothing to clean up. Running `python clicker.py` on its own is inert for the same reason: a fresh interpreter starts disarmed.
+
+(The full build parks the mode in a flag file, because *its* badge dispatcher and console are different processes, and pays the price in a liveness check. `clicker/CLICKER.md` has that side of the story.)
+
+### The click is not aimed at a window
+
+`clicker.py` does no window targeting at all. Windows routes a button-down to the window under the **cursor**, so "click the game" and "click where the pointer is" are the same instruction — and re-pointing the cursor to satisfy a window check would move the very thing being aimed. This is the deliberate opposite of `vibekeys.py`, which verifies focus and aborts rather than redirect; that guardrail exists because a stray Enter *submits* something, and it does not transfer to a click.
+
+**So state the cost plainly:** while Game Mode is on, every tap right-clicks whatever the pointer is over. Stop the mode before leaving the pointer somewhere a right-click would matter. What contains it is the mode itself — explicit arming, a loud banner, and death with the server.
+
+### Tuning
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SDK_GAME_BUTTON` | `right` | `right`, `left` or `middle` |
+| `SDK_GAME_HOLD_MS` | `20` | how long the button is held down |
+
+`SDK_GAME_HOLD_MS` is not cosmetic. A game that polls button state once per frame can miss a press that goes down and up inside the same frame; 20 ms clears 60fps with room to spare and is invisible next to the ~1 s badge dispatch in front of it.
+
+**Rate:** roughly one click per tap cycle — about a second, governed by the badge audio link coming up and down, not by anything in `clicker.py`. Right for a transporter, wrong for a fire button.
+
+## 13.  More Info
 
 This SDK is the distilled foundation of a much larger system — the Terran Operating System (TOS), the author's full starship-computer environment built on this same voice command pipeline (voice-print identity, command vocabularies, dictation, an AI main computer, and more). To see where this foundation can lead, visit https://tos.md.

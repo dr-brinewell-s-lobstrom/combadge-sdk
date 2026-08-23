@@ -29,7 +29,8 @@ Persistent downlink (push path): a relay may instead open with b'h' + MAC
 and hold the connection open.  The server keeps it alive with b'k' every
 5 s and can push b'v' voice frames down it at any time — audio that plays
 on the badge with no tap.  Console commands (stdin): `badges` lists known
-badges; `hail <mac> [text]` pushes TTS to one.  See sdk/INTERCOM.md.
+badges; `hail <mac> [text]` pushes TTS to one; `game [on|off]` drives Game
+Mode.  See sdk/INTERCOM.md.
 
 Response signals back to listener.py:
     b'c'                       — command matched (no audio, badge plays ACK chirp)
@@ -95,6 +96,15 @@ try:
     import vibekeys
 except ImportError:
     vibekeys = None
+
+# Game Mode — the badge tap AS a mouse click (see sdk/clicker.py).  Same
+# defensive shape and the same reasoning as the vibekeys import above:
+# Windows-only, entirely optional, and its absence just means the Game Mode
+# commands are omitted.
+try:
+    import clicker
+except ImportError:
+    clicker = None
 
 SetLogLevel(-1)   # silence Vosk's verbose initialization chatter
 
@@ -421,6 +431,16 @@ if vibekeys is not None:
     COMMANDS[VIBE_ACTIVATE] = lambda: vibekeys.activate()
     COMMANDS["computer wake up"] = lambda: _vibe(vibekeys.wake)
 
+# Game Mode's entry point, for the same reason VIBE_ACTIVATE is a constant.
+# NOTE there is no matching deactivate COMMAND, and its absence is the design:
+# while Game Mode is on a tap never becomes speech, so a spoken phrase could
+# never reach the dispatcher to end it.  The way out is `game off` at the
+# server console — which is why activate() prints a banner saying exactly that.
+GAME_ACTIVATE = "computer activate game mode"
+
+if clicker is not None:
+    COMMANDS[GAME_ACTIVATE] = lambda: clicker.activate()
+
 
 # ---------------------------------------------------------------------------
 # Text-to-speech synthesis
@@ -742,6 +762,12 @@ def active_commands():
     Vibe Control ADDS its phrases to the normal vocabulary rather than
     replacing it: while the mode is latched everything in COMMANDS still
     works, and VIBE_COMMANDS is available on top.
+
+    GAME MODE DOES NOT APPEAR HERE AT ALL, and that is not an omission.  It
+    is a TAP takeover, not a vocabulary takeover: while it is on, a tap is
+    answered with a click before a recognizer is ever built, so which phrases
+    would have been in force is a question that never gets asked.  See
+    handle_connection().
 
     THIS IS A DELIBERATE DIVERGENCE from the full system, which suspends its
     normal vocabulary entirely while the mode is up.  That gate is worth
@@ -1217,6 +1243,24 @@ def handle_connection(conn, addr, model):
         if hail_entry:
             print(f"[computer] [{mac}] tap answers pending hail from {hail_entry['from']}")
             run_channel_answer(conn, mac, hail_entry)
+            return
+
+        # --- Game Mode: this tap IS a click, not a command ---
+        # Checked before the recognizer is even built, because the point of the
+        # mode is that nothing is recognized.  b'c' goes back immediately: the
+        # listener streams audio until it reads a signal byte, so answering at
+        # once collapses the tap cycle instead of holding the microphone open
+        # for the full TIMEOUT_S.  That matters here in a way it does not
+        # elsewhere — a trigger that goes deaf for ten seconds after each use
+        # is not a trigger.
+        #
+        # Ordered AFTER the answer-tap check on purpose: a pending hail has
+        # someone waiting at the other end of it, and playing a game does not
+        # make an unanswered hail the right outcome.
+        if clicker is not None and clicker.is_active():
+            print(f"[computer] [{mac}] game mode — tap dispatched as a click")
+            conn.sendall(b"c")
+            clicker.click()
             return
 
         # --- Vosk recognition loop ---
@@ -1973,6 +2017,10 @@ def console_loop():
                              plays on that badge with no tap.  <mac> may be
                              any unique substring (e.g. "2F:60").  Default
                              text: "Incoming hail."
+        game [on|off]        report or set Game Mode (sdk/clicker.py).  This
+                             is the ONLY way to turn Game Mode off: while it
+                             is on, every badge tap is a click, so no spoken
+                             phrase can reach the dispatcher.
 
     Runs as a daemon thread reading stdin; exits quietly if stdin closes
     (e.g. when the server runs headless).
@@ -2017,8 +2065,25 @@ def console_loop():
                 print(f"[console] channel closed ({chan['from']} <-> "
                       f"{chan.get('answer_mac')})")
 
+        elif cmd == "game":
+            # The way OUT of Game Mode, and the reason activate() prints a
+            # banner pointing here: while the mode is on every badge tap is a
+            # click, so no spoken phrase can ever reach the dispatcher to end
+            # it.  `game` alone reports; `game off` stops it; `game on` is here
+            # for symmetry and for testing without a badge.
+            if clicker is None:
+                print("[console] game mode unavailable (Windows only)")
+            elif len(parts) > 1 and parts[1].lower() == "off":
+                clicker.deactivate()
+            elif len(parts) > 1 and parts[1].lower() == "on":
+                clicker.activate()
+            else:
+                state = "ACTIVE — taps are clicks" if clicker.is_active() else "off"
+                print(f"[console] game mode: {state}")
+
         else:
-            print("[console] commands: badges | hail <mac> [text] | close")
+            print("[console] commands: badges | hail <mac> [text] | close | "
+                  "game [on|off]")
 
 
 # ---------------------------------------------------------------------------
