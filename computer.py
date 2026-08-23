@@ -35,6 +35,9 @@ Mode.  See sdk/INTERCOM.md.
 Response signals back to listener.py:
     b'c'                       — command matched (no audio, badge plays ACK chirp)
     b'f'                       — no match      (no audio, badge plays NACK chirp)
+    b'g'                       — Game Mode click: terminal and SILENT, so the
+                                 relay tears SCO down at once (see §12)
+Downlink-only signals: b'k' keepalive, b'W' prewarm, b'M'/b'N' Game Mode on/off.
     b'v' + 4-byte size + WAV   — voice response (badge plays the WAV)
 
 A command returns either a string (spoken back) or the ACK sentinel (acted
@@ -438,8 +441,51 @@ if vibekeys is not None:
 # server console — which is why activate() prints a banner saying exactly that.
 GAME_ACTIVATE = "computer activate game mode"
 
+def broadcast_game_state():
+    """Tell every connected badge whether Game Mode is on.  b'M' on, b'N' off.
+
+    M/N rather than G/N because the full TOS relay protocol already spends b'G'
+    on the authorized-greeting marker, and the two dialects are kept in parity.
+
+    WHY THE RELAY HAS TO BE TOLD, rather than working it out from the tap reply:
+    the listening chirp plays at step 4 of the tap cycle, BEFORE the socket to
+    this server exists.  By the time a reply could carry the news, the sound has
+    already been made.  So the mode is pushed when it changes, and again on every
+    downlink (re)connect — see run_downlink() — and the relay consults a local
+    flag when a tap arrives.
+
+    Non-terminal, no payload, and safe against an older relay: it logs one
+    "unknown downlink byte" line and carries on chirping.  Degrades to the old
+    behaviour, never to silence.
+    """
+    if clicker is None:
+        return
+    byte = b"M" if clicker.is_active() else b"N"
+    with downlinks_lock:
+        entries = list(downlinks.items())
+    for mac, entry in entries:
+        try:
+            with entry["lock"]:
+                entry["sock"].sendall(byte)
+        except OSError:
+            # A dead downlink is run_downlink()'s problem, not ours; it will
+            # notice and deregister.  Losing this byte costs a chirp, not a mode.
+            print(f"[computer] [{mac}] could not push game state")
+
+
+def _game(action):
+    """Run a clicker state change and push the new state to every badge.
+
+    Every entry point goes through here — the spoken command and both console
+    forms — so no path can change the mode without the relays hearing about it.
+    """
+    phrase = action()
+    broadcast_game_state()
+    return phrase
+
+
 if clicker is not None:
-    COMMANDS[GAME_ACTIVATE] = lambda: clicker.activate()
+    COMMANDS[GAME_ACTIVATE] = lambda: _game(clicker.activate)
 
 
 # ---------------------------------------------------------------------------
@@ -1259,7 +1305,15 @@ def handle_connection(conn, addr, model):
         # make an unanswered hail the right outcome.
         if clicker is not None and clicker.is_active():
             print(f"[computer] [{mac}] game mode — tap dispatched as a click")
-            conn.sendall(b"c")
+            # b'g', NOT b'c'. Both are terminal; only b'g' is silent. b'c' makes
+            # the listener play the command-executed chirp, and play_wav() blocks
+            # until pw-play exits — so the chirp holds SCO up for its own
+            # duration and the teardown queues up behind it. b'g' falls straight
+            # through to the teardown, and the badge's own hardware chirp as the
+            # SCO link drops is the feedback (Captain, 2026-08-23: "latency is
+            # everything"). The listening chirp is skipped at the other end of
+            # the same cycle, off the downlink state below.
+            conn.sendall(b"g")
             clicker.click()
             return
 
@@ -1415,6 +1469,16 @@ def run_downlink(conn, addr, mac):
     with downlinks_lock:
         old = downlinks.get(mac)
         downlinks[mac] = entry
+    # Sync Game Mode to this badge the moment it registers. A relay that
+    # restarts, or comes back from a range loss, has a freshly cleared flag and
+    # would otherwise chirp its way through a mode that is still on until
+    # something else happened to change it.
+    if clicker is not None and clicker.is_active():
+        try:
+            with entry["lock"]:
+                conn.sendall(b"M")
+        except OSError:
+            pass
     if old:
         try:
             old["sock"].close()
@@ -2074,9 +2138,9 @@ def console_loop():
             if clicker is None:
                 print("[console] game mode unavailable (Windows only)")
             elif len(parts) > 1 and parts[1].lower() == "off":
-                clicker.deactivate()
+                _game(clicker.deactivate)
             elif len(parts) > 1 and parts[1].lower() == "on":
-                clicker.activate()
+                _game(clicker.activate)
             else:
                 state = "ACTIVE — taps are clicks" if clicker.is_active() else "off"
                 print(f"[console] game mode: {state}")

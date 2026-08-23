@@ -173,6 +173,21 @@ PRIME_MS_COLD = 1000
 # the confusing "no/unknown signal byte: None" with no failure chirp.
 RECORD_MAX_S = 13
 
+# Game Mode, mirrored from the server over the downlink (b'M' on, b'N' off).
+# M/N rather than G/N because the full TOS relay protocol already spends b'G' on
+# the authorized-greeting marker, and the two dialects are kept in parity.
+#
+# The listener has to know this BEFORE it chirps, and that is the whole reason
+# the state is pushed rather than inferred. The listening chirp plays at step 4,
+# before the socket to the server even exists — by the time a tap-cycle reply
+# could tell us anything, the sound has already been made. So the server
+# announces the mode when it changes and again on every downlink (re)connect,
+# and a tap consults a local flag.
+#
+# An Event, not a bool: the downlink runs on its own thread and the tap cycle
+# reads this from the main one.
+game_mode = threading.Event()
+
 # Downlink (persistent server connection) tuning.
 DOWNLINK_RETRY_S = 5    # seconds between reconnect attempts while down
 DOWNLINK_TIMEOUT = 15   # recv timeout: 3 missed 5 s keepalives = server presumed dead
@@ -628,6 +643,18 @@ def downlink_loop():
                         force_sco_teardown()
                         audio_lock.release()
                     continue
+                if sig in (b"M", b"N"):
+                    # Game Mode state from the server. Non-terminal, no payload.
+                    # Older servers never send it; older listeners log it as an
+                    # unknown byte and carry on — degrades to the chirping
+                    # behaviour, never to silence.
+                    if sig == b"M":
+                        game_mode.set()
+                        print("[listener] game mode ON — taps are clicks, no chirps")
+                    else:
+                        game_mode.clear()
+                        print("[listener] game mode OFF")
+                    continue
                 if sig == b"v":
                     path = read_voice_payload(sock)
                     if path:
@@ -1028,8 +1055,15 @@ def _stream_and_handle_response():
     # --- Step 4: play the listening chirp ---
     # SCO is confirmed live.  play_silence(0) is a no-op so the chirp
     # plays immediately.  Increase PRIME_MS_LISTENING if it still clips to speakers.
-    play_silence(PRIME_MS_LISTENING)
-    play_wav(LISTENING_WAV, prime=False)
+    #
+    # SKIPPED IN GAME MODE, and this is the larger of the two chirp savings.
+    # "Listening" is a promise the mode does not keep: nothing is listened to,
+    # the tap IS the click. play_wav() blocks on pw-play until the sound has
+    # finished, so the chirp is not just wrong, it is dead time sitting between
+    # the tap and the click.
+    if not game_mode.is_set():
+        play_silence(PRIME_MS_LISTENING)
+        play_wav(LISTENING_WAV, prime=False)
 
     # --- Step 5: connect to server ---
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1138,6 +1172,17 @@ def _stream_and_handle_response():
     # --- Step 7: play ack/nack, or nothing if voice response was already played ---
     if signal_byte == b"c":
         play_wav(ACK_WAV)       # command matched and executed — success chirp
+    elif signal_byte == b"g":
+        # Game Mode click. Deliberately SILENT: fall straight through to the
+        # teardown below, which is the fastest exit this cycle has.
+        #
+        # The chirp is not merely skipped to save a sound — play_wav() blocks
+        # on pw-play, so the ack chirp holds SCO up for its whole duration and
+        # delays the teardown behind it. Dropping it moves the teardown to the
+        # instant the click is confirmed, and the badge's OWN hardware chirp as
+        # the SCO link drops becomes the feedback (Captain, 2026-08-23:
+        # "latency is everything").
+        pass
     elif signal_byte == b"f":
         play_wav(NACK_WAV)      # no phrase matched — failure chirp
     elif signal_byte == b"v":

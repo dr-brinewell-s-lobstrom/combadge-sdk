@@ -831,7 +831,7 @@ Every other command in this SDK treats the tap as *"I am about to say something.
 ```
 computer activate game mode   → "Game mode engaged. Badge taps send right-click
                                  until game mode is stopped from the server console."
-(tap)                         → right-click at the pointer, ACK chirp
+(tap)                         → right-click at the pointer. No chirps at all.
 game off        (console)     → "Game mode released."
 ```
 
@@ -842,6 +842,26 @@ Vibe Control changes *which phrases* are in force. Game Mode never gets that far
 Answering with the signal byte at once is deliberate. `listener.py` streams audio until it reads one, so replying immediately collapses the tap cycle instead of holding the microphone open for the full timeout. A trigger that goes deaf for ten seconds after each use is not a trigger.
 
 The check sits **after** the pending-hail answer, on purpose: a hail has someone waiting at the other end, and playing a game does not make an unanswered hail the right outcome.
+
+### Both chirps are removed, and that is a latency decision
+
+Two sounds normally bracket a tap. Game Mode drops both, because **both block the audio pipeline** — `play_wav()` runs `pw-play` to completion before anything else happens:
+
+| Chirp | Normally | In Game Mode |
+|---|---|---|
+| `listening.wav`, on tap | plays at step 4 of the tap cycle | **suppressed** — "listening" is a promise the mode does not keep, since nothing is listened to |
+| `commandexecuted.wav`, on `b'c'` | plays **to completion before** `force_sco_teardown()` | **suppressed** — the server sends `b'g'` instead, which falls straight through to the teardown |
+
+The badge's **own hardware chirp as the SCO link drops** becomes the feedback, which is why the teardown wants to be as early as possible rather than queued behind a WAV.
+
+The listening chirp is the interesting half. It plays *before the socket to the server exists*, so no reply could ever suppress it — by the time one arrived the sound would already have been made. So the mode is **pushed** down the persistent downlink instead:
+
+| Byte | Channel | Meaning |
+|---|---|---|
+| `b'M'` / `b'N'` | downlink | Game Mode on / off. Sent on every change, and again whenever a downlink registers, so a relay that restarted re-syncs at once |
+| `b'g'` | tap socket | the click is done — terminal and silent |
+
+`b'M'`/`b'N'` rather than `b'G'`, because the full TOS relay dialect already spends `b'G'` on its authorized-greeting marker and the two are kept in parity. An older relay logs one "unknown byte" line and carries on chirping: degrades to the old behaviour, never to silence.
 
 ### The way out is the console, and it has to be
 
