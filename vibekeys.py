@@ -180,32 +180,45 @@ def deactivate():
 def target_hwnd():
     """The latched HWND, re-validated as a live session window.
 
-    Returns None if the stored handle is gone and cannot be rebound — callers
-    must treat that as 'do not send', NEVER as 'send somewhere else'.  Falling
-    back to whatever happens to be focused at send time is how a stray Enter
-    lands in the wrong application.
+    Returns None if the stored handle no longer looks like the session that was
+    latched — callers must treat that as 'do not send', NEVER as 'send somewhere
+    else'.  Falling back to whatever happens to be focused at send time is how a
+    stray Enter lands in the wrong application.
 
-    Re-latch: if the bound window has died (the terminal was restarted) and
-    there is now exactly one candidate, rebind to it.  Zero or several, and we
-    decline and keep waiting — refusing to guess, exactly as at activation.
-    Checking lazily here, at send time, is why no background re-validation
-    thread is needed: nothing can be injected without passing through this
-    function first.
+    THE TARGET IS NEVER RE-ACQUIRED.  If the bound window is gone, the mode ends
+    here: _active goes False, the vocabulary comes back, and re-entering Vibe
+    Control is one deliberate phrase aimed at a session that exists at the
+    moment it is spoken.
+
+    This used to re-latch lazily instead — the bound window dies, and the next
+    command rebinds to whatever single session now exists.  It is a tempting
+    convenience and it is wrong twice over (Captain, 2026-08-23, on the TOS side
+    where the same idea ran in a supervisor loop):
+
+      * A latch is consent to drive ONE session.  A session that appears later
+        is a DIFFERENT session and was never authorized.  Rebinding silently, as
+        this did, is exactly the mistarget the whole refuse-over-guess gate at
+        activation exists to prevent — undone at send time, in the one place
+        where a keystroke immediately follows.
+      * It let the mode outlive its own purpose.  Vibe Control exists to drive a
+        session; with that session gone there is nothing to drive.  On CUBE the
+        equivalent code waited TWENTY HOURS and then armed itself at a terminal
+        the Captain had opened for something unrelated.
+
+    Checking lazily here, at send time, is still why no background thread is
+    needed: nothing is injected without passing through this function first.
     """
-    global _target
+    global _active, _target
     with _state_lock:
         hwnd = _target
-    if hwnd is not None and vibewin.window_matches(hwnd):
-        return hwnd
-
-    r = vibewin.resolve()
-    if r["status"] != "ok":
-        _log(f"target window lost and cannot re-latch: {r['status']}")
-        return None
-    with _state_lock:
-        _target = r["hwnd"]
-    _log(f"RE-LATCHED hwnd={r['hwnd']} title={r['title']!r}")
-    return r["hwnd"]
+        if hwnd is not None and vibewin.window_matches(hwnd):
+            return hwnd
+        # Gone. End the mode rather than look for another one.
+        _active = False
+        _target = None
+    _log(f"target window hwnd={hwnd} lost — VIBE CONTROL RELEASED "
+         f"(the target is never re-acquired; say the activation phrase again)")
+    return None
 
 
 # ---------------------------------------------------------------------------

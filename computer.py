@@ -348,8 +348,18 @@ def _vibe(action, *args):
     """Run a vibekeys action and ACK.  ACK regardless of outcome: the failure
     detail is on the server console, and the badge chirp only reports that the
     command was heard and dispatched.  A refusal to inject is not a
-    recognition failure, and reporting it as one would be misleading."""
+    recognition failure, and reporting it as one would be misleading.
+
+    ONE exception, and it is not a failure — it is a state change.  If the
+    latched window has closed, vibekeys.target_hwnd() ends the mode rather than
+    re-acquiring a target (see its docstring).  The whole vocabulary comes back
+    at that instant, and a chirp would not say so.  Speak it instead: you need
+    to know the badge is listening for the full command set again, and that the
+    phrase you just said went nowhere."""
+    was_active = vibekeys.is_active()
     action(*args)
+    if was_active and not vibekeys.is_active():
+        return "Vibe control target closed. Vibe control released."
     return ACK
 
 

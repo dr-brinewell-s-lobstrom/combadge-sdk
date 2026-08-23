@@ -179,11 +179,26 @@ latched onto, because the target is chosen automatically and that is the one
 thing you cannot verify by looking at a badge. If the title carries no useful
 name it says *"latched to an unnamed session"* rather than inventing one.
 
-**Re-latch happens lazily.** If the bound window dies and exactly one candidate
-now exists, the next command rebinds to it and logs `RE-LATCHED`. Zero or
-several, and it declines and keeps waiting — the same refusal as at activation.
-Because every injection routes through `target_hwnd()`, this needs no background
-thread and no polling.
+**The target's death ends the mode. It is never re-acquired** (2026-08-23).
+When `target_hwnd()` finds the bound window gone, it disarms — `is_active()`
+goes False, the full `COMMANDS` vocabulary comes back, and the badge is told
+*"Vibe control target closed. Vibe control released."* rather than chirping as
+though the keystroke landed. Re-entering the mode is one deliberate phrase,
+aimed at a session that exists at the moment it is spoken.
+
+This **used to re-latch lazily**: bound window dies, next command rebinds to
+whatever single candidate now exists. It reads as a convenience and it is a
+mistarget. A latch is consent to drive *one* session; a session that appears
+later is a different one and was never authorized — so the lazy rebind quietly
+undid, at send time, the very refuse-over-guess gate that activation is so
+careful about. The TOS side ran the same idea in a supervisor loop and it
+eventually armed the injector at a terminal the Captain had opened for something
+unrelated, twenty hours after the session it was latched to had closed
+(`vibe/VIBE.md` → *The target's death ends the mode*). Both sides were fixed
+together; don't reintroduce it on either.
+
+Checking lazily in `target_hwnd()` is still why this needs no background thread
+and no polling: nothing is injected without passing through it first.
 
 ## Detecting the candidates {#detecting-the-candidates}
 
