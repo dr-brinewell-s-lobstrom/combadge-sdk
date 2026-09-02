@@ -35,7 +35,7 @@ Required environment (set by transceiver.py — do not run this script directly)
     SDK_SERVER_PORT          — TCP port for computer.py (default 1701)
     XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, HOME, USER  — for pw-play/pactl
 
-Stripped down from relay/relay.py: no double-tap, no btmon, no per-scenario
+Stripped down from relay-linux/relay.py: no double-tap, no btmon, no per-scenario
 priming, no captain's log.  Single-tap loop plus the persistent downlink
 (sdk/INTERCOM.md Phase 2).
 """
@@ -281,9 +281,57 @@ def play_wav(path, prime=True, volume=0.5):
         return
     if prime:
         play_silence(PRIME_MS)
+    t0 = time.monotonic()
     subprocess.run(["pw-play", "--target", SINK, "--media-role=communication",
                     "--volume", str(volume), path],
                    check=False, capture_output=True, timeout=15)
+    check_playback(path, time.monotonic() - t0)
+
+
+def wav_duration_s(path):
+    """Play length of a WAV in seconds, or 0.0 if it cannot be read.
+
+    Returns 0.0 rather than raising — MP3s and unreadable files simply opt
+    out of the check below.  A diagnostic must never break what it measures.
+    """
+    try:
+        with wave.open(path, "rb") as w:
+            rate = w.getframerate()
+            return w.getnframes() / float(rate) if rate else 0.0
+    except Exception:
+        return 0.0
+
+
+def check_playback(path, elapsed):
+    """Warn if pw-play returned far sooner than the audio's real length.
+
+    WHY this exists:
+      pw-play exiting 0 says only that nothing raised.  It does NOT say the
+      badge got the audio.  play_wav_cold()'s own docstring describes the
+      failure mode above -- on a cold SCO link, pw-play "fails silently" and
+      PipeWire routes to the default output device instead.  Nothing detected
+      that; the sound simply did not arrive and the log said it played.
+
+      Comparing how long pw-play RAN against how long the file IS separates
+      three failures that are otherwise identical in a log:
+        - the audio was never generated
+        - it was generated and cut short (the sink went away mid-stream)
+        - it played fine and you did not hear it (wrong device, volume, ...)
+
+      It does NOT prove the badge emitted sound.  Only a second microphone
+      does that.  It is the cheap check that tells you whether the expensive
+      one is worth setting up.
+
+      Threshold is 75% rather than exact: pw-play's own startup is real time
+      and short files are dominated by it, so a small overrun is normal and a
+      large SHORTFALL is the signal.
+    """
+    expected = wav_duration_s(path)
+    if expected and elapsed < expected * 0.75:
+        print(f"[listener] PLAYBACK TRUNCATED — {os.path.basename(path)}: "
+              f"expected {expected:.2f}s, pw-play ran {elapsed:.2f}s. "
+              f"The sink stopped early or never started; the badge did not "
+              f"get the whole sound.", file=sys.stderr)
 
 
 def play_wav_cold(path, volume=0.5):
@@ -696,7 +744,7 @@ CHANNEL_TAP_GRACE_S = 1.0   # ignore badge taps in the first second of a channel
 
 # Double-tap detection: the badge emits AT+BVRA=1 on the HFP control
 # channel (never an evdev event).  Same btmon-under-pty pattern the full
-# relay uses in production (relay/relay.py monitor_bluetooth_logs).
+# relay uses in production (relay-linux/relay.py monitor_bluetooth_logs).
 BTMON_TRIGGER = "AT+BVRA=1"
 _ANSI_RE      = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -830,12 +878,34 @@ def run_channel(sock, ffmpeg):
     up_b = down_b = dropped_b = 0
     player_dead = False
     last_beat   = time.time()
+    # Uplink LEVEL, in the same unit the server's gate compares against
+    # SDK_CHANNEL_GATE (mean |sample| of 16-bit PCM).
+    #
+    # WHY: computer.py already prints "gate: open N/M chunks, hd-muted N,
+    # floor-muted N" — the gate's EFFECT.  But those counts are a function of
+    # the level AND the threshold together, so on their own they cannot tell
+    # "this mic is hot" from "this threshold is wrong".  Reading the level at
+    # the source settles it with two numbers side by side.
+    #
+    # This matters because the failure it diagnoses is silent: if a badge's
+    # mic sits above the gate on room noise, its gate never closes, it holds
+    # the channel, and half-duplex then mutes the PEER continuously — which
+    # sounds exactly like "the other badge is broken" and is not.
+    lvl_sum = 0.0
+    lvl_n = 0
+    lvl_peak = 0
+    lvl_nth = 0
     try:
         while True:
             # Heartbeat: proves the loop is alive and shows audio movement.
             if time.time() - last_beat >= 5:
+                _avg = lvl_sum / lvl_n if lvl_n else 0.0
                 print(f"[listener] channel: up {up_b//1024}KB "
-                      f"down {down_b//1024}KB dropped {dropped_b//1024}KB")
+                      f"down {down_b//1024}KB dropped {dropped_b//1024}KB "
+                      f"| mic avg {_avg:.0f} peak {lvl_peak}")
+                lvl_sum = 0.0
+                lvl_n = 0
+                lvl_peak = 0
                 last_beat = time.time()
             if not player_dead and player.poll() is not None:
                 print(f"[listener] channel: player exited rc={player.returncode} "
@@ -917,6 +987,24 @@ def run_channel(sock, ffmpeg):
                 data = ffmpeg.stdout.read(4096)
                 if data:
                     up_b += len(data)
+                    # Level meter: every 8th chunk, every 8th sample within
+                    # it.  A fair estimate, not every sample, kept off the
+                    # hot path.  (audioop was removed in Python 3.13, so this
+                    # is done by hand rather than with audioop.rms.)
+                    lvl_nth += 1
+                    if lvl_nth % 8 == 0 and len(data) >= 32:
+                        view = memoryview(data)[:len(data) & ~1].cast("h")
+                        total = count = 0
+                        for i in range(0, len(view), 8):
+                            v = view[i]
+                            v = -v if v < 0 else v
+                            total += v
+                            count += 1
+                            if v > lvl_peak:
+                                lvl_peak = v
+                        if count:
+                            lvl_sum += total / count
+                            lvl_n += 1
                     try:
                         sock.sendall(data)
                     except OSError:

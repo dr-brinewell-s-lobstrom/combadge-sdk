@@ -1614,7 +1614,7 @@ CHANNEL_HALF_DUPLEX_MS = float(os.environ.get("SDK_CHANNEL_HALF_DUPLEX_MS", "800
                                   # static.  Somewhat canonical behavior: i.e.
                                   # users learn to say "over".  Set to 0 to
                                   # disable and return to full duplex.
-CHANNEL_FLOOR_RELEASE_MS = float(os.environ.get("SDK_CHANNEL_FLOOR_RELEASE_MS", "1000"))
+CHANNEL_FLOOR_RELEASE_MS = float(os.environ.get("SDK_CHANNEL_FLOOR_RELEASE_MS", "0"))
                                   # FLOOR CONTROL (adjacent-badge / same-room
                                   # use, e.g. filming both ends): one talker at
                                   # a time — the first gate to open holds the
@@ -1627,6 +1627,29 @@ CHANNEL_FLOOR_RELEASE_MS = float(os.environ.get("SDK_CHANNEL_FLOOR_RELEASE_MS", 
                                   # duplex alone can't stop cross-badge
                                   # coupling: the bleed enters the TALKER's
                                   # own open mic.  0 disables floor control.
+                                  #
+                                  # ⚠ DEFAULT CHANGED 1000 -> 0 on 2026-09-02,
+                                  # measured on two badges in DIFFERENT ROOMS.
+                                  # At 1000 the return path is starved: one
+                                  # side is audible, the other is silent, and
+                                  # it presents as "the other badge is
+                                  # broken".  Config was identical either way
+                                  # apart from this value, so the attribution
+                                  # is clean.
+                                  #
+                                  # THERE IS NO CORRECT SINGLE VALUE — it
+                                  # depends on badge placement:
+                                  #   different rooms  -> 0     (this default)
+                                  #   same room / desk -> 1000
+                                  # 0 is the default because the intercom
+                                  # exists to reach a badge somewhere else,
+                                  # and because the two failure modes are not
+                                  # equally diagnosable: setting it wrong for
+                                  # adjacent badges gives audible feedback
+                                  # that announces itself, while setting it
+                                  # wrong for separate rooms gives silence
+                                  # that gets blamed on the hardware.  Ship
+                                  # the failure a user can hear.
 CHANNEL_FLOOR_MAX_S = float(os.environ.get("SDK_CHANNEL_FLOOR_MAX_S", "12"))
                                   # cap on continuous floor hold — adjacent-
                                   # badge echo can pin the holder's gate open
