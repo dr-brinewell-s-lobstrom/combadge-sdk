@@ -409,7 +409,9 @@ The SDK uses `c`, `f`, `v`, `k`, and the four channel bytes above. Other letters
 4. TCP connect, send header, stream PCM
 ```
 
-`PRIME_MS_LISTENING` controls how long to prime the output side after the input side is confirmed live. Start at 0 ms (the event-driven teardown + ensure_hfp_profile() cycle leaves the link in a consistent state on each tap); bump to 200–500 ms only if the chirp still splits to speakers.
+`PRIME_MS_LISTENING` controls how long to prime the output side after the input side is confirmed live. It is **160 ms**, established by blind A/B on hardware — at 0 ms the chirp was heard as clipped in 4 of 4 trials.
+
+⚠ **If you swap the chirp asset, re-derive this number.** What actually protects the chirp is the prime PLUS the silence your WAV begins with. The shipped `assets/listening.wav` opens with 90 ms of its own silence, so 160 + 90 gives 250 ms of protection. A chirp that starts at full level needs the whole 250 ms from the prime; one with a longer lead-in needs less. Measure your file's lead-in before copying anyone's value — including this one.
 
 **Event-driven SCO teardown and re-establishment.** `subprocess.run(["pw-play", ...])` is synchronous - it blocks until the last audio frame has left the pipeline. Its return is the definitive "nothing is playing" event. Call `force_sco_teardown()` exactly at that moment:
 

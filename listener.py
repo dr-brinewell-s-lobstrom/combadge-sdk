@@ -156,19 +156,38 @@ PRIME_MS = 200
 
 # Milliseconds of silence played before the listening chirp.
 #
-# 250 since 2026-09-05, matching what TOS settled on.  It was 0 here, on the
+# 160 since 2026-09-05, MEASURED AND THEN CONFIRMED BY EAR.  It was 0, on the
 # reasoning that ensure_hfp_profile() has already confirmed the HFP sink is live
-# before the chirp plays — so the prime was redundant.  Hardware disagreed: the
-# Captain tuned the equivalent TOS knob ([relay] prime_ms_listening) from 0 to
-# 250 by ear on PAN on 2026-07-07, and that finding never came back here.  The
-# SDK ran two months at a value its own sibling had already rejected.
+# before the chirp plays — so the prime was redundant.  Hardware disagreed.
 #
-# Both sides run the same PipeWire/pw-play output path on Linux, so there is no
-# reason to expect the SDK to need less.  If you hear the chirp routing to laptop
-# speakers, raise it further; if you are on hardware whose sink comes up faster,
-# 0 may still be right for you — this is a starting point, not a constant of
-# nature.
-PRIME_MS_LISTENING = 250
+# WHY 160 AND NOT 250, which is what the sibling project uses.  What protects the
+# chirp is the total SILENCE AT THE HEAD OF THE STREAM, and that is the prime
+# PLUS whatever silence the chirp file itself begins with.  The two projects play
+# DIFFERENT chirps, and this is the whole of the difference:
+#
+#     TOS  audio/listening.wav          324 ms,  0 ms of built-in lead-in
+#     SDK  sdk/assets/listening.wav    1189 ms, 90 ms of built-in lead-in
+#
+# TOS reaches full level inside its first 10 ms frame and needs the entire 250 ms
+# from the prime.  This chirp opens with 90 ms of silence and then ramps, so
+# 160 + 90 gives the same 250 ms of protection.  Copying TOS's 250 would have
+# added 90 ms of dead air to every tap for nothing.
+#
+# CONFIRMED, not merely reasoned: a blind A/B on PAN, badge 1B:B8:82:88:2F:60,
+# reproducing this exact call sequence on a cold link (mixer/sdk_prime_probe.py
+# in the TOS tree).  Twelve trials over two runs, order hidden from the listener:
+#
+#     0 ms    4/4 heard as CLIPPED
+#     160 ms  4/4 heard as CLEAN
+#     250 ms  4/4 heard as CLEAN
+#
+# The first run happened to place both 0 ms trials last, so "the last two were
+# clipped" fit the report equally well; the second run put them first and fourth
+# and the clipping followed them.  Position was ruled out, not assumed away.
+#
+# If you hear the chirp routing to laptop speakers, raise it.  If your chirp asset
+# is not this one, RE-DERIVE THE NUMBER — measure your file's own lead-in first.
+PRIME_MS_LISTENING = 160
 
 # Milliseconds of silence played after SCO is confirmed live on a cold link
 # (startup sounds only).  Cold links need more priming (~1000 ms) because the
@@ -1151,8 +1170,10 @@ def _stream_and_handle_response():
         wav_header += chunk
 
     # --- Step 4: play the listening chirp ---
-    # SCO is confirmed live.  play_silence(0) is a no-op so the chirp
-    # plays immediately.  Increase PRIME_MS_LISTENING if it still clips to speakers.
+    # SCO is confirmed live on the INPUT side; the output side may still be
+    # negotiating, which is what PRIME_MS_LISTENING covers.  Note that the
+    # chirp's own leading silence counts toward that protection -- see the
+    # constant's definition before changing it or the asset.
     #
     # SKIPPED IN GAME MODE, and this is the larger of the two chirp savings.
     # "Listening" is a promise the mode does not keep: nothing is listened to,

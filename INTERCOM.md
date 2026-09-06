@@ -201,8 +201,16 @@ badge** (when it arrives: pair to the host, update its MAC in TOS.conf
 `[intercom]` badge_* key + the relay host's `authorized_badges`/app config).
 Tuning applied on hardware: TOS.conf `[relay] prime_ms_listening` 0 → 250
 (Captain, by ear). The SDK's counterpart is the module constant
-`PRIME_MS_LISTENING` in `listener.py`, which was brought to 250 to match on
-2026-09-05 — the tuning had travelled one way only for two months.
+`PRIME_MS_LISTENING` in `listener.py`, which had sat at 0 for two months — the
+tuning had travelled one way only.
+
+⚠ **The SDK's value is 160, not 250, and the difference is not an oversight.**
+What protects the chirp is the total silence at the head of the stream: the
+prime PLUS the chirp file's own lead-in. The two projects play different chirps
+— TOS's is 324 ms and starts at full level; the SDK's is 1189 ms and opens with
+90 ms of silence. 160 + 90 gives the same 250 ms of protection, and copying 250
+would add 90 ms of dead air to every tap. Confirmed by blind A/B on PAN
+(12 trials): 0 ms clipped 4/4, 160 ms and 250 ms clean 4/4 each.
 
 Ported to production per Captain's rulings (2026-07-05/06): (1) unified b'h' —
 the hello connection IS the downlink, legacy clients that close after the
@@ -213,7 +221,8 @@ the relay's existing btmon plumbing), SINGLE tap on mobile (the system's
 tap-equals-SCO-hang-up is adopted as the gesture; Bixby owns double-tap);
 (4) latency reductions in scope — the SDK's `PRIME_MS_LISTENING` 0 carried into
 TOS.conf as `prime_ms_listening` 0, 0.2s sink poll, no post-cycle debounce
-blackout. (Both sides later moved to 250; see the hardware-tuning note above.)
+blackout. (TOS later moved to 250 and the SDK to 160 — the same protection through
+different chirp assets; see the hardware-tuning note above.)
 
 - [x] **maincomputer**: new `maincomputer/intercom.py` (downlink registry,
       hail flow with large-vocab silence gating, prepare_hail_pcm, prewarm,
@@ -384,7 +393,8 @@ reference implementation; production config lives in TOS.conf
   (watch maincomputer "channel gate:" log lines during a channel — the
   `hd-muted K` / `floor-muted K` counters show how much audio the
   half-duplex and floor mutes are stopping), `hail_silence_s`, `hail_answer_s`, `push_volume`,
-  `prime_ms_push`; `prime_ms_listening` settled at 250 on PAN.
+  `prime_ms_push`; `prime_ms_listening` settled at 250 on PAN (the SDK's
+  own `PRIME_MS_LISTENING` settled at 160 — different chirp asset).
 - **Teleprompter**: cosmetic CHANNEL indicator (deferred from the original
   Phase 5 scope; intercom works without it).
 - **Mobile (pre-existing roadmap, unchanged)**: call-yield handler (first),
