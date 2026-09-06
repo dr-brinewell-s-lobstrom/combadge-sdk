@@ -4,7 +4,7 @@
 
 > Parent doc: [README.md](README.md) — the single-badge SDK voice command pipeline this builds on.
 > Related reading (context only, not binding): `../multiuser/MULTIUSER.md` (scratchpad),
-> `../relay/RELAY.md`, `../relay-mobile/RELAY-MOBILE.md`, `../maincomputer/MAINCOMPUTER.md`.
+> `../relay-linux/RELAY.md`, `../relay-mobile/RELAY-MOBILE.md`, `../maincomputer/MAINCOMPUTER.md`.
 
 ## Goal
 
@@ -14,7 +14,7 @@ on badge 2 immediately → if user 2 taps within **30 s**, a **persistent
 bidirectional audio channel** opens (as close to realtime as possible, no taps
 needed while open) → either side closes it with a gesture.
 
-On completion, the learnings port to `relay/`, `relay-mobile/`, and
+On completion, the learnings port to `relay-linux/`, `relay-mobile/`, and
 `maincomputer/` (separate effort, discussed before execution).
 
 ## Test Bench (validated 2026-07-04)
@@ -199,7 +199,10 @@ S21 than it was on BOX — so BOX contributed some of the glitchiness, but the
 badge itself is still suspected marginal; **Captain plans to buy a replacement
 badge** (when it arrives: pair to the host, update its MAC in TOS.conf
 `[intercom]` badge_* key + the relay host's `authorized_badges`/app config).
-Tuning applied on hardware: `prime_ms_listening` 0 → 250 (Captain, by ear).
+Tuning applied on hardware: TOS.conf `[relay] prime_ms_listening` 0 → 250
+(Captain, by ear). The SDK's counterpart is the module constant
+`PRIME_MS_LISTENING` in `listener.py`, which was brought to 250 to match on
+2026-09-05 — the tuning had travelled one way only for two months.
 
 Ported to production per Captain's rulings (2026-07-05/06): (1) unified b'h' —
 the hello connection IS the downlink, legacy clients that close after the
@@ -208,8 +211,9 @@ answer tap from a locked badge falls through to the voice-print prompt with the
 hail left pending; (3) close gestures per platform — double-tap on Linux (via
 the relay's existing btmon plumbing), SINGLE tap on mobile (the system's
 tap-equals-SCO-hang-up is adopted as the gesture; Bixby owns double-tap);
-(4) latency reductions in scope (prime_ms_listening 0, 0.2s sink poll, no
-post-cycle debounce blackout).
+(4) latency reductions in scope — the SDK's `PRIME_MS_LISTENING` 0 carried into
+TOS.conf as `prime_ms_listening` 0, 0.2s sink poll, no post-cycle debounce
+blackout. (Both sides later moved to 250; see the hardware-tuning note above.)
 
 - [x] **maincomputer**: new `maincomputer/intercom.py` (downlink registry,
       hail flow with large-vocab silence gating, prepare_hail_pcm, prewarm,
@@ -219,7 +223,7 @@ post-cycle debounce blackout).
       hails a spoken "no listing" response. Wire-tested end-to-end 2026-07-06
       (12/14 pass; 2 fails were harness stdout-buffering artifacts, behaviors
       confirmed in the server log).
-- [x] **relay/ (Linux)**: downlink_loop replaces send_hello (reconnect
+- [x] **relay-linux/**: downlink_loop replaces send_hello (reconnect
       greeting = restart detection, closes the RELAY.md open item), b'W'
       prewarm, pushed b'v' (push_volume/prime_ms_push), run_channel (paplay
       primary, double-tap close via stop_recording, ffmpeg-EOF close), SDK
@@ -334,7 +338,7 @@ for the diagnostic and next steps.
 
 **ALL PHASES (1–6) COMPLETE AND ON-BADGE VALIDATED.** The SDK
 implementation was validated PAN↔BOX (2026-07-05); the production port
-(maincomputer/intercom.py + relay/relay.py + relay-mobile) was validated
+(maincomputer/intercom.py + relay-linux/relay.py + relay-mobile) was validated
 PAN↔S21 (2026-07-07, all four tests passed — see Phase 5 above); Phase 6
 audio-quality tuning validated on-badge 2026-07-17. The SDK tree
 (`computer.py`, `listener.py`, `aliases.conf`) remains as the minimal
@@ -470,7 +474,7 @@ recovery hatch + test unblock.
 resolved same day:
 - **Close gesture = DOUBLE-TAP (Captain-approved, "only option").**
   Ported the full relay's proven btmon-under-pty pattern
-  (`stdbuf -oL btmon`, match `AT+BVRA=1`; relay/relay.py
+  (`stdbuf -oL btmon`, match `AT+BVRA=1`; relay-linux/relay.py
   `monitor_bluetooth_logs`) into `run_channel` — the pty master fd folds
   straight into the channel's select loop; spawned per channel, killed at
   close. Single-tap evdev path kept as a silent secondary.

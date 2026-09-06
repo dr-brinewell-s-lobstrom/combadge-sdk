@@ -155,10 +155,20 @@ TAP_DEBOUNCE = 2.0  # seconds
 PRIME_MS = 200
 
 # Milliseconds of silence played before the listening chirp.
-# Set to 0 because ensure_hfp_profile() already confirmed the HFP sink is live
-# before the chirp plays.  If you hear the chirp routing to laptop speakers,
-# increase this to 200–500 ms to give the output-side SCO more time to settle.
-PRIME_MS_LISTENING = 0
+#
+# 250 since 2026-09-05, matching what TOS settled on.  It was 0 here, on the
+# reasoning that ensure_hfp_profile() has already confirmed the HFP sink is live
+# before the chirp plays — so the prime was redundant.  Hardware disagreed: the
+# Captain tuned the equivalent TOS knob ([relay] prime_ms_listening) from 0 to
+# 250 by ear on PAN on 2026-07-07, and that finding never came back here.  The
+# SDK ran two months at a value its own sibling had already rejected.
+#
+# Both sides run the same PipeWire/pw-play output path on Linux, so there is no
+# reason to expect the SDK to need less.  If you hear the chirp routing to laptop
+# speakers, raise it further; if you are on hardware whose sink comes up faster,
+# 0 may still be right for you — this is a starting point, not a constant of
+# nature.
+PRIME_MS_LISTENING = 250
 
 # Milliseconds of silence played after SCO is confirmed live on a cold link
 # (startup sounds only).  Cold links need more priming (~1000 ms) because the

@@ -87,7 +87,7 @@ it is worth understanding why before tuning anything.
     without polling at all, the right answer is not a tighter loop — it is a
     D-Bus signal subscription on org.bluez.Device1's `Connected` property.
 
-Stripped down from relay/combadge.py: no per-host PID files, no IPC flags,
+Stripped down from relay-linux/combadge.py: no per-host PID files, no IPC flags,
 no log file rotation, no authorized-badge filtering, no focus-shift handling.
 Single badge, single listener process, foreground.
 """
@@ -144,7 +144,7 @@ def quarantine(mac, seconds=UNUSABLE_COOLDOWN):
     Needed because "connected" and "usable" are NOT the same thing. BlueZ will
     happily hold an ACL link open to a badge whose audio profile never came up
     (`br-connection-profile-unavailable` — see the troubleshooting notes in
-    relay/RELAY.md). Such a badge reports `Connected: yes` forever while no
+    relay-linux/RELAY.md). Such a badge reports `Connected: yes` forever while no
     `bluez_card.<MAC>` ever appears.
 
     Without a quarantine that state is a LIVELOCK: the detect loop keeps
@@ -246,7 +246,7 @@ def run_as_user(username, cmd):
 def ensure_audio_services(username, force=False):
     """Start the user's PipeWire stack. Startup only, and again on fault.
 
-    Ported from relay/combadge.py. A headless or SSH-only relay host often has
+    Ported from relay-linux/combadge.py. A headless or SSH-only relay host often has
     no running PipeWire session at all until something asks for one, and
     WirePlumber's Bluetooth monitor additionally gates on logind reporting the
     seat active — see the wireplumber seat-monitoring note in README §7 if the
