@@ -343,6 +343,99 @@ default thresholds the bench still feeds back via the talker's own
 pinned gate; see "Adjacent-badge feedback (open)" in the pending items
 for the diagnostic and next steps.
 
+### Phase 7 — TOS hardware findings ported back ✓ (2026-09-07)
+
+The intercom traveled SDK → TOS. **This is the return trip.** TOS spent an
+evening on real badges chasing "crap shoot transmission, static ping-ponging
+between the badges even 15 feet apart", and the fix is two defaults, both of
+which are structural findings rather than room tuning. Applied here.
+
+| knob | was | now |
+|---|---|---|
+| `SDK_CHANNEL_HALF_DUPLEX_MS` | 800 | **150** |
+| `SDK_CHANNEL_GATE_HOLD` | 0.8 | **0.5** |
+
+**1. The half-duplex mute was guarding a path the hardware already guards, and
+charging the reply for it.** These badges advertise `AT+BRSF=671` with bit 0
+(EC/NR) set — they have their own echo canceller, and nothing in the stack
+disables it. HFP puts the canceller in the headset by design, which is also why
+these badges do ordinary full-duplex phone calls.
+
+Worse, `speaker_last_audio` is refreshed on **every** emitted chunk, so `N` was
+never "N ms of decay" — it was *the peer's whole transmission, plus N ms*. At
+800 that tail lands precisely where an answer begins. Measured: peaks of **445
+and 400** in the audio the mute discarded, against a 3-6 idle floor and speech
+at 145-370. It was throwing away real speech. Engagement fell from **35% of
+chunks to 7%** at 150.
+
+**2. `CHANNEL_GATE_HOLD` is a transmit tail.** For that long after the last
+word the gate is still open and still sending room noise, amplified by
+`CHANNEL_GAIN`, out of the peer's speaker — where it can re-open the peer's
+gate. That is the ping-pong. 0.8 → 0.5 cut gate-open time from 47% to 32% and
+took post-transmission static to near zero. **0.4 is the measured floor**; below
+it, mid-sentence pauses get chopped.
+
+#### ⚠ Two knobs TOS also changed and this file deliberately did NOT
+
+`SDK_CHANNEL_GATE` stays **40** (TOS runs 50) and `SDK_CHANNEL_GAIN` stays **6**
+(TOS runs 3). Those are **calibrations** — they depend on badge mic level, room,
+host, and how long a chunk your transport delivers — and calibrations do not
+transfer between rigs. Copying them would be the exact mistake this project has
+made before.
+
+What *does* transfer is the ordering lesson, and it is counter-intuitive enough
+to be worth stating: **fix the transmit tails first, then set the gate.**
+Lowering `GATE` to make quiet speech carry also makes returning echo easier to
+latch, so TOS's 40 → 25 helped the Captain be heard and fed the runaway at the
+same time. Once the tails were fixed there was far less for the threshold to
+trip on — so TOS *raised* it to 50 and got a **more** responsive channel.
+
+#### ⚠ Known gap, not ported: the gate's averaging window is a transport artefact
+
+`_pump_audio` averages over whatever one `recv()` returns. TOS measured **128 ms
+per chunk on one relay and 17 ms on another** — a 7.5x difference in averaging
+time against one shared threshold, with the short-window end running roughly
+double the gate-open rate on the *same* channel. TOS fixed it with a
+fixed-interval window (`channel_gate_window_ms`); the SDK has not.
+
+If both ends of your channel run the same transceiver this is symmetric and
+harmless. If they do not, your thresholds mean different things at each end, and
+that is worth knowing before you tune either.
+
+#### What none of this fixes
+
+The **cross-badge** path — badge A's speaker into badge B's mic. Neither badge
+has any reference for the other's output, so no canceller at any layer can
+subtract it, and no host-side AEC (NLMS, WebRTC AEC3, PipeWire
+`module-echo-cancel`) can either. Below roughly **5 feet** it runs away into
+feedback. TOS's answer is proximity detection with automatic channel
+termination; it is not built yet, and more suppression is not the answer.
+
+Measured operating envelope after this change, on TOS hardware: **usable down to
+5 ft**, with the nearer badge winning, and static near zero.
+
+#### Current channel defaults — the authoritative list
+
+⚠ **Read these, not the numbers quoted in Phases 4 and 6.** Those are accurate
+records of what was true *at that phase* and several have moved since; a couple
+(`GAIN` 12, `GATE` 250/400-peak) predate the switch from peak to average
+magnitude entirely.
+
+| env var | default | kind |
+|---|---|---|
+| `SDK_CHANNEL_GAIN` | 6 | calibration — per badge/host |
+| `SDK_CHANNEL_GATE` | 40 | calibration — per badge/room/transport |
+| `SDK_CHANNEL_GATE_CLOSE` | 40% of `GATE` | derived |
+| `SDK_CHANNEL_GATE_HOLD` | **0.5** | finding — floor is 0.4 |
+| `SDK_CHANNEL_GATE_FADE_MS` | 10 | structural |
+| `SDK_CHANNEL_HALF_DUPLEX_MS` | **150** | finding — 0 is now a small step |
+| `SDK_CHANNEL_FLOOR_RELEASE_MS` | 0 (disabled) | adjacent-badge use only |
+| `SDK_CHANNEL_FLOOR_MAX_S` | 12 | cap on a pinned floor |
+
+The **kind** column is the one that matters when porting between rigs: a
+*finding* is about the hardware or the code and travels; a *calibration* is
+about your room and does not.
+
 ## Resume Point (2026-07-17)
 
 **ALL PHASES (1–6) COMPLETE AND ON-BADGE VALIDATED.** The SDK

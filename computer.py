@@ -251,6 +251,20 @@ CHANNEL_GAIN       = float(os.environ.get("SDK_CHANNEL_GAIN", "6"))
                                   # drop: passing more borderline audio and
                                   # amplifying less keeps the noise floor
                                   # inaudible without chopping the signal.
+                                  #
+                                  # Applied AFTER the gate decision, so this
+                                  # makes transmitted speech louder to the
+                                  # listener and does NOTHING to help quiet
+                                  # speech get through — that is
+                                  # SDK_CHANNEL_GATE.  It does multiply any
+                                  # noise that clears the gate, so lower is
+                                  # calmer if your badge mic runs hot.
+                                  #
+                                  # ⚠ DELIBERATELY NOT SYNCED WITH TOS, which
+                                  # runs 3 as of 2026-09-07.  SCO mic level is
+                                  # per-badge and per-host; halving this on a
+                                  # quiet rig makes the peer inaudible.  A
+                                  # calibration, not a finding.
 
 # 17-char colon-separated MAC, e.g. "2C:F2:DF:45:EC:28" (case-insensitive).
 MAC_RE      = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
@@ -1584,6 +1598,40 @@ CHANNEL_GATE_OPEN  = float(os.environ.get("SDK_CHANNEL_GATE", "40"))
                                   # (SDK_CHANNEL_HALF_DUPLEX_MS), so OPEN can
                                   # be sensitive to soft word onsets without
                                   # amplifying the peer's spillover.
+                                  #
+                                  # ⚠ DELIBERATELY NOT SYNCED WITH TOS, which
+                                  # runs 50 as of 2026-09-07.  This number is a
+                                  # CALIBRATION — it depends on your badge's
+                                  # mic level, your room and how long a chunk
+                                  # your transport delivers — and calibrations
+                                  # do not transfer between rigs.  TOS walked
+                                  # 40 -> 25 -> 50 to land there, and its 50
+                                  # sits on top of a fixed 128 ms averaging
+                                  # window this file does not have (below).
+                                  # Tune yours from the 5 s gate log line.
+                                  #
+                                  # What DOES transfer is the ordering lesson:
+                                  # lowering OPEN to make quiet speech carry
+                                  # also makes returning echo easier to latch,
+                                  # so fix the transmit TAILS first
+                                  # (CHANNEL_GATE_HOLD, CHANNEL_HALF_DUPLEX_MS)
+                                  # and then set OPEN over the quieter channel
+                                  # that results.  TOS ended up RAISING it and
+                                  # getting a more responsive system.
+                                  #
+                                  # ⚠ KNOWN GAP: _pump_audio averages over
+                                  # whatever one recv() returns, so the window
+                                  # is a transport artefact.  TOS measured 128
+                                  # ms on one relay and 17 ms on another — a
+                                  # 7.5x difference in averaging time against
+                                  # one shared threshold, and the short-window
+                                  # side ran roughly double the gate-open rate
+                                  # on the SAME channel.  It fixed this with a
+                                  # fixed-interval window; the SDK has not.  If
+                                  # both your ends are the same implementation
+                                  # this is symmetric and harmless.  If they
+                                  # are not, expect the thresholds to mean
+                                  # different things at each end.
 CHANNEL_GATE_CLOSE = float(os.environ.get("SDK_CHANNEL_GATE_CLOSE",
                                             str(CHANNEL_GATE_OPEN * 0.4)))
                                   # Hysteresis: once open, the gate stays
@@ -1594,26 +1642,65 @@ CHANNEL_GATE_CLOSE = float(os.environ.get("SDK_CHANNEL_GATE_CLOSE",
                                   # room speech) — the second threshold
                                   # blocks that flap.  Env-var default is
                                   # 40% of OPEN; override to tune per-room.
-CHANNEL_GATE_HOLD  = float(os.environ.get("SDK_CHANNEL_GATE_HOLD", "0.8"))
+CHANNEL_GATE_HOLD  = float(os.environ.get("SDK_CHANNEL_GATE_HOLD", "0.5"))
                                   # seconds the average must stay under CLOSE
                                   # before the gate actually shuts (replaces
-                                  # the old CHANNEL_GATE_HANG hangover — this
-                                  # is the same idea, longer default because
-                                  # hysteresis already prevents rapid reopens)
+                                  # the old CHANNEL_GATE_HANG hangover — same
+                                  # idea, and hysteresis prevents rapid reopens)
+                                  #
+                                  # THIS IS A TRANSMIT TAIL: for this long
+                                  # after the last word the gate is still open
+                                  # and still sending room noise, amplified by
+                                  # CHANNEL_GAIN, out of the peer's speaker.
+                                  # Once that reaches the peer's mic it is half
+                                  # of a ping-pong.  0.8 -> 0.5 (2026-09-07,
+                                  # hardware): gate-open time fell 47% -> 32%
+                                  # and post-transmission static dropped to
+                                  # near zero.  0.4 is the measured floor —
+                                  # below it, mid-sentence pauses get chopped.
 CHANNEL_GATE_FADE_MS = int(os.environ.get("SDK_CHANNEL_GATE_FADE_MS", "10"))
                                   # linear fade over the boundary chunk on
                                   # every gate open/close transition — avoids
                                   # the click that a hard silence->audio
                                   # (or audio->silence) edge produces
-CHANNEL_HALF_DUPLEX_MS = float(os.environ.get("SDK_CHANNEL_HALF_DUPLEX_MS", "800"))
+CHANNEL_HALF_DUPLEX_MS = float(os.environ.get("SDK_CHANNEL_HALF_DUPLEX_MS", "150"))
                                   # HALF-DUPLEX mute: while the local badge's
                                   # speaker played peer audio within the last
                                   # N ms, its mic uplink is force-silenced
                                   # (regardless of the gate) so playback
                                   # bleeding into the mic can't feed back as
-                                  # static.  Somewhat canonical behavior: i.e.
-                                  # users learn to say "over".  Set to 0 to
-                                  # disable and return to full duplex.
+                                  # static.  Set to 0 to disable and return to
+                                  # full duplex.
+                                  #
+                                  # 800 -> 150 (2026-09-07, hardware).  Two
+                                  # findings, both structural rather than
+                                  # room-specific, so they port to any rig:
+                                  #
+                                  # 1. The badge has its OWN echo canceller.
+                                  #    HFP puts it in the headset by design —
+                                  #    these badges advertise AT+BRSF=671 with
+                                  #    bit 0 (EC/NR) set, and nothing in the
+                                  #    stack disables it.  This mute is
+                                  #    guarding a path hardware already guards.
+                                  # 2. speaker_last_audio is refreshed on EVERY
+                                  #    emitted chunk (see _pump_audio), so N is
+                                  #    not "N ms of decay" — it is the peer's
+                                  #    WHOLE transmission plus N ms.  At 800
+                                  #    that tail lands exactly where a reply
+                                  #    begins, and it was discarding real
+                                  #    speech: measured peaks of 445 and 400 in
+                                  #    the muted audio against a 3-6 idle floor.
+                                  #
+                                  # Measured effect: engagement fell from 35%
+                                  # of chunks to 7%.  150 only has to cover
+                                  # acoustic decay after the speaker stops.
+                                  #
+                                  # ⚠ What no canceller and no mute can fix is
+                                  # the CROSS-badge path — badge A's speaker
+                                  # into badge B's mic.  Neither badge has a
+                                  # reference for the other's output.  Below
+                                  # ~5 ft that runs away, and the answer is
+                                  # proximity detection, not more suppression.
 CHANNEL_FLOOR_RELEASE_MS = float(os.environ.get("SDK_CHANNEL_FLOOR_RELEASE_MS", "0"))
                                   # FLOOR CONTROL (adjacent-badge / same-room
                                   # use, e.g. filming both ends): one talker at
