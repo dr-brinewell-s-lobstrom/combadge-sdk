@@ -375,20 +375,75 @@ gate. That is the ping-pong. 0.8 → 0.5 cut gate-open time from 47% to 32% and
 took post-transmission static to near zero. **0.4 is the measured floor**; below
 it, mid-sentence pauses get chopped.
 
-#### ⚠ Two knobs TOS also changed and this file deliberately did NOT
+#### The two room calibrations, and why they are shipped anyway
 
-`SDK_CHANNEL_GATE` stays **40** (TOS runs 50) and `SDK_CHANNEL_GAIN` stays **6**
-(TOS runs 3). Those are **calibrations** — they depend on badge mic level, room,
-host, and how long a chunk your transport delivers — and calibrations do not
-transfer between rigs. Copying them would be the exact mistake this project has
-made before.
+`SDK_CHANNEL_GATE` **40 → 50** and `SDK_CHANNEL_GAIN` **6 → 3**, matching TOS.
 
-What *does* transfer is the ordering lesson, and it is counter-intuitive enough
-to be worth stating: **fix the transmit tails first, then set the gate.**
-Lowering `GATE` to make quiet speech carry also makes returning echo easier to
-latch, so TOS's 40 → 25 helped the Captain be heard and fed the runaway at the
-same time. Once the tails were fixed there was far less for the threshold to
-trip on — so TOS *raised* it to 50 and got a **more** responsive channel.
+These two *are* room calibrations rather than findings, and the first instinct
+was to leave them — calibrations do not transfer between rigs, and copying one
+is a mistake this project has made before. **That reasoning was wrong here, and
+the Captain caught it:**
+
+> given that these two badges and my environment are the ONLY things ever tested
+> with TOS or the SDK to my knowledge, I would think that we should apply the
+> `channel_gate` and `channel_gain` as well, since at least it's a known-good
+> config even if specific to my badges and my environment. Better for new users
+> to start with that, than with guesses.
+
+The old 40 and 6 were not neutral defaults — they came from **the same two
+badges in the same rooms**, just an earlier and less-informed session. There is
+no second rig. Choosing between two calibrations from one environment, the one
+that was measured last and demonstrably held a clean channel wins.
+
+**So: where these numbers come from, stated plainly.** Two Star Trek combadges
+in one home, in relatively quiet rooms with some hum, hiss and cricket noise.
+Measured bounds there: room noise max **5.6**, quietest quarter of speech
+**p25 = 90**. That environment is why 50 works; a workshop, an office with HVAC,
+or a badge with a hotter mic will want different numbers. **Expect to tune
+these two**, and use the 5 s gate log line as the instrument.
+
+`GATE` is calibrated against a **128 ms** averaging window, which is what this
+stack naturally produces — `listener.py` uplinks with
+`ffmpeg.stdout.read(4096)`, a blocking pipe read, and 4096 B at 16 kHz mono s16
+*is* 128 ms. Relevant if you replace the transceiver; see the known gap below.
+
+`GAIN` applies **after** the gate, so it sets loudness to the listener and does
+nothing for quiet speech getting through. **Raise it first if the peer sounds
+too quiet.**
+
+The **ordering lesson** travels even where the numbers do not, and it is
+counter-intuitive enough to be worth stating: **fix the transmit tails first,
+then set the gate.** Lowering `GATE` to make quiet speech carry also makes
+returning echo easier to latch, so TOS's 40 → 25 helped the Captain be heard and
+fed the runaway at the same time. Once the tails were fixed there was far less
+for the threshold to trip on — so TOS *raised* it to 50 and got a **more**
+responsive channel.
+
+#### ⚠ Also ported: a guard against inverted hysteresis
+
+**`CHANNEL_GATE_CLOSE >= CHANNEL_GATE_OPEN` is an oscillator, not a gate.** It
+opens at `OPEN`, and the average is already above `CLOSE`, so the hold timer
+resets forever and the channel transmits continuously — room noise, amplified by
+`CHANNEL_GAIN`, straight into the peer's speaker.
+
+Not hypothetical: it shipped for an evening on TOS (2026-09-07). `CLOSE` was
+pinned at 16 while `OPEN` was lowered to 10 to chase microphone sensitivity, the
+pair inverted, and it was audible as continuous **static ping-pong** between the
+badges. It cost a test session before the printed thresholds gave it away.
+
+The SDK is *more* exposed than TOS was, because `SDK_CHANNEL_GATE_CLOSE` can be
+pinned by env var while `SDK_CHANNEL_GATE` is tuned independently. There is now
+a load-time clamp (to 40% of open, with a message saying what it did) plus a
+warning when `CLOSE` falls below **8**, the floor below which measured room noise
+keeps the hold timer alive. The default is left as the **auto 40%-of-`OPEN`
+rule** rather than TOS's pinned 16, because the rule survives someone re-tuning
+`OPEN` and a pinned number would not — that gives `CLOSE` = 20 here against
+TOS's 16, a small difference in the safe direction.
+
+⚠ Both warnings are **ASCII-only on purpose**: they run at module import, before
+`__main__` reconfigures stdout to UTF-8, so a non-ASCII character in them is a
+hard `UnicodeEncodeError` at startup on a cp1252 console — the default on
+Windows. A warning about a misconfiguration must not itself crash the server.
 
 #### ⚠ Known gap, not ported: the gate's averaging window is a transport artefact
 
@@ -423,18 +478,24 @@ magnitude entirely.
 
 | env var | default | kind |
 |---|---|---|
-| `SDK_CHANNEL_GAIN` | 6 | calibration — per badge/host |
-| `SDK_CHANNEL_GATE` | 40 | calibration — per badge/room/transport |
-| `SDK_CHANNEL_GATE_CLOSE` | 40% of `GATE` | derived |
+| `SDK_CHANNEL_GAIN` | **3** | calibration — per badge/host. Raise if the peer is too quiet |
+| `SDK_CHANNEL_GATE` | **50** | calibration — per badge/room/transport. The one to tune first |
+| `SDK_CHANNEL_GATE_CLOSE` | 40% of `GATE` (= 20) | derived; clamped if >= `GATE`, warns below 8 |
 | `SDK_CHANNEL_GATE_HOLD` | **0.5** | finding — floor is 0.4 |
 | `SDK_CHANNEL_GATE_FADE_MS` | 10 | structural |
 | `SDK_CHANNEL_HALF_DUPLEX_MS` | **150** | finding — 0 is now a small step |
 | `SDK_CHANNEL_FLOOR_RELEASE_MS` | 0 (disabled) | adjacent-badge use only |
 | `SDK_CHANNEL_FLOOR_MAX_S` | 12 | cap on a pinned floor |
 
-The **kind** column is the one that matters when porting between rigs: a
-*finding* is about the hardware or the code and travels; a *calibration* is
-about your room and does not.
+The **kind** column is what matters when you tune. A *finding* is about the
+badge hardware or this code and should hold anywhere. A *calibration* is about
+one quiet home with two badges — shipped because it is the only configuration
+ever measured and a known-good starting point beats a guess, but it is a
+starting point and not a universal default.
+
+**As a whole this set is a tested configuration**, not an assembly of
+independently-chosen numbers: two badges held a clean channel on it down to
+about 5 ft. Change one at a time and watch the gate log.
 
 ## Resume Point (2026-07-17)
 

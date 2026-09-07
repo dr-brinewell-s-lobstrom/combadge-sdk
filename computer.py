@@ -242,29 +242,34 @@ HAIL_MAX_CAPTURE_S = 20           # hard cap on hail capture (noisy-room backsto
 pending_hails      = {}           # target MAC -> channel entry dict (see handle_hail)
 pending_hails_lock = threading.Lock()
 
-CHANNEL_GAIN       = float(os.environ.get("SDK_CHANNEL_GAIN", "6"))
+CHANNEL_GAIN       = float(os.environ.get("SDK_CHANNEL_GAIN", "3"))
                                   # per-chunk software gain on bridged mic PCM —
                                   # SCO mic level vs speaker level, the same
                                   # mismatch hail normalization fixes, applied
                                   # per-chunk here for realtime.  Lowered
-                                  # from 12 to 6 alongside the gate-threshold
-                                  # drop: passing more borderline audio and
-                                  # amplifying less keeps the noise floor
-                                  # inaudible without chopping the signal.
+                                  # 12 -> 6 alongside the gate-threshold drop,
+                                  # then 6 -> 3 (2026-09-07): passing more
+                                  # borderline audio and amplifying less keeps
+                                  # the noise floor inaudible without chopping
+                                  # the signal.
                                   #
                                   # Applied AFTER the gate decision, so this
                                   # makes transmitted speech louder to the
                                   # listener and does NOTHING to help quiet
                                   # speech get through — that is
-                                  # SDK_CHANNEL_GATE.  It does multiply any
-                                  # noise that clears the gate, so lower is
-                                  # calmer if your badge mic runs hot.
+                                  # SDK_CHANNEL_GATE.  It DOES multiply
+                                  # whatever noise clears the gate, which is
+                                  # why halving it halves the static burst
+                                  # that follows an utterance.
                                   #
-                                  # ⚠ DELIBERATELY NOT SYNCED WITH TOS, which
-                                  # runs 3 as of 2026-09-07.  SCO mic level is
-                                  # per-badge and per-host; halving this on a
-                                  # quiet rig makes the peer inaudible.  A
-                                  # calibration, not a finding.
+                                  # ⚠ ROOM CALIBRATION, same caveat as
+                                  # SDK_CHANNEL_GATE: measured on two badges
+                                  # in one quiet home, the only rig this code
+                                  # has run on.  A known-good starting point,
+                                  # not a universal default.  RAISE IT FIRST
+                                  # if the peer sounds too quiet — SCO mic
+                                  # level varies by badge and by host, and
+                                  # this is the knob for loudness.
 
 # 17-char colon-separated MAC, e.g. "2C:F2:DF:45:EC:28" (case-insensitive).
 MAC_RE      = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
@@ -1584,7 +1589,7 @@ def push_voice(mac, text):
 # b'X' against in-flight frames.
 # ---------------------------------------------------------------------------
 
-CHANNEL_GATE_OPEN  = float(os.environ.get("SDK_CHANNEL_GATE", "40"))
+CHANNEL_GATE_OPEN  = float(os.environ.get("SDK_CHANNEL_GATE", "50"))
                                   # AVERAGE |sample| per chunk at/above which
                                   # the gate OPENS (not peak: noise spikes
                                   # have high peaks but low average; speech
@@ -1599,39 +1604,59 @@ CHANNEL_GATE_OPEN  = float(os.environ.get("SDK_CHANNEL_GATE", "40"))
                                   # be sensitive to soft word onsets without
                                   # amplifying the peer's spillover.
                                   #
-                                  # ⚠ DELIBERATELY NOT SYNCED WITH TOS, which
-                                  # runs 50 as of 2026-09-07.  This number is a
-                                  # CALIBRATION — it depends on your badge's
-                                  # mic level, your room and how long a chunk
-                                  # your transport delivers — and calibrations
-                                  # do not transfer between rigs.  TOS walked
-                                  # 40 -> 25 -> 50 to land there, and its 50
-                                  # sits on top of a fixed 128 ms averaging
-                                  # window this file does not have (below).
-                                  # Tune yours from the 5 s gate log line.
+                                  # 40 -> 50 (2026-09-07).  THIS IS A ROOM
+                                  # CALIBRATION, and it is worth knowing whose
+                                  # room: every number in this file was
+                                  # measured on two Star Trek combadges in one
+                                  # home, in relatively quiet rooms with some
+                                  # hum, hiss and cricket noise.  That is the
+                                  # only rig this code has ever run on.  It is
+                                  # published as a KNOWN-GOOD STARTING POINT —
+                                  # a place where two badges demonstrably held
+                                  # a clean channel down to about 5 ft — and
+                                  # not as a universal default.  Expect to tune
+                                  # it; the 5 s gate log line is the
+                                  # instrument, and TOS.conf's [intercom]
+                                  # section documents the measured bounds
+                                  # (room noise max 5.6, quietest quarter of
+                                  # speech p25 = 90).
                                   #
-                                  # What DOES transfer is the ordering lesson:
-                                  # lowering OPEN to make quiet speech carry
-                                  # also makes returning echo easier to latch,
-                                  # so fix the transmit TAILS first
-                                  # (CHANNEL_GATE_HOLD, CHANNEL_HALF_DUPLEX_MS)
-                                  # and then set OPEN over the quieter channel
-                                  # that results.  TOS ended up RAISING it and
-                                  # getting a more responsive system.
+                                  # Calibrated against a 128 ms averaging
+                                  # window, which is what this stack naturally
+                                  # produces: listener.py uplinks with
+                                  # ffmpeg.stdout.read(4096), a blocking pipe
+                                  # read, and 4096 B at 16 kHz mono s16 IS
+                                  # 128 ms.  Keep that in mind if you replace
+                                  # the transceiver — see the KNOWN GAP below.
+                                  #
+                                  # The ORDERING LESSON travels even where the
+                                  # number does not: lowering OPEN to make
+                                  # quiet speech carry also makes returning
+                                  # echo easier to latch, so fix the transmit
+                                  # TAILS first (CHANNEL_GATE_HOLD,
+                                  # CHANNEL_HALF_DUPLEX_MS) and only then set
+                                  # OPEN over the quieter channel that results.
+                                  # TOS walked 40 -> 25 -> 50: the 25 helped
+                                  # quiet speech AND fed the feedback runaway,
+                                  # and once the tails were fixed RAISING it
+                                  # to 50 gave a more responsive channel.
                                   #
                                   # ⚠ KNOWN GAP: _pump_audio averages over
-                                  # whatever one recv() returns, so the window
-                                  # is a transport artefact.  TOS measured 128
-                                  # ms on one relay and 17 ms on another — a
-                                  # 7.5x difference in averaging time against
-                                  # one shared threshold, and the short-window
-                                  # side ran roughly double the gate-open rate
-                                  # on the SAME channel.  It fixed this with a
-                                  # fixed-interval window; the SDK has not.  If
-                                  # both your ends are the same implementation
-                                  # this is symmetric and harmless.  If they
-                                  # are not, expect the thresholds to mean
-                                  # different things at each end.
+                                  # whatever one recv() returns rather than a
+                                  # fixed interval, so the window is a
+                                  # transport artefact.  With the stock
+                                  # transceiver at both ends it is a steady
+                                  # 128 ms and this threshold means what it
+                                  # says.  Mix in a transport that delivers
+                                  # shorter chunks and it will not: TOS
+                                  # measured 128 ms on one relay against 17 ms
+                                  # on another, one shared threshold, and the
+                                  # short-window end ran roughly DOUBLE the
+                                  # gate-open rate on the SAME channel (short
+                                  # windows have more variance, so transients
+                                  # a 128 ms average smooths away clear the
+                                  # bar outright).  TOS fixed this with a
+                                  # fixed-interval window; the SDK has not.
 CHANNEL_GATE_CLOSE = float(os.environ.get("SDK_CHANNEL_GATE_CLOSE",
                                             str(CHANNEL_GATE_OPEN * 0.4)))
                                   # Hysteresis: once open, the gate stays
@@ -1641,7 +1666,61 @@ CHANNEL_GATE_CLOSE = float(os.environ.get("SDK_CHANNEL_GATE_CLOSE",
                                   # on marginal signals (distant audio, quiet
                                   # room speech) — the second threshold
                                   # blocks that flap.  Env-var default is
-                                  # 40% of OPEN; override to tune per-room.
+                                  # 40% of OPEN, which auto-scales when you
+                                  # tune OPEN; override to pin it per-room.
+                                  #
+                                  # The rig this was calibrated on runs an
+                                  # explicit 16 against OPEN 50 (32%) rather
+                                  # than the 20 this formula gives.  The
+                                  # difference is small and 20 errs toward
+                                  # shutting sooner, which is the safe
+                                  # direction; the auto rule is kept because
+                                  # it survives someone re-tuning OPEN and a
+                                  # pinned 16 would not.
+
+# ⚠ INVERTED HYSTERESIS IS AN OSCILLATOR, NOT A GATE.  If CLOSE >= OPEN the
+# gate can never shut: it opens at OPEN, and the average is already above CLOSE
+# so the hold timer resets forever.  The channel then transmits continuously —
+# room noise, amplified by CHANNEL_GAIN, straight into the peer's speaker.
+#
+# This is not hypothetical.  It shipped for one evening on TOS (2026-09-07):
+# CLOSE pinned at 16 while OPEN was lowered to 10 to chase microphone
+# sensitivity, and the pair inverted.  It was audible as continuous "static
+# ping-pong" between the badges and cost a test session before the printed
+# thresholds gave it away.  It is an easy trap here because CLOSE can be pinned
+# by env var while OPEN is tuned independently.
+#
+# Clamped rather than refused: an intercom that will not carry a voice is worse
+# than one running on a corrected threshold, and the message says what was done.
+if CHANNEL_GATE_CLOSE >= CHANNEL_GATE_OPEN:
+    _bad = CHANNEL_GATE_CLOSE
+    CHANNEL_GATE_CLOSE = CHANNEL_GATE_OPEN * 0.4
+    # ASCII ONLY in this message and the one below: both run at MODULE IMPORT,
+    # which is before __main__ reconfigures stdout to UTF-8. A non-ASCII
+    # character here is a hard UnicodeEncodeError at import on a cp1252 console
+    # (the default on Windows, which is the SDK's primary platform) -- i.e. the
+    # warning about a misconfiguration would itself crash the server.
+    print(f"[computer] WARNING: SDK_CHANNEL_GATE_CLOSE ({_bad:g}) >= "
+          f"SDK_CHANNEL_GATE ({CHANNEL_GATE_OPEN:g}) - that pair is an "
+          f"OSCILLATOR, not a gate. Clamped to {CHANNEL_GATE_CLOSE:g} "
+          f"(40% of open). Set close BELOW open, and keep it clear of the "
+          f"room noise floor.")
+    del _bad
+
+# The lowest CLOSE that can still SHUT the gate on the calibration rig: room
+# noise at the badge mic measured 3-6 there, and a close threshold inside that
+# band means the hold timer keeps resetting.  WARN, do not clamp — raising
+# CLOSE could re-invert it against OPEN, and the honest fix is a higher OPEN,
+# which is a tuning decision rather than something to impose silently.
+CHANNEL_GATE_CLOSE_MIN = 8.0
+if CHANNEL_GATE_CLOSE < CHANNEL_GATE_CLOSE_MIN:
+    print(f"[computer] WARNING: SDK_CHANNEL_GATE_CLOSE is {CHANNEL_GATE_CLOSE:g}, "
+          f"below the {CHANNEL_GATE_CLOSE_MIN:g} floor measured from room noise "
+          f"(3-6). The gate may never SHUT, and floor control only releases on a "
+          f"close - so one badge can hold the channel indefinitely and the other "
+          f"will seem dead. Raise SDK_CHANNEL_GATE instead if quiet speech is not "
+          f"getting through. (Your room may differ; measure it.)")
+
 CHANNEL_GATE_HOLD  = float(os.environ.get("SDK_CHANNEL_GATE_HOLD", "0.5"))
                                   # seconds the average must stay under CLOSE
                                   # before the gate actually shuts (replaces
