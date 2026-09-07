@@ -106,6 +106,11 @@ ACK_WAV                 = os.path.join(ASSET_DIR, "commandexecuted.wav")
 NACK_WAV                = os.path.join(ASSET_DIR, "commandfailure.wav")
 BADGE_ONLINE_WAV        = os.path.join(ASSET_DIR, "badge-to-comms-relay-online.wav")
 MAINCOMPUTER_ONLINE_WAV = os.path.join(ASSET_DIR, "maincomputeronline.wav")
+# The other edge.  Added 2026-09-06: the server going away was logged and
+# otherwise silent, so a badge that had stopped working sounded exactly like a
+# badge nobody had tapped.  A bundled asset rather than TTS for a structural
+# reason — synthesis needs the server, which is by definition what just went.
+MAINCOMPUTER_OFFLINE_WAV = os.path.join(ASSET_DIR, "maincomputeroffline.wav")
 
 
 # ---------------------------------------------------------------------------
@@ -165,8 +170,14 @@ PRIME_MS = 200
 # PLUS whatever silence the chirp file itself begins with.  The two projects play
 # DIFFERENT chirps, and this is the whole of the difference:
 #
-#     TOS  audio/listening.wav          324 ms,  0 ms of built-in lead-in
-#     SDK  sdk/assets/listening.wav    1189 ms, 90 ms of built-in lead-in
+#     TOS  audio/listening.wav          309 ms,  4 ms of built-in lead-in
+#     SDK  sdk/assets/listening.wav     671 ms, 77 ms of built-in lead-in
+#
+# (Both files were tail-trimmed 2026-09-06 -- 324->309, 1189->671 -- which
+# removed dead air AFTER the sound and so cost nothing. Heads untouched, so
+# this constant is still correct at 160.  The lead-ins above are measured at
+# 0.5% of peak; the "90 ms" mentioned below is the same ramp at 10%, since
+# this chirp fades in rather than starting flat.)
 #
 # TOS reaches full level inside its first 10 ms frame and needs the entire 250 ms
 # from the prime.  This chirp opens with 90 ms of silence and then ramps, so
@@ -174,7 +185,7 @@ PRIME_MS = 200
 # added 90 ms of dead air to every tap for nothing.
 #
 # CONFIRMED, not merely reasoned: a blind A/B on PAN, badge 1B:B8:82:88:2F:60,
-# reproducing this exact call sequence on a cold link (mixer/sdk_prime_probe.py
+# reproducing this exact call sequence on a cold link (controlpanel/sdk_prime_probe.py
 # in the TOS tree).  Twelve trials over two runs, order hidden from the listener:
 #
 #     0 ms    4/4 heard as CLIPPED
@@ -757,11 +768,24 @@ def downlink_loop():
             print(f"[listener] downlink error: {e} — reconnecting")
         finally:
             release_warm()
+            # THE UP->DOWN EDGE, and the mirror of the maincomputeronline.wav
+            # announce above.  downlink_up is set only once the connection was
+            # actually established, so this cannot fire on the startup retries
+            # before the first successful connect — and because it is on the
+            # edge rather than in the retry loop, it says it ONCE rather than
+            # every DOWNLINK_RETRY_S seconds for as long as the server is down.
+            was_up = downlink_up.is_set()
             downlink_up.clear()
             try:
                 sock.close()
             except OSError:
                 pass
+            if was_up:
+                print("[listener] server OFF-LINE — announcing")
+                try:
+                    play_pushed_voice(MAINCOMPUTER_OFFLINE_WAV, volume=0.5)
+                except Exception as e:                        # noqa: BLE001
+                    print(f"[listener] offline announce failed: {e}")
         time.sleep(1)   # brief pause, then the reconnect loop takes over
 
 

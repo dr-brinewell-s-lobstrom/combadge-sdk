@@ -207,7 +207,7 @@ tuning had travelled one way only.
 ⚠ **The SDK's value is 160, not 250, and the difference is not an oversight.**
 What protects the chirp is the total silence at the head of the stream: the
 prime PLUS the chirp file's own lead-in. The two projects play different chirps
-— TOS's is 324 ms and starts at full level; the SDK's is 1189 ms and opens with
+— TOS's is 309 ms and starts at full level; the SDK's is 671 ms and opens with
 90 ms of silence. 160 + 90 gives the same 250 ms of protection, and copying 250
 would add 90 ms of dead air to every tap. Confirmed by blind A/B on PAN
 (12 trials): 0 ms clipped 4/4, 160 ms and 250 ms clean 4/4 each.

@@ -915,3 +915,29 @@ State is in-process, as it is for Vibe Control, and here that buys something ext
 ## 13.  More Info
 
 This SDK is the distilled foundation of a much larger system - the Terran Operating System (TOS), the author's full starship-computer environment built on this same voice command pipeline (voice-print identity, command vocabularies, dictation, an AI main computer, and more). To see where this foundation can lead, visit https://tos.md.
+
+
+## "Main computer offline." — announced
+
+The server going away was printed to the console and otherwise silent, so a
+badge that had stopped working sounded exactly like a badge nobody had tapped.
+`listener.py` now plays `assets/maincomputeroffline.wav` on the **up->down
+edge** of the downlink -- the mirror of the `maincomputeronline.wav` announce
+it already made on connect.
+
+Once per transition, gated on `downlink_up` having actually been set, so it
+never fires on the startup retries before the first successful connect and
+never repeats every `DOWNLINK_RETRY_S` while the server stays down.
+
+A bundled asset rather than TTS for a structural reason: synthesis needs the
+server, which is by definition what just disappeared.
+
+⚠ **The SDK's copy is NOT the one the full TOS tree ships.** `audio/` and
+relay-mobile carry the Majel voice; the SDK is meant to be voice-neutral, so
+`assets/maincomputeroffline.wav` was regenerated 2026-09-06 with `tts.sh`, the
+same platform TTS `computer.py::synth_wav()` uses at runtime. Same filename,
+deliberately different audio. Regenerate it with:
+
+```bash
+./tts.sh "Main computer offline." assets/maincomputeroffline.wav
+```
