@@ -103,6 +103,22 @@ ASSET_DIR  = os.path.join(SCRIPT_DIR, "assets")
 
 LISTENING_WAV           = os.path.join(ASSET_DIR, "listening.wav")
 ACK_WAV                 = os.path.join(ASSET_DIR, "commandexecuted.wav")
+# Spoken channel cues (INTERCOM.md Phase 9), generated with tts.sh like the
+# rest.  "Listening" and "Command executed" are wrong at those two moments:
+# an answering tap takes no command, and a closing channel executed none.
+CHANNEL_OPEN_WAV        = os.path.join(ASSET_DIR, "channelopen.wav")
+CHANNEL_CLOSED_WAV      = os.path.join(ASSET_DIR, "channelclosed.wav")
+# Uplink sent as SILENCE for this long after "Channel open." finishes.  The
+# badge unmutes its own mic 10-25 ms after its speaker stops, into a room
+# still ringing with the clip for up to ~250 ms (measured in TOS, 2026-09-10),
+# and that ring is exactly what used to open gates and start bounce loops.
+ANNOUNCE_TAIL_S         = 0.35
+# Hail pending (Phase 9): the downlink sets `until` on b'H' -- the server has
+# delivered a hail to this badge and is holding its answer window -- and b'E',
+# any tap, or a downlink reconnect clears it.  The cap is a backstop only, in
+# case b'E' never arrives; the server's own window is SDK_HAIL_ANSWER_S (30).
+HAIL_PENDING_MAX_S      = 45
+hail_pending            = {"until": 0.0}
 NACK_WAV                = os.path.join(ASSET_DIR, "commandfailure.wav")
 BADGE_ONLINE_WAV        = os.path.join(ASSET_DIR, "badge-to-comms-relay-online.wav")
 MAINCOMPUTER_ONLINE_WAV = os.path.join(ASSET_DIR, "maincomputeronline.wav")
@@ -679,6 +695,7 @@ def downlink_loop():
 
         print(f"[listener] downlink established to {SERVER_HOST}:{SERVER_PORT}")
         downlink_up.set()
+        hail_pending["until"] = 0.0     # a (re)connected server holds no hail for us
         # Announce on every (re)connect — audible "the server is (back) up."
         # Standard chirp level, NOT hail level — matches the badge-online
         # announce that precedes it.
@@ -730,6 +747,21 @@ def downlink_loop():
                         print("[listener] prewarm failed — will fall back to cold path")
                         force_sco_teardown()
                         audio_lock.release()
+                    continue
+                if sig in (b"H", b"E"):
+                    # Hail pending / ended (INTERCOM.md Phase 9). b'H' arrives
+                    # just before the hail itself: the server is about to hold
+                    # an answer window, so the next tap ANSWERS -- and must not
+                    # chirp "listening" for a command that is not coming.
+                    # b'E': the window closed unanswered.  Older servers never
+                    # send either; older listeners log them as unknown bytes
+                    # and keep chirping.
+                    if sig == b"H":
+                        hail_pending["until"] = time.time() + HAIL_PENDING_MAX_S
+                        print("[listener] hail pending -- next tap answers it")
+                    else:
+                        hail_pending["until"] = 0.0
+                        print("[listener] hail window closed")
                     continue
                 if sig in (b"M", b"N"):
                     # Game Mode state from the server. Non-terminal, no payload.
@@ -925,6 +957,21 @@ def run_channel(sock, ffmpeg):
         print("[listener] channel: no badge input — tap-to-close unavailable")
 
     print("[listener] CHANNEL OPEN — single tap to close")
+
+    # Spoken "Channel open." on BOTH badges (Phase 9) -- in a THREAD, because
+    # the loop below must start pumping at once: were it to wait, peer audio
+    # would queue in the socket while the clip plays and the channel would run
+    # late by the clip's length for its whole life.  The uplink goes out as
+    # SILENCE until ANNOUNCE_TAIL_S after the clip ends, so the badge's own
+    # ring of it cannot reach the server's gate.  play_wav() takes no lock,
+    # and PipeWire mixes it with the channel player.
+    announce_mute_until = [float("inf")]
+
+    def _announce():
+        play_wav(CHANNEL_OPEN_WAV, prime=False)
+        announce_mute_until[0] = time.time() + ANNOUNCE_TAIL_S
+
+    threading.Thread(target=_announce, daemon=True).start()
     opened  = time.time()
     closing = False
     buf     = b""
@@ -1059,7 +1106,10 @@ def run_channel(sock, ffmpeg):
                             lvl_sum += total / count
                             lvl_n += 1
                     try:
-                        sock.sendall(data)
+                        # Silence, same length, while "Channel open." plays
+                        # and rings -- keeps the stream's timing intact.
+                        sock.sendall(data if time.time() >= announce_mute_until[0]
+                                     else bytes(len(data)))
                     except OSError:
                         break
                 else:
@@ -1131,7 +1181,7 @@ def run_channel(sock, ffmpeg):
         terminate_ffmpeg(player)
     print(f"[listener] CHANNEL CLOSED (up {up_b//1024}KB down {down_b//1024}KB "
           f"dropped {dropped_b//1024}KB)")
-    play_wav(ACK_WAV, prime=False)   # close confirmation; SCO still hot
+    play_wav(CHANNEL_CLOSED_WAV, prime=False)   # "Channel closed." (Phase 9); SCO still hot
 
 
 # ---------------------------------------------------------------------------
@@ -1204,7 +1254,16 @@ def _stream_and_handle_response():
     # the tap IS the click. play_wav() blocks on pw-play until the sound has
     # finished, so the chirp is not just wrong, it is dead time sitting between
     # the tap and the click.
-    if not game_mode.is_set():
+    #
+    # SKIPPED WHEN THIS TAP ANSWERS A HAIL (Phase 9).  The server will reply
+    # b'O' and the channel announces itself with "Channel open."; a
+    # "listening" first would promise a command that is not coming.  The tap
+    # consumes the pending mark either way.
+    answering = time.time() < hail_pending["until"]
+    hail_pending["until"] = 0.0
+    if answering:
+        print("[listener] answering hail -- no listening chirp")
+    elif not game_mode.is_set():
         play_silence(PRIME_MS_LISTENING)
         play_wav(LISTENING_WAV, prime=False)
 
@@ -1337,7 +1396,7 @@ def _stream_and_handle_response():
     elif signal_byte == b"v":
         pass                    # voice response already played in receive_voice_response()
     elif signal_byte == b"O":
-        pass                    # channel ran to completion; close chirp already played
+        pass                    # channel ran to completion; "Channel closed." already played
     else:
         print(f"[listener] no/unknown signal byte: {signal_byte!r}")
 

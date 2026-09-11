@@ -23,6 +23,8 @@
 #   ./tts.sh "Badge to comms relay online."  assets/badge-to-comms-relay-online.wav
 #   ./tts.sh "Command executed."             assets/commandexecuted.wav
 #   ./tts.sh "Command failure."              assets/commandfailure.wav
+#   ./tts.sh "Channel open."                 assets/channelopen.wav
+#   ./tts.sh "Channel closed."               assets/channelclosed.wav
 
 set -euo pipefail
 

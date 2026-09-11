@@ -2126,6 +2126,25 @@ def run_channel_answer(conn, mac, entry):
     _close_channel(entry)
 
 
+def _downlink_signal(mac, byte):
+    """One payload-free control byte down a badge's downlink; best-effort.
+
+    Used for b'H' / b'E' (hail pending / ended, INTERCOM.md Phase 9).  A
+    badge with no live downlink simply does not hear it, and its listener's
+    own backstop expires the mark.
+    """
+    with downlinks_lock:
+        entry = downlinks.get(mac)
+    if not entry:
+        return False
+    try:
+        with entry["lock"]:
+            entry["sock"].sendall(byte)
+        return True
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Hail flow (sdk/INTERCOM.md Phase 3)
 # ---------------------------------------------------------------------------
@@ -2212,7 +2231,12 @@ def handle_hail(conn, caller_mac, target_mac, phrase, rec, pcm, mac_to_aliases):
     # delays the earliest answer tap; mic captures are quiet.
     hail_wav = wav_from_pcm(prepare_hail_pcm(b"".join(pcm),
                                              tag=f"[{caller_mac}] hail "))
+    # b'H' goes BEFORE the hail (Phase 9): the target's downlink handles bytes
+    # in order, so by the time the hail has finished playing its listener
+    # already knows the next tap answers -- no race with a quick tap.
+    _downlink_signal(target_mac, b"H")
     if not push_frame(target_mac, hail_wav):
+        _downlink_signal(target_mac, b"E")
         conn.settimeout(10)
         send_voice(conn, f"{target_name} is not available.", caller_mac)
         return
@@ -2275,6 +2299,8 @@ def handle_hail(conn, caller_mac, target_mac, phrase, rec, pcm, mac_to_aliases):
         with pending_hails_lock:
             if pending_hails.get(target_mac) is entry:
                 del pending_hails[target_mac]
+        if not answered.is_set():
+            _downlink_signal(target_mac, b"E")   # window over: taps are commands again
 
 
 # ---------------------------------------------------------------------------

@@ -378,15 +378,17 @@ ffmpeg is not a stylistic choice - `parec`, `parecord --file-format=raw`, and `p
 | `b'v'` | voice response       | read 4-byte big-endian size, then exactly N bytes of WAV; play |
 | `b'k'` | keepalive            | reset the recv timeout (and slide the recording deadline), keep waiting |
 | `b'W'` | prewarm (downlink)   | bring SCO up now and hold it - a hail is about to arrive     |
-| `b'O'` | channel open         | this tap socket is now a live intercom (see `INTERCOM.md`)   |
+| `b'H'` | hail pending (downlink) | the next tap answers a hail - skip the `listening.wav` chirp for it |
+| `b'E'` | hail ended (downlink) | the answer window closed unanswered - taps are commands again |
+| `b'O'` | channel open         | this tap socket is now a live intercom (see `INTERCOM.md`); play `channelopen.wav` |
 | `b'A'`+len+PCM | channel audio | peer audio frame (2-byte BE len); pipe into the stdin player |
-| `b'X'` | channel closed       | play close chirp, tear down                                  |
+| `b'X'` | channel closed       | play `channelclosed.wav`, tear down                          |
 
 The badge-to-badge hail/channel system built on these (aliases, prewarm, hysteretic noise gate, half-duplex mute, close gestures) is documented in `INTERCOM.md`.
 
-The SDK uses `c`, `f`, `v`, `k`, and the four channel bytes above. Other letters are free for your own extensions - a signal byte can trigger any relay-side behavior you like (the author's fuller system uses `l` for dictation-recorded and `p` for prompt-dispatched, for example).
+The SDK uses `c`, `f`, `v`, `k`, the four channel bytes above, and the downlink's `H`/`E`. Other letters are free for your own extensions - a signal byte can trigger any relay-side behavior you like (the author's fuller system uses `l` for dictation-recorded and `p` for prompt-dispatched, for example).
 
-`listener.py` expects these asset files in `assets/` (next to the scripts): `listening.wav` (chirp on tap), `commandexecuted.wav`, `commandfailure.wav`, `badge-to-comms-relay-online.wav` (played on startup once the badge connects), `maincomputeronline.wav` (played once the server is reachable). Any short WAV/MP3 clips work - record or synthesize your own and drop them in under these names.
+`listener.py` expects these asset files in `assets/` (next to the scripts): `listening.wav` (chirp on tap), `commandexecuted.wav`, `commandfailure.wav`, `badge-to-comms-relay-online.wav` (played on startup once the badge connects), `maincomputeronline.wav` (played once the server is reachable), `channelopen.wav` and `channelclosed.wav` (spoken when an intercom channel opens and closes). Any short WAV/MP3 clips work - record or synthesize your own and drop them in under these names.
 
 **Generating the spoken assets - `tts.sh`.** For the spoken (as opposed to purely sound-effect) assets, `tts.sh` writes a WAV from a phrase using the *same* TTS engine `computer.py` speaks with - Windows SAPI (`System.Speech`, female voice, Rate 2) or `espeak-ng -v en-us -s 165` on Linux/macOS - so your startup and acknowledgement tones match the voice that answers commands. Unlike `speak`-style tools it only writes the file; it never plays audio. A bare filename lands next to the script; a path containing a slash is used as given:
 
@@ -396,6 +398,8 @@ The SDK uses `c`, `f`, `v`, `k`, and the four channel bytes above. Other letters
 ./tts.sh "Badge to comms relay online."  assets/badge-to-comms-relay-online.wav
 ./tts.sh "Command executed."             assets/commandexecuted.wav
 ./tts.sh "Command failure."              assets/commandfailure.wav
+./tts.sh "Channel open."                 assets/channelopen.wav
+./tts.sh "Channel closed."               assets/channelclosed.wav
 ```
 
 **Persistent downlink.** On startup `listener.py` opens a second, long-lived connection to the server - handshake `b'h'` + MAC - and holds it open for the life of the session on a background thread. The server sends `b'k'` keepalives every ~5 s; 15 s of silence means the server is gone, and the relay reconnects every 5 s, playing `maincomputeronline.wav` on each successful (re)connect - so a server restart is audible on the badge with no tap. The downlink is also the server's **push path**: a `b'v'` frame arriving on it plays through the badge immediately via the cold-SCO sequence (`ensure_hfp_profile()` → `play_wav_cold()` → teardown), which is how badge-to-badge hails are delivered (see `INTERCOM.md`). An `audio_lock` serializes pushed audio against active tap cycles so a hail can never play over a live command. Taps are not accepted until the downlink's first connect.

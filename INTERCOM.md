@@ -75,7 +75,9 @@ sentinel `00:00:00:00:00:00`.
 | `b'W'` | server → relay | Prewarm (downlink): a hail is being captured for this badge — bring SCO up now and hold it (≤`PREWARM_MAX_S` 25 s, `audio_lock` held) so the coming `b'v'` plays instantly. Best-effort: expiry/failure falls back to the cold path |
 | `b'O'` | server → relay | Channel open — this tap socket is now the live intercom: uplink stays raw mic PCM; downlink switches to framed audio |
 | `b'A'`+len+PCM | server → relay | Channel audio frame (2-byte BE len) — peer's amplified mic audio; relay pipes payload into its stdin player |
-| `b'X'` | server → relay | Channel closed by the other side — play close chirp, teardown |
+| `b'X'` | server → relay | Channel closed by the other side — speak "Channel closed." (`channelclosed.wav`), teardown |
+| `b'H'` | server → relay | *(Phase 9)* Hail pending (downlink), sent just before the hail itself: the next tap answers it, so skip the `listening.wav` chirp. Payload-free |
+| `b'E'` | server → relay | *(Phase 9)* Hail ended (downlink): the answer window closed unanswered (or delivery failed); taps are commands again. Payload-free |
 
 Close-with-drain discipline (already in place): server drains inbound PCM to
 EOF before closing (avoids TCP RST truncating in-flight `b'v'` payloads);
@@ -549,6 +551,35 @@ floor block afterwards can only add a mute for that chunk, never lift one.
 **Correcting Phase 7:** `SDK_CHANNEL_HALF_DUPLEX_MS` at 0 is **not** "a small
 step". The mute is what keeps the badge's own ring out of the gate in the
 moments after its speaker stops. Keep it at 150.
+
+### Phase 9 — The channel says so ✓ (2026-09-11)
+
+Found in the first SDK on-badge test of Phase 8 (PAN + BOX, server on CUBE),
+by the Captain. The SDK's cues are *spoken* clips, where TOS plays tones, so
+two of them said the wrong thing:
+
+- **The answering tap said "listening."** The listener plays `listening.wav`
+  at step 4 of every tap, before it has connected and so before it can know
+  the tap answers a hail. Now the server sends **`b'H'`** down the target's
+  downlink just *before* pushing the hail. The downlink handles bytes in
+  order, so the listener knows the next tap answers by the time the hail has
+  finished playing, and that tap skips the chirp. **`b'E'`** clears it when
+  the window closes unanswered or delivery fails; so do any tap and any
+  downlink reconnect, with a 45 s backstop in case `b'E'` never arrives.
+- **Opening now says "Channel open."** — on both badges, since both receive
+  `b'O'`, which also tells the caller that the hail was answered. It plays in
+  a thread, so the pump starts at once and peer audio never queues behind the
+  clip. The uplink is sent as **silence** while it plays and for 0.35 s after
+  (`ANNOUNCE_TAIL_S`). That covers the badge unmuting into its own ring of the
+  clip, which is the Phase 8 bounce trigger. Without it, the announcement
+  itself could open the gate.
+- **Closing said "command executed."** It now says **"Channel closed."**
+  (`channelclosed.wav`), on both badges.
+
+Both clips were generated with `tts.sh`, the same engine as every other
+spoken asset. Both new bytes are payload-free, so an older listener logs them
+as unknown and keeps its old cues, and an older server simply never sends
+them.
 
 ## Resume Point (2026-07-17)
 
