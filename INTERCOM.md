@@ -469,6 +469,10 @@ termination; it is not built yet, and more suppression is not the answer.
 Measured operating envelope after this change, on TOS hardware: **usable down to
 5 ft**, with the nearer badge winning, and static near zero.
 
+⚠ **Superseded by Phase 8:** with muted audio no longer able to open the gate,
+the same badges were measured usable *within 3 ft*, and self-calming when
+nearly touching.
+
 #### Current channel defaults — the authoritative list
 
 ⚠ **Read these, not the numbers quoted in Phases 4 and 6.** Those are accurate
@@ -483,8 +487,8 @@ magnitude entirely.
 | `SDK_CHANNEL_GATE_CLOSE` | 40% of `GATE` (= 20) | derived; clamped if >= `GATE`, warns below 8 |
 | `SDK_CHANNEL_GATE_HOLD` | **0.5** | finding — floor is 0.4 |
 | `SDK_CHANNEL_GATE_FADE_MS` | 10 | structural |
-| `SDK_CHANNEL_HALF_DUPLEX_MS` | **150** | finding — 0 is now a small step |
-| `SDK_CHANNEL_FLOOR_RELEASE_MS` | 0 (disabled) | adjacent-badge use only |
+| `SDK_CHANNEL_HALF_DUPLEX_MS` | **150** | finding — **do not go to 0** (Phase 8) |
+| `SDK_CHANNEL_FLOOR_RELEASE_MS` | **400** | finding — the tested configuration in both placements (Phase 8); 0 disables floor control |
 | `SDK_CHANNEL_FLOOR_MAX_S` | 12 | cap on a pinned floor |
 
 The **kind** column is what matters when you tune. A *finding* is about the
@@ -496,6 +500,55 @@ starting point and not a universal default.
 **As a whole this set is a tested configuration**, not an assembly of
 independently-chosen numbers: two badges held a clean channel on it down to
 about 5 ft. Change one at a time and watch the gate log.
+
+### Phase 8 — Same-room use, no more static loops: muted audio no longer opens the gate ✓ (2026-09-11; verified in TOS and on-badge in the SDK)
+
+**The flaw.** `_pump_audio` decided the gate on every chunk and only *then*
+masked it with the half-duplex and floor mutes. So audio that was never going
+to be sent could still **open** the gate. The gate then held for
+`CHANNEL_GATE_HOLD` after the mute ended, and sent that hold: room noise times
+`CHANNEL_GAIN`. The far badge played the noise. About 0.45 s later it unmuted
+into its own room ring, and its gate did the same thing back. The result was a
+self-sustaining exchange of held-open gates, one round every ~1.3 s: *"static
+every second or two, looping."*
+
+Why the far badge hears itself at all: its echo control is a **switch, not a
+canceller**. It mutes its own mic while its speaker carries any sound, and lets
+go 10–25 ms after the speaker stops, while the room is still ringing with that
+sound for up to ~250 ms. That was measured in TOS with a second microphone as
+witness, on both relay platforms.
+
+**Found and verified in TOS**, with a per-chunk trace of the maincomputer's
+channel pump:
+
+| | spoken | bounces | longest chain |
+|---|---|---|---|
+| before, noisy room | 7 | 55 | 16 |
+| before, quiet room | 17 | 11 | 4 |
+| **after** | 20 | **0** | 0 |
+
+After the fix, nine gate openings were blocked, each of them what used to
+start a chain, and no static was heard. Then, in one room: the nearer badge
+transmits within **3 ft**, and when the badges are nearly touching, a slight
+echo dies away on its own. TOS has shelved its planned proximity
+auto-termination on the strength of it.
+
+**The fix.** A chunk that the half-duplex or floor mute will discard now
+reaches the gate as silence (`last_avg = 0`), so it can neither open the gate
+nor hold it open. `muted_input` is computed ahead of the gate decision; the
+floor block afterwards can only add a mute for that chunk, never lift one.
+
+**SDK differences to know:**
+- The SDK decides the gate per chunk rather than over a fixed window (Phase
+  7's known gap), so the zeroing applies per chunk.
+- **Floor control now ships ON, at 400 ms** (`SDK_CHANNEL_FLOOR_RELEASE_MS`;
+  it was 0, disabled). That is the value every same-room result above was
+  measured with, and the SDK's on-badge test passed on it. Set it to 0 to
+  disable floor control; the fix still covers every half-duplex mute.
+
+**Correcting Phase 7:** `SDK_CHANNEL_HALF_DUPLEX_MS` at 0 is **not** "a small
+step". The mute is what keeps the badge's own ring out of the gate in the
+moments after its speaker stops. Keep it at 150.
 
 ## Resume Point (2026-07-17)
 

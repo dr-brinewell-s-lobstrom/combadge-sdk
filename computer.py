@@ -1780,7 +1780,13 @@ CHANNEL_HALF_DUPLEX_MS = float(os.environ.get("SDK_CHANNEL_HALF_DUPLEX_MS", "150
                                   # reference for the other's output.  Below
                                   # ~5 ft that runs away, and the answer is
                                   # proximity detection, not more suppression.
-CHANNEL_FLOOR_RELEASE_MS = float(os.environ.get("SDK_CHANNEL_FLOOR_RELEASE_MS", "0"))
+                                  #
+                                  # Superseded in practice by Phase 8: with
+                                  # muted audio no longer able to open the
+                                  # gate, the badges work within 3 ft and a
+                                  # nearly-touching echo dies out on its own.
+                                  # Proximity detection is shelved.
+CHANNEL_FLOOR_RELEASE_MS = float(os.environ.get("SDK_CHANNEL_FLOOR_RELEASE_MS", "400"))
                                   # FLOOR CONTROL (adjacent-badge / same-room
                                   # use, e.g. filming both ends): one talker at
                                   # a time — the first gate to open holds the
@@ -1805,9 +1811,9 @@ CHANNEL_FLOOR_RELEASE_MS = float(os.environ.get("SDK_CHANNEL_FLOOR_RELEASE_MS", 
                                   #
                                   # THERE IS NO CORRECT SINGLE VALUE — it
                                   # depends on badge placement:
-                                  #   different rooms  -> 0     (this default)
+                                  #   different rooms  -> 0     (the default until 2026-09-11)
                                   #   same room / desk -> 1000
-                                  # 0 is the default because the intercom
+                                  # 0 was the default because the intercom
                                   # exists to reach a badge somewhere else,
                                   # and because the two failure modes are not
                                   # equally diagnosable: setting it wrong for
@@ -1816,6 +1822,15 @@ CHANNEL_FLOOR_RELEASE_MS = float(os.environ.get("SDK_CHANNEL_FLOOR_RELEASE_MS", 
                                   # wrong for separate rooms gives silence
                                   # that gets blamed on the hardware.  Ship
                                   # the failure a user can hear.
+                                  #
+                                  # ⚠ DEFAULT CHANGED 0 -> 400 on 2026-09-11,
+                                  # and the dilemma above is resolved.  400
+                                  # measured good in BOTH placements --
+                                  # different rooms and same room (TOS, two
+                                  # badges, with the Phase 8 gate fix) -- and
+                                  # then on-badge in the SDK.  1000 is what
+                                  # starved replies; 400 does not.  0 still
+                                  # disables floor control.
 CHANNEL_FLOOR_MAX_S = float(os.environ.get("SDK_CHANNEL_FLOOR_MAX_S", "12"))
                                   # cap on continuous floor hold — adjacent-
                                   # badge echo can pin the holder's gate open
@@ -1877,6 +1892,10 @@ def _pump_audio(src, dst, dst_lock, stop, entry, my_side, peer_side):
     the round-trip so the echo dies instead of grabbing a gate.  Inert
     when badges are in separate rooms.
 
+    MUTED INPUT IS SILENCE TO THE GATE (INTERCOM.md Phase 8).  A chunk the
+    half-duplex or floor mute will discard reaches the gate as zeros, so it
+    can neither open the gate nor hold it open.
+
     `entry["speaker_last_audio"]` and `entry["floor"]` are shared state
     both pumps read/write; `my_side`/`peer_side` are the keys naming this
     thread's local badge and its peer respectively ("caller"/"answer").
@@ -1924,9 +1943,26 @@ def _pump_audio(src, dst, dst_lock, stop, entry, my_side, peer_side):
             continue
         s = array.array("h")
         s.frombytes(data)
-        last_avg = sum(abs(x) for x in s) / len(s)
         now = time.time()
         chunks += 1
+
+        # --- a MUTED chunk must not open or hold the gate (Phase 8) ---
+        # The gate used to be decided on every chunk and only THEN masked by
+        # the half-duplex and floor mutes, so audio that was never going to
+        # be sent could still OPEN the gate.  The gate then held for
+        # CHANNEL_GATE_HOLD after the mute ended and sent that hold: room
+        # noise times CHANNEL_GAIN.  The far badge played it, unmuted into
+        # its own room ring, and did the same back -- a loop of held-open
+        # gates, "static every second or two".  Found with a per-chunk trace
+        # in TOS (2026-09-10): 55 bounces before the fix, 0 after.  Muted
+        # input now reaches the gate as silence.  Computed ahead of the floor
+        # block below, which can only ever add a mute, never lift one.
+        muted_input = ((hd_hold_s > 0
+                        and now - speaker_last[my_side] < hd_hold_s)
+                       or (floor_guard_s > 0
+                           and (now < floor["guard_until"]
+                                or floor["holder"] == peer_side)))
+        last_avg = 0.0 if muted_input else sum(abs(x) for x in s) / len(s)
 
         # --- gate state transition decision ---
         transition = None                # "open" | "close" | None
