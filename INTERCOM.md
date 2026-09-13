@@ -623,6 +623,11 @@ gives up at 1.51 s), and `_btmon_taps` against a real pipe (the `AT+CHUP`
 hexdump line with ANSI codes, `AT+BVRA=1` split across two reads, unrelated
 HCI traffic, EOF). ⚠ **Not yet run on the badge in the SDK.**
 
+**Single-tap channel close, verified in TOS on the badge (2026-09-12),**
+across every relay pairing: hailed mobile → Windows, closed from mobile;
+hailed Windows → mobile, closed from Windows; hailed Windows → Linux, closed
+from Linux. The Linux close is the `AT+CHUP` path this phase ports.
+
 ## Resume Point (2026-07-17)
 
 **ALL PHASES (1–6) COMPLETE AND ON-BADGE VALIDATED.** The SDK
