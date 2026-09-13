@@ -26,6 +26,21 @@
 #   ./tts.sh "Channel open."                 assets/channelopen.wav
 #   ./tts.sh "Channel closed."               assets/channelclosed.wav
 #   ./tts.sh "Cancelled."                    assets/cancelled.wav
+#   ./tts.sh "Ready."                        assets/ready.wav
+#   ./tts.sh "Listening."                    assets/listening.wav
+#
+# ⚠ EVERY ASSET IN THIS LIST IS SPEECH, listening.wav included -- it says the
+# word "Listening", it is not a tone. TOS ships a file of the same name that
+# IS a tone, and on 2026-09-13 that difference was ported across by filename:
+# the SDK's end-of-cycle cue replayed listening.wav and told the Captain the
+# badge was listening when it was not. listening.wav was the one asset missing
+# from this list, which is how its meaning went unrecorded. Keep the list
+# complete.
+#
+# ⚠ AND listening.wav AS SHIPPED IS TAIL-TRIMMED: 1189 ms -> 671 ms on
+# 2026-09-06, to cut dead air before capture begins. Regenerating it here
+# gives the untrimmed file back. The HEAD is what PRIME_MS_LISTENING = 160 is
+# sized against, so trim only the tail if you re-cut it.
 
 set -euo pipefail
 

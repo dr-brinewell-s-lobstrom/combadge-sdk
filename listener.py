@@ -103,6 +103,18 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSET_DIR  = os.path.join(SCRIPT_DIR, "assets")
 
 LISTENING_WAV           = os.path.join(ASSET_DIR, "listening.wav")
+# "Ready." -- the end-of-cycle cue on a HELD link, where nothing is torn down
+# and so the badge's own chirp does not sound until the linger expires.
+#
+# ⚠ IT MUST NOT BE listening.wav, and that is not a style preference. THIS
+# ASSET IS SPEECH: the clip says the word "Listening", where TOS's file of the
+# same name is a 309 ms tone (measured 2026-09-13: 1050 vs 10275 zero
+# crossings per second, energy at 150 Hz vs 4 kHz). Playing it here told the
+# Captain the badge was listening when it was merely reusable, he spoke, and
+# nothing answered -- the same fault Phase 9 fixed for the answering tap and
+# the closing channel, reintroduced by copying TOS's ready_chirp = listening
+# .wav across a filename that means something different on this side.
+READY_WAV               = os.path.join(ASSET_DIR, "ready.wav")
 ACK_WAV                 = os.path.join(ASSET_DIR, "commandexecuted.wav")
 # Spoken channel cues (INTERCOM.md Phase 9), generated with tts.sh like the
 # rest.  "Listening" and "Command executed" are wrong at those two moments:
@@ -1768,10 +1780,11 @@ def _stream_and_handle_response(reuse=None):
     #
     # Held (Phase 11): nothing is torn down, so the badge's own chirp -- the
     # usual "tap when you like" cue on Linux -- does not sound until the
-    # linger expires.  The listening chirp replays here as that cue, the same
-    # sound the hardware chirp makes; no prime, the link is hot.
+    # linger expires.  "Ready." takes its place; no prime, the link is hot.
+    # NOT listening.wav, which on this side is the spoken word and would
+    # promise a recording that is not running -- see READY_WAV.
     if holding:
-        play_wav(LISTENING_WAV, prime=False)
+        play_wav(READY_WAV, prime=False)
     else:
         force_sco_teardown()
     # The instant another tap can be acted on.  "waiting for tap..." is the

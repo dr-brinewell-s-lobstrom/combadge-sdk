@@ -641,9 +641,11 @@ running capture — and watches that capture.
 - **The capture is the link.** At the end of a cycle, `_sco_hold.begin()`
   takes the still-running ffmpeg *before* the confirmation plays (its pipe
   must be drained or ffmpeg blocks and drops the link) and lingers
-  `SCO_HOLD_MS` (5000). The cycle ends by replaying `listening.wav` as the
-  "tap when you like" cue, because the badge's own teardown chirp — the
-  usual cue on Linux — now sounds at the end of the *linger*. On expiry,
+  `SCO_HOLD_MS` (5000). The cycle ends with a spoken **"Ready."**
+  (`ready.wav`) as the "tap when you like" cue, because the badge's own
+  teardown chirp — the usual cue on Linux — now sounds at the end of the
+  *linger*. (It replayed `listening.wav` until the badge test; see the end of
+  Phase 12 for why that was wrong here and right in TOS.) On expiry,
   `drop()` reaps and tears down as before. If the capture ends on its own,
   the hold is gone, the profile is switched off to resync, and the next tap
   arrives on evdev and takes the full path.
@@ -713,6 +715,30 @@ the cycle ends. Acceptable, and stated so nobody reads it as an oversight.
 Off-badge harness 7/7 (both clocks, the hold writing the teardown clock at
 expiry and at capture death, claim still handing back capture + btmon).
 ⚠ **Not yet run on a badge.**
+
+### ⚠ Found on the badge, and fixed: the ready cue said "Listening."
+
+The first SDK badge test of Phase 11 failed, and on the one thing this
+project has been caught by before. The Captain: *"tap > 'computer time' > I
+hear the time > I then hear 'listening' (unexpected) > skeptical, I say:
+'computer time' — no response, as I thought, it wasn't really listening."*
+
+Phase 11 copied TOS's ready cue, which is `ready_chirp = listening.wav`. In
+TOS that file is a **309 ms tone**, quieter than the badge's hardware chirp
+and distinguishable from it by ear (Captain). Here the file of the same name
+is the **spoken word "Listening."** — measured 2026-09-13: 1050 zero
+crossings per second with 71% of its energy at 150 Hz, against TOS's
+10275/s and 40% at 4 kHz. So the cue announced a recording that was not
+running, the Captain reasonably spoke, and nothing was listening.
+
+This is exactly the fault **Phase 9** fixed for the answering tap and the
+closing channel — *the SDK's cues are spoken, so they must say the true
+thing* — reintroduced by porting a TOS filename rather than a TOS meaning.
+
+Fixed with a new `ready.wav`, spoken **"Ready."** (`tts.sh`, 974 ms, same
+voice as every other clip). ⚠ **The rule this leaves behind: a TOS asset
+name is not an SDK asset meaning.** Before reusing either side's cue, check
+what the file actually says.
 
 ## Resume Point (2026-07-17)
 
