@@ -39,6 +39,7 @@ Stripped down from relay-linux/relay.py: no per-scenario priming.  Single-tap
 loop plus the persistent downlink (sdk/INTERCOM.md Phase 2); while SCO is up,
 btmon watches for the tap that ends a recording or closes a channel (Phase 10).
 """
+import atexit
 import os
 import pty
 import re
@@ -238,6 +239,26 @@ RECORD_MAX_S = 13
 # back to "waiting for tap".  Matches TOS.conf [relay] tap_finalize_wait_s.
 TAP_FINALIZE_WAIT_S = 1.5
 
+# Milliseconds to keep the SCO link up after a tap cycle ends, instead of
+# tearing it down at once (sdk/INTERCOM.md Phase 11, ported from TOS
+# relay-linux 2026-09-13, where it is TOS.conf [relay] sco_hold_ms).
+#
+# Tap -> listening chirp is ~1.2 s on Linux, and most of it is the audio path
+# being rebuilt after the previous cycle's teardown.  This keeps the cycle's
+# capture (which IS the link) running for this long; a tap inside the window
+# arrives on btmon as AT+CHUP -- there is no key event while the link is up --
+# and reuses the live capture, skipping the rebuild.  Expiry tears down as
+# before, so the badge's own chirp sounds at the END of the linger; the
+# listening chirp replays at the end of the cycle as the "tap when you like"
+# cue instead.  If the capture ends on its own the hold is gone and the next
+# tap takes the full path.  Battery: the link is up for the whole linger.
+# 0 = the pre-Phase-11 behaviour.  No btmon (no HCI privileges) = no hold,
+# because a held link would then be deaf.
+SCO_HOLD_MS = 5000
+# An AT+CHUP inside this many seconds of the hold beginning is a bounce of
+# the tap that ended the cycle, not a new tap.
+HOLD_TAP_GUARD_S = 0.5
+
 # Game Mode, mirrored from the server over the downlink (b'M' on, b'N' off).
 # M/N rather than G/N because the full TOS relay protocol already spends b'G' on
 # the authorized-greeting marker, and the two dialects are kept in parity.
@@ -433,7 +454,7 @@ def play_wav_cold(path, volume=0.5):
         print(f"[listener] missing asset: {os.path.basename(path)}", file=sys.stderr)
         return
 
-    ffmpeg = start_sco_capture()
+    ffmpeg = start_sco_capture()   # drops any lingering hold first
     if not ffmpeg:
         print(f"[listener] SCO link failed — skipping {os.path.basename(path)}",
               file=sys.stderr)
@@ -457,6 +478,10 @@ def start_sco_capture(timeout_s=10):
     running ffmpeg Popen (caller must terminate_ffmpeg() it) or None on
     timeout/failure.  Shared by play_wav_cold() and the downlink prewarm.
     """
+    # Never two captures on one SCO link: a lingering hold yields to any real
+    # capture.  The profile stays on, so the new one only pays the SCO
+    # renegotiation.
+    _sco_hold.drop("new capture requested", teardown=False)
     ffmpeg = subprocess.Popen(
         ["ffmpeg", "-f", "pulse", "-i", SOURCE,
          "-ar", "16000", "-ac", "1", "-f", "wav",
@@ -489,6 +514,175 @@ def terminate_ffmpeg(proc):
 
 
 # ---------------------------------------------------------------------------
+# SCO hold (Phase 11) -- the cycle's capture, kept alive between cycles
+# ---------------------------------------------------------------------------
+
+# Wall time of the last accepted tap, from EITHER detector: evdev while the
+# link is down, btmon while it is held.  The main loop's debounce reads it,
+# and the hold bumps it whenever it tears the link down, so the spurious key
+# events a teardown can emit are swallowed as they are after a normal cycle.
+_tap_clock = {"last": 0.0}
+
+
+class _ScoHold:
+    """The capture from the last cycle, lingering so the next tap can reuse
+    the live SCO link.  A verbatim port of TOS relay-linux/relay.py's
+    _ScoHold (2026-09-13), with one SDK difference: the cycle's btmon comes
+    along, because the listener is single-threaded and main() selects on the
+    hold's btmon fd beside the evdev fd while idle.
+
+    ON LINUX THE CAPTURE IS THE LINK.  Between cycles it is drained and
+    discarded -- an unread pipe fills and blocks ffmpeg, and a blocked ffmpeg
+    stops servicing the device.  claim() hands it to the next cycle, which
+    streams from it as if it had just opened it (the server discards the
+    header either way).  If it ends on its own, the hold is gone, the profile
+    is switched off to resync, and the next tap arrives on evdev and takes
+    the full path.
+    """
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.proc = None
+        self.header = b""
+        self.btmon = (None, None)
+        self.btmon_buf = ""
+        self.idle = threading.Event()   # set = lingering and claimable
+        self.began = 0.0
+        self.up_at = None
+        self.timer = None
+        self._stop = None
+        self._drain = None
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def watch_fd(self):
+        """The btmon fd main() should select on, or None."""
+        with self.lock:
+            return self.btmon[1] if self.idle.is_set() else None
+
+    def poll_taps(self):
+        """Drain the held btmon: (tapped, alive)."""
+        with self.lock:
+            fd = self.btmon[1]
+            if fd is None:
+                return False, False
+            tapped, self.btmon_buf, alive = _btmon_taps(fd, self.btmon_buf)
+            return tapped, alive
+
+    def _cancel_timer(self):
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+
+    def _stop_drain(self):
+        if self._stop is not None:
+            self._stop.set()
+        if self._drain is not None and self._drain is not threading.current_thread():
+            self._drain.join(timeout=1)
+        self._stop = None
+        self._drain = None
+
+    def _pump(self, proc, stop):
+        while not stop.is_set():
+            try:
+                if not proc.stdout.read(4096):
+                    break
+            except Exception:
+                break
+        if not stop.is_set():
+            self._died(proc)
+
+    def _died(self, proc):
+        with self.lock:
+            if self.proc is not proc:
+                return
+            self.idle.clear()
+            self._cancel_timer()
+            self.proc = None
+            self._stop = None
+            self._drain = None
+            held = (time.monotonic() - self.up_at) * 1000 if self.up_at else 0
+            self.up_at = None
+            _stop_btmon(*self.btmon)
+            self.btmon = (None, None)
+            print(f"[listener] SCO hold: capture ended on its own after {held:.0f}ms "
+                  f"(badge dropped the link?) -- resyncing with a teardown")
+            _tap_clock["last"] = time.time()
+            force_sco_teardown()
+
+    def begin(self, proc, header, btmon, btmon_buf):
+        """Take the cycle's live capture and btmon; linger SCO_HOLD_MS."""
+        with self.lock:
+            self._cancel_timer()
+            self._stop_drain()
+            if self.proc is not None and self.proc is not proc:
+                terminate_ffmpeg(self.proc)
+            self.proc, self.header = proc, header
+            self.btmon, self.btmon_buf = btmon, btmon_buf
+            self.began = time.time()
+            self.up_at = time.monotonic()
+            self._stop = threading.Event()
+            self._drain = threading.Thread(target=self._pump, args=(proc, self._stop),
+                                           daemon=True)
+            self._drain.start()
+            self.timer = threading.Timer(SCO_HOLD_MS / 1000.0, self._expire)
+            self.timer.daemon = True
+            self.timer.start()
+            self.idle.set()
+            print(f"[listener] SCO hold: lingering {SCO_HOLD_MS}ms; a tap now reuses the link")
+
+    def claim(self):
+        """Hand everything to a new cycle: (proc, header, btmon, btmon_buf),
+        or None if there is nothing live to hand over."""
+        with self.lock:
+            if not self.idle.is_set() or not self.alive():
+                self.idle.clear()
+                return None
+            self.idle.clear()
+            self._cancel_timer()
+            self._stop_drain()
+            proc, self.proc = self.proc, None
+            btmon, self.btmon = self.btmon, (None, None)
+            held = (time.monotonic() - self.up_at) * 1000 if self.up_at else 0
+            self.up_at = None
+            print(f"[listener] SCO hold: reused after {held:.0f}ms -- no bring-up cost")
+            return proc, self.header, btmon, self.btmon_buf
+
+    def _expire(self):
+        with self.lock:
+            self.timer = None
+            if self.idle.is_set() and self.proc is not None:
+                print("[listener] SCO hold: linger expired; tearing down")
+                self.drop("linger expired")
+
+    def drop(self, reason="", teardown=True):
+        """End the hold now.  With teardown the profile goes off too (the
+        badge chirps); without, it stays on for a capture about to open.
+        Silent no-op when nothing is held."""
+        with self.lock:
+            self.idle.clear()
+            self._cancel_timer()
+            if self.proc is None:
+                return
+            self._stop_drain()
+            terminate_ffmpeg(self.proc)
+            self.proc = None
+            _stop_btmon(*self.btmon)
+            self.btmon = (None, None)
+            held = (time.monotonic() - self.up_at) * 1000 if self.up_at else 0
+            self.up_at = None
+            print(f"[listener] SCO hold: released after {held:.0f}ms ({reason})")
+            if teardown:
+                _tap_clock["last"] = time.time()
+                force_sco_teardown()
+
+
+_sco_hold = _ScoHold()
+atexit.register(_sco_hold.drop, "shutdown")
+
+
+# ---------------------------------------------------------------------------
 # HFP profile management (SCO link lifecycle)
 # ---------------------------------------------------------------------------
 
@@ -506,7 +700,11 @@ def force_sco_teardown():
       holding the badge microphone open.  On the next tap, ensure_hfp_profile()
       re-establishes it cleanly.  This explicit teardown + re-establishment
       cycle gives a predictable, consistent starting state for every tap.
+
+    Phase 11: a held capture must not outlive the profile it runs on, so any
+    hold is reaped first.
     """
+    _sco_hold.drop("teardown", teardown=False)
     subprocess.run(["pactl", "set-card-profile", CARD, "off"],
                    capture_output=True, timeout=5)
 
@@ -1257,18 +1455,21 @@ def _finish_tapped_recording(sock, ffmpeg):
         return sig
 
 
-def stream_and_handle_response():
+def stream_and_handle_response(reuse=None):
     """Serialized entry point for the tap cycle.
 
     Holds audio_lock for the whole cycle so a pushed hail (downlink thread)
     can never play over the top of an active recording or response — it
     waits its turn, and vice versa.
+
+    `reuse` is what _sco_hold.claim() returned: the previous cycle's capture
+    and btmon, still running, whose SCO link is therefore already up.
     """
     with audio_lock:
-        _stream_and_handle_response()
+        _stream_and_handle_response(reuse)
 
 
-def _stream_and_handle_response():
+def _stream_and_handle_response(reuse=None):
     """Full single-tap cycle: SCO setup → chirp → stream → response → teardown.
 
     Ordered sequence:
@@ -1279,38 +1480,49 @@ def _stream_and_handle_response():
       5. TCP connect to server       send tap byte + WAV header, then PCM
       6. select() loop               forward audio; watch for response signal
       7. Handle signal byte          play ack/nack/voice response
-      8. force_sco_teardown()        clean up immediately after last audio
+      8. force_sco_teardown()        clean up immediately after last audio --
+                                     or, with SCO_HOLD_MS, hand the capture to
+                                     _sco_hold and replay the listening chirp
+                                     as the ready cue (Phase 11)
+
+    A cycle started from a held link (`reuse`) skips steps 1-3: the capture
+    is already running and its link already up.
     """
+    reused = reuse is not None
+    if reused:
+        ffmpeg, wav_header, (btmon_pid, btmon_fd), btmon_buf = reuse
+        print("[listener] reusing the held capture; SCO already live")
+    else:
+        # --- Step 1: re-establish HFP profile ---
+        # Fast no-op on first tap (profile already active from transceiver.py).
+        # On subsequent taps, restores the profile that force_sco_teardown() disabled.
+        ensure_hfp_profile()
 
-    # --- Step 1: re-establish HFP profile ---
-    # Fast no-op on first tap (profile already active from transceiver.py).
-    # On subsequent taps, restores the profile that force_sco_teardown() disabled.
-    ensure_hfp_profile()
+        # --- Step 2: start ffmpeg BEFORE playing the chirp ---
+        # Opening bluez_input (the badge microphone) triggers SCO negotiation from
+        # the capture side, which is more reliable than the output-side path.
+        # If we played the chirp first, it would likely route to laptop speakers
+        # because the SCO output path hasn't finished negotiating yet.
+        _sco_hold.drop("evdev tap", teardown=False)   # an evdev tap means the link was down
+        ffmpeg = subprocess.Popen(
+            ["ffmpeg", "-f", "pulse", "-i", SOURCE,
+             "-ar", "16000", "-ac", "1", "-f", "wav",
+             "-loglevel", "quiet", "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
 
-    # --- Step 2: start ffmpeg BEFORE playing the chirp ---
-    # Opening bluez_input (the badge microphone) triggers SCO negotiation from
-    # the capture side, which is more reliable than the output-side path.
-    # If we played the chirp first, it would likely route to laptop speakers
-    # because the SCO output path hasn't finished negotiating yet.
-    ffmpeg = subprocess.Popen(
-        ["ffmpeg", "-f", "pulse", "-i", SOURCE,
-         "-ar", "16000", "-ac", "1", "-f", "wav",
-         "-loglevel", "quiet", "pipe:1"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-
-    # --- Step 3: wait for the 44-byte WAV header ---
-    # ffmpeg writes this header the moment it successfully opens bluez_input.
-    # Its arrival means the SCO input path is live and pw-play will route to
-    # the badge.  If ffmpeg exits early (badge disconnected), read() returns b""
-    # and we fall through with an empty wav_header; the pipeline still runs
-    # but the chirp may not route to the badge.
-    wav_header = b""
-    while len(wav_header) < 44:
-        chunk = ffmpeg.stdout.read(44 - len(wav_header))
-        if not chunk:
-            break
-        wav_header += chunk
+        # --- Step 3: wait for the 44-byte WAV header ---
+        # ffmpeg writes this header the moment it successfully opens bluez_input.
+        # Its arrival means the SCO input path is live and pw-play will route to
+        # the badge.  If ffmpeg exits early (badge disconnected), read() returns b""
+        # and we fall through with an empty wav_header; the pipeline still runs
+        # but the chirp may not route to the badge.
+        wav_header = b""
+        while len(wav_header) < 44:
+            chunk = ffmpeg.stdout.read(44 - len(wav_header))
+            if not chunk:
+                break
+            wav_header += chunk
 
     # --- Step 4: play the listening chirp ---
     # SCO is confirmed live on the INPUT side; the output side may still be
@@ -1361,14 +1573,18 @@ def _stream_and_handle_response():
         # way to produce corrupted-packet floods. The finally block below
         # already reaps properly; this early exit did not.
         terminate_ffmpeg(ffmpeg)
+        if reused:
+            _stop_btmon(btmon_pid, btmon_fd)   # the hold's btmon came with the capture
         return
 
     # --- Step 5b: watch for the tap that ends the recording (Phase 10) ---
     # Started only now, after the chirp, so the tap that began this cycle --
     # or a bounce of it -- cannot end it.  Not in Game Mode, where the cycle
-    # is a click and over in well under a second.
-    btmon_pid, btmon_fd = (None, None) if game_mode.is_set() else _start_btmon()
-    btmon_buf = ""
+    # is a click and over in well under a second.  A reused cycle already has
+    # the hold's btmon.
+    if not reused:
+        btmon_pid, btmon_fd = (None, None) if game_mode.is_set() else _start_btmon()
+        btmon_buf = ""
     tap_ended = False
 
     # --- Step 6: select() loop — stream audio and watch for server response ---
@@ -1457,18 +1673,29 @@ def _stream_and_handle_response():
                     break
 
     finally:
-        # Always clean up both resources, even if an exception occurred above.
-        # ffmpeg.terminate() sends SIGTERM; escalate to SIGKILL if it doesn't
-        # exit within 0.5 s (rare but possible if the capture device is stuck).
-        if ffmpeg.poll() is None:
-            ffmpeg.terminate()
-            try:
-                ffmpeg.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                ffmpeg.kill()
-                ffmpeg.wait()
+        # HOLD OR REAP, decided once, here, before the confirmation plays.
+        #
+        # Hold: the capture and btmon go to _sco_hold NOW, so the pipe is
+        # drained while the chirps below play (an unread pipe fills in ~2 s
+        # and a blocked ffmpeg drops the link); step 8 then plays the ready
+        # cue instead of tearing down.  Only with a verdict (a server that
+        # never answered gets the teardown, as before), only outside Game
+        # Mode (its cue IS the teardown chirp), and only with a live btmon --
+        # a held link emits no key events, so without btmon the badge would
+        # be deaf for the whole linger.  A tap-ended cycle never holds: that
+        # path reaped the capture before waiting for its verdict.
+        #
+        # Reap otherwise: ffmpeg.terminate() sends SIGTERM, escalated to
+        # SIGKILL if it doesn't exit within 0.5 s.
+        holding = (SCO_HOLD_MS > 0 and signal_byte is not None
+                   and not game_mode.is_set() and btmon_fd is not None
+                   and ffmpeg.poll() is None)
+        if holding:
+            _sco_hold.begin(ffmpeg, wav_header, (btmon_pid, btmon_fd), btmon_buf)
+        else:
+            terminate_ffmpeg(ffmpeg)
+            _stop_btmon(btmon_pid, btmon_fd)
         sock.close()
-        _stop_btmon(btmon_pid, btmon_fd)
 
     # --- Step 7: play ack/nack, or nothing if voice response was already played ---
     if tap_ended and signal_byte in (None, b"f"):
@@ -1495,11 +1722,19 @@ def _stream_and_handle_response():
     else:
         print(f"[listener] no/unknown signal byte: {signal_byte!r}")
 
-    # --- Step 8: event-driven SCO teardown ---
+    # --- Step 8: event-driven SCO teardown, or the ready cue on a held link ---
     # play_wav() uses subprocess.run(), which blocks until pw-play exits.
     # That exit IS the "last audio frame left the pipeline" event — no timer
     # needed.  Tearing down here is instantaneous and cannot be premature.
-    force_sco_teardown()
+    #
+    # Held (Phase 11): nothing is torn down, so the badge's own chirp -- the
+    # usual "tap when you like" cue on Linux -- does not sound until the
+    # linger expires.  The listening chirp replays here as that cue, the same
+    # sound the hardware chirp makes; no prime, the link is hot.
+    if holding:
+        play_wav(LISTENING_WAV, prime=False)
+    else:
+        force_sco_teardown()
 
 
 # ---------------------------------------------------------------------------
@@ -1528,7 +1763,6 @@ def main():
     print(f"[listener] tap badge once → chirp → speak a command")
 
     last_path = None
-    last_tap  = 0.0
 
     while True:
         # Re-discover the badge input device each iteration.  The /dev/input/
@@ -1556,9 +1790,34 @@ def main():
                 # select() on dev.fd avoids busy-polling and allows a clean
                 # exit path if the badge disconnects (OSError on read).
                 # 0.5 s timeout keeps the outer loop responsive to reconnects.
-                r, _, _ = select.select([dev.fd], [], [], 0.5)
+                #
+                # While the link is HELD (Phase 11) a tap is AT+CHUP on the
+                # hold's btmon and no key event at all, so that fd is watched
+                # here too, on this same thread.
+                hold_fd = _sco_hold.watch_fd()
+                fds = [dev.fd] + ([hold_fd] if hold_fd is not None else [])
+                r, _, _ = select.select(fds, [], [], 0.5)
                 if not r:
                     continue   # no events in 0.5 s — loop back to select
+
+                if hold_fd is not None and hold_fd in r:
+                    tapped, alive = _sco_hold.poll_taps()
+                    if not alive:
+                        # btmon died under the hold: without it a held link
+                        # is deaf, so give the link up and go back to evdev.
+                        _sco_hold.drop("btmon ended")
+                        continue
+                    if not tapped:
+                        continue
+                    if time.time() - _sco_hold.began < HOLD_TAP_GUARD_S:
+                        continue   # a bounce of the tap that ended the cycle
+                    reuse = _sco_hold.claim()
+                    if reuse is None:
+                        continue   # expired or died between the tap and here
+                    _tap_clock["last"] = time.time()
+                    print("[listener] tap (held link)")
+                    stream_and_handle_response(reuse)
+                    break      # close and reopen the device, as after any cycle
 
                 try:
                     events = list(dev.read())
@@ -1572,9 +1831,9 @@ def main():
                     if (ev.type == evdev.ecodes.EV_KEY
                             and ev.code in (200, 201)
                             and ev.value == 1):
-                        if time.time() - last_tap < TAP_DEBOUNCE:
+                        if time.time() - _tap_clock["last"] < TAP_DEBOUNCE:
                             continue   # too soon after last tap — debounce
-                        last_tap = time.time()
+                        _tap_clock["last"] = time.time()
                         print("[listener] tap")
                         stream_and_handle_response()
                         # NOTE: we do NOT reset last_tap back to 0 here.
@@ -1582,7 +1841,7 @@ def main():
                         # cycle (see dev.close() in the finally block below).
                         # Closing and reopening flushes the kernel event queue,
                         # discarding any spurious re-fire events that SCO
-                        # teardown can trigger.  Resetting last_tap here would
+                        # teardown can trigger.  Resetting the clock here would
                         # add a needless 2 s blackout after audio playback ends.
                         break
 

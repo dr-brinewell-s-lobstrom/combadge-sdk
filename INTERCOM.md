@@ -628,6 +628,51 @@ across every relay pairing: hailed mobile → Windows, closed from mobile;
 hailed Windows → mobile, closed from Windows; hailed Windows → Linux, closed
 from Linux. The Linux close is the `AT+CHUP` path this phase ports.
 
+### Phase 11 — The SCO hold: a follow-up tap skips the link rebuild ✓ code (2026-09-13)
+
+Ported from TOS relay-linux the night it was verified on PAN (TOS
+`relay-linux/RELAY.md` → *the SCO hold*). Tap → listening chirp is ~1.2 s on
+Linux and most of it is rebuilding the audio link the previous cycle tore
+down. Simply not tearing down was tested in TOS on 2026-09-05 and failed: the
+badge dropped the link on its own timetable while the relay assumed it was
+up. This holds the link the way the 2026-09-13 btmon test did — with a
+running capture — and watches that capture.
+
+- **The capture is the link.** At the end of a cycle, `_sco_hold.begin()`
+  takes the still-running ffmpeg *before* the confirmation plays (its pipe
+  must be drained or ffmpeg blocks and drops the link) and lingers
+  `SCO_HOLD_MS` (5000). The cycle ends by replaying `listening.wav` as the
+  "tap when you like" cue, because the badge's own teardown chirp — the
+  usual cue on Linux — now sounds at the end of the *linger*. On expiry,
+  `drop()` reaps and tears down as before. If the capture ends on its own,
+  the hold is gone, the profile is switched off to resync, and the next tap
+  arrives on evdev and takes the full path.
+- **Taps arrive differently while held.** With the link up a single tap is
+  `AT+CHUP` on btmon and **no evdev event at all** (measured in TOS,
+  `log/btmon_hold_test_20260913_002925.txt`), so the cycle's btmon comes
+  along into the hold and `main()` selects on `_sco_hold.watch_fd()` beside
+  the evdev fd. A tap there claims the capture and btmon and runs
+  `stream_and_handle_response(reuse)`, which skips steps 1–3.
+- **No btmon, no hold.** On an install without HCI privileges a held link
+  would be deaf for the whole linger, so the hold needs a live btmon at the
+  end of the cycle. Also no hold in Game Mode (its cue *is* the teardown
+  chirp), after a server that never answered, or after a tap-ended cycle
+  (that path reaps the capture before its verdict wait).
+- **Chokepoints:** `start_sco_capture()` and `force_sco_teardown()` both
+  drop any hold first, so `play_wav_cold`, the prewarm and the downlink
+  paths behave exactly as before.
+- **Differs from TOS in two ways.** TOS reads `sco_hold_ms` live from
+  TOS.conf; here it is a constant. And TOS never holds after a spoken answer
+  (its `b'v'` path reaps the capture before playing); the SDK has always
+  played `b'v'` with the capture open, so it holds after those too.
+
+TOS measured on PAN: tap → server accepting the stream ~240–340 ms on a
+held link against ~490 ms cold; the audible gap is larger since the output
+side is warm too. Captain: *"noticeably faster, more like the Windows relay
+already does."* Off-badge harness 10/10 (lifecycle, claim hands back
+capture + btmon, expiry, capture death, drop without teardown, btmon death).
+⚠ **Not yet run on a badge in the SDK.**
+
 ## Resume Point (2026-07-17)
 
 **ALL PHASES (1–6) COMPLETE AND ON-BADGE VALIDATED.** The SDK
