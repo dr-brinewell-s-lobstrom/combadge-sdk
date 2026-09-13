@@ -25,6 +25,7 @@
 #   ./tts.sh "Command failure."              assets/commandfailure.wav
 #   ./tts.sh "Channel open."                 assets/channelopen.wav
 #   ./tts.sh "Channel closed."               assets/channelclosed.wav
+#   ./tts.sh "Cancelled."                    assets/cancelled.wav
 
 set -euo pipefail
 

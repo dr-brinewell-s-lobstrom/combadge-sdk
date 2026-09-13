@@ -57,6 +57,8 @@ On completion, the learnings port to `relay-linux/`, `relay-mobile/`, and
    finalize). Linux: double-tap (btmon `AT+BVRA=1`) or just the socket
    closing. Mobile (later): any tap during SCO is a system hang-up that drops
    SCO — adopted as the close gesture, not fought.
+   **Superseded by Phase 10 (2026-09-12):** one gesture everywhere, a single
+   tap. On Linux it is the same hang-up, seen as `AT+CHUP` on btmon.
 
 ## Protocol (SDK dialect — converging with maincomputer's)
 
@@ -580,6 +582,46 @@ Both clips were generated with `tts.sh`, the same engine as every other
 spoken asset. Both new bytes are payload-free, so an older listener logs them
 as unknown and keeps its old cues, and an older server simply never sends
 them.
+
+### Phase 10 — One tap ends whatever the badge is doing ✓ code (2026-09-12)
+
+Ported from TOS, where it was built and verified on the badge the same day on
+relay-windows, relay-linux and relay-mobile (TOS `controlpanel/TUNING.md` →
+item 1c). **The rule: one tap starts a recording, the next tap ends it — or
+closes a channel.**
+
+- **Why a single tap did nothing on Linux.** While SCO is up the badge button
+  is call control, and a single tap sends a hang-up. Captured on PAN with
+  btmon, one tap mid-recording:
+  `21 ef 11 41 54 2b 43 48 55 50 0d 80  !..AT+CHUP..`. BlueZ has no call to
+  hang up, and the listener watched only for `AT+BVRA=1` (double tap), so the
+  badge chirped and nothing happened. The older note that single taps "emit
+  nothing at all" during SCO was true only of evdev.
+- **The channel** now closes on either `AT+CHUP` or `AT+BVRA=1`
+  (`_btmon_taps`, shared). evdev and ffmpeg-EOF stay as secondary paths.
+- **A command recording** now watches btmon too. The monitor starts after
+  the listening chirp, so the starting tap cannot end its own cycle, and it is
+  handed to `run_channel` if the tap answers a hail. It is skipped in Game
+  Mode. On a tap, `_finish_tapped_recording` stops ffmpeg, half-closes, and
+  waits `TAP_FINALIZE_WAIT_S` (1.5 s) for the verdict. A verdict plays as
+  usual, so a dictation ended by tap is kept and confirmed. `b'f'` or no
+  verdict plays **"Cancelled."** (`cancelled.wav`, new, spoken with `tts.sh`
+  like the other SDK clips; TOS plays a tone here).
+- **Not a recall.** The server finalizes a half-closed stream on the audio it
+  has (`computer.py` treats EOF like end of speech), so a command it has
+  recognised still runs. Deliberate: once spoken, execution is considered
+  inevitable, and a tap exists to abandon a recording.
+- **No protocol change, no server change.** The server already finalized on
+  EOF and sent `b'f'` on no match.
+
+`cancelled.wav`: 1139 ms, 22050 Hz mono, 95 ms of lead-in. It plays through
+`play_wav()` with the default `PRIME_MS` 200, like the ack and nack clips.
+
+Behaviour-tested off-badge, 8/8: `_finish_tapped_recording` against a real
+socketpair (b'f' returned in 0.05 s; keepalive then b'l' in 0.10 s; no verdict
+gives up at 1.51 s), and `_btmon_taps` against a real pipe (the `AT+CHUP`
+hexdump line with ANSI codes, `AT+BVRA=1` split across two reads, unrelated
+HCI traffic, EOF). ⚠ **Not yet run on the badge in the SDK.**
 
 ## Resume Point (2026-07-17)
 

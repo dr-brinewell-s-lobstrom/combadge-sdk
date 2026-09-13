@@ -35,9 +35,9 @@ Required environment (set by transceiver.py — do not run this script directly)
     SDK_SERVER_PORT          — TCP port for computer.py (default 1701)
     XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, HOME, USER  — for pw-play/pactl
 
-Stripped down from relay-linux/relay.py: no double-tap, no btmon, no per-scenario
-priming, no captain's log.  Single-tap loop plus the persistent downlink
-(sdk/INTERCOM.md Phase 2).
+Stripped down from relay-linux/relay.py: no per-scenario priming.  Single-tap
+loop plus the persistent downlink (sdk/INTERCOM.md Phase 2); while SCO is up,
+btmon watches for the tap that ends a recording or closes a channel (Phase 10).
 """
 import os
 import pty
@@ -120,6 +120,8 @@ ANNOUNCE_TAIL_S         = 0.35
 HAIL_PENDING_MAX_S      = 45
 hail_pending            = {"until": 0.0}
 NACK_WAV                = os.path.join(ASSET_DIR, "commandfailure.wav")
+# Spoken "Cancelled." -- a tap ended the recording and nothing came of it.
+CANCELLED_WAV           = os.path.join(ASSET_DIR, "cancelled.wav")
 BADGE_ONLINE_WAV        = os.path.join(ASSET_DIR, "badge-to-comms-relay-online.wav")
 MAINCOMPUTER_ONLINE_WAV = os.path.join(ASSET_DIR, "maincomputeronline.wav")
 # The other edge.  Added 2026-09-06: the server going away was logged and
@@ -228,6 +230,13 @@ PRIME_MS_COLD = 1000
 # equal value made the relay give up just before b'f' arrived — logged as
 # the confusing "no/unknown signal byte: None" with no failure chirp.
 RECORD_MAX_S = 13
+
+# A second tap ends a recording (sdk/INTERCOM.md Phase 10).  Seconds to wait
+# for the server's verdict after that tap: a verdict plays as usual (a
+# tapped-off dictation is still kept and confirmed), while b'f' or nothing
+# plays cancelled.wav.  Short on purpose -- the point of the tap is to get
+# back to "waiting for tap".  Matches TOS.conf [relay] tap_finalize_wait_s.
+TAP_FINALIZE_WAIT_S = 1.5
 
 # Game Mode, mirrored from the server over the downlink (b'M' on, b'N' off).
 # M/N rather than G/N because the full TOS relay protocol already spends b'G' on
@@ -827,10 +836,16 @@ def downlink_loop():
 
 CHANNEL_TAP_GRACE_S = 1.0   # ignore badge taps in the first second of a channel
 
-# Double-tap detection: the badge emits AT+BVRA=1 on the HFP control
-# channel (never an evdev event).  Same btmon-under-pty pattern the full
-# relay uses in production (relay-linux/relay.py monitor_bluetooth_logs).
+# Taps while SCO is up.  Neither gesture is an evdev event then; both arrive
+# on the HFP control channel, so btmon (under a pty) watches for them -- the
+# pattern relay-linux/relay.py uses in production:
+#   single tap  AT+CHUP    the badge button is call control, so a tap is a
+#                          HANG-UP.  Captured on PAN 2026-09-12:
+#                          21 ef 11 41 54 2b 43 48 55 50 0d 80  !..AT+CHUP..
+#   double tap  AT+BVRA=1  voice-recognition activation
+# Either one ends a recording or closes a channel.
 BTMON_TRIGGER = "AT+BVRA=1"
+BTMON_HANGUP  = "AT+CHUP"
 _ANSI_RE      = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -864,7 +879,34 @@ def _stop_btmon(pid, fd):
             pass
 
 
-def run_channel(sock, ffmpeg):
+def _btmon_taps(fd, buf):
+    """Drain btmon's pty and say whether a tap (single or double) arrived.
+
+    Returns (tapped, buf, alive).  DRAINS rather than reading once: during an
+    active SCO link btmon emits a torrent of HCI traffic, and a single 1 KB
+    read per loop pass falls behind until the tap line drowns in backlog
+    (observed: PAN double-tap "did nothing").  Capped per pass.
+    """
+    chunk = ""
+    try:
+        for _ in range(64):                    # <=64 KB per pass
+            chunk += os.read(fd, 1024).decode("utf-8", errors="ignore")
+            r, _, _ = select.select([fd], [], [], 0)
+            if not r:
+                break
+    except OSError:
+        pass
+    if not chunk:
+        return False, buf, False
+    buf += chunk
+    lines = buf.split("\n")
+    buf = lines.pop()
+    tapped = any(BTMON_HANGUP in ln or BTMON_TRIGGER in ln
+                 for ln in (_ANSI_RE.sub("", raw) for raw in lines))
+    return tapped, buf, True
+
+
+def run_channel(sock, ffmpeg, btmon=(None, None)):
     """Live intercom: this tap socket is now a full-duplex audio channel.
 
     Entered when the server sends b'O' (this badge is one end of an
@@ -877,12 +919,15 @@ def run_channel(sock, ffmpeg):
                 stdin); b'X' = channel closed by the other side.  Framing
                 exists so control bytes stay distinguishable inside a raw
                 audio stream.
-      close     single badge tap -> half-close the uplink (SHUT_WR); the
-                server tears the bridge down and b'X's both sides.
-                (Double-tap emits AT+BVRA on the HFP control channel,
-                visible only via btmon/root — out of SDK scope.  Single
-                tap also matches the future mobile relay, where any tap
-                during SCO is a system hang-up.)
+      close     a badge tap -> half-close the uplink (SHUT_WR); the server
+                tears the bridge down and b'X's both sides.  During SCO a
+                single tap arrives as AT+CHUP and a double tap as AT+BVRA=1,
+                both on btmon (Phase 10); evdev and ffmpeg EOF are kept as
+                secondary paths.
+
+    `btmon` is the tap cycle's (pid, fd), handed over so the channel watches
+    the same monitor; the cycle stops it.  If none is given, the channel
+    starts and stops its own.
 
     Returns when the channel ends; the caller's normal teardown runs.
     """
@@ -938,13 +983,15 @@ def run_channel(sock, ffmpeg):
     player   = _spawn_player(player_cmds[0])
     next_cmd = 1
 
-    # Double-tap monitor — the PRIMARY close gesture (Captain-approved:
-    # single taps during SCO emit nothing at all on Linux, validated
-    # on-badge 2026-07-05).
-    btmon_pid, btmon_fd = _start_btmon()
+    # btmon — the PRIMARY close gesture: a single tap (AT+CHUP) or a double
+    # tap (AT+BVRA=1).  Neither surfaces on evdev during SCO.
+    btmon_pid, btmon_fd = btmon
+    own_btmon = btmon_fd is None
+    if own_btmon:
+        btmon_pid, btmon_fd = _start_btmon()
     btmon_buf = ""
     if btmon_fd is None:
-        print("[listener] channel: btmon unavailable — double-tap close disabled")
+        print("[listener] channel: btmon unavailable — tap close disabled")
 
     dev = None
     try:
@@ -1026,42 +1073,25 @@ def run_channel(sock, ffmpeg):
                 fds.append(btmon_fd)
             r, _, _ = select.select(fds, [], [], 0.5)
 
-            # --- close gesture: double tap (btmon AT+BVRA) ---
+            # --- close gesture: a tap, single or double (btmon) ---
             if btmon_fd is not None and btmon_fd in r:
-                # DRAIN the pty, not just one read: during an active SCO
-                # link btmon emits a torrent of HCI traffic, and a single
-                # 1 KB read per loop pass falls behind — the BVRA line
-                # drowns in pty backlog (observed: PAN double-tap "did
-                # nothing").  Read until would-block, capped per pass.
-                chunk = ""
-                try:
-                    for _ in range(64):                    # ≤64 KB per pass
-                        chunk += os.read(btmon_fd, 1024).decode(
-                            "utf-8", errors="ignore")
-                        r2, _, _ = select.select([btmon_fd], [], [], 0)
-                        if not r2:
-                            break
-                except OSError:
-                    if not chunk:
-                        chunk = ""
-                if not chunk:
-                    _stop_btmon(btmon_pid, btmon_fd)
+                tapped, btmon_buf, alive = _btmon_taps(btmon_fd, btmon_buf)
+                if not alive:
+                    # Only stop a monitor we own: the cycle's fd is closed
+                    # by the cycle, and closing it twice could hit a reused
+                    # descriptor number.
+                    if own_btmon:
+                        _stop_btmon(btmon_pid, btmon_fd)
                     btmon_pid = btmon_fd = None
-                    print("[listener] channel: btmon ended — double-tap close disabled")
-                else:
-                    btmon_buf += chunk
-                    lines = btmon_buf.split("\n")
-                    btmon_buf = lines.pop()
-                    for ln in lines:
-                        if (BTMON_TRIGGER in _ANSI_RE.sub("", ln)
-                                and not closing
-                                and time.time() - opened > CHANNEL_TAP_GRACE_S):
-                            print("[listener] channel close requested (double-tap)")
-                            closing = True
-                            try:
-                                sock.shutdown(socket.SHUT_WR)
-                            except OSError:
-                                pass
+                    print("[listener] channel: btmon ended — tap close disabled")
+                elif (tapped and not closing
+                        and time.time() - opened > CHANNEL_TAP_GRACE_S):
+                    print("[listener] channel close requested (tap)")
+                    closing = True
+                    try:
+                        sock.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
 
             # --- close gesture: single tap (kept as secondary; usually
             #     silent during SCO on Linux badges) ---
@@ -1173,7 +1203,8 @@ def run_channel(sock, ffmpeg):
                 dev.close()
             except Exception:
                 pass
-        _stop_btmon(btmon_pid, btmon_fd)
+        if own_btmon:
+            _stop_btmon(btmon_pid, btmon_fd)
         try:
             player.stdin.close()
         except OSError:
@@ -1187,6 +1218,44 @@ def run_channel(sock, ffmpeg):
 # ---------------------------------------------------------------------------
 # Core tap cycle: establish audio, stream to server, play response
 # ---------------------------------------------------------------------------
+
+def _finish_tapped_recording(sock, ffmpeg):
+    """A tap ended the recording: stop the mic, half-close, and wait up to
+    TAP_FINALIZE_WAIT_S for the server's verdict.  Returns the terminal
+    signal byte, or None.
+
+    The half-close is the end of utterance the server always sees, so it
+    finalizes on the audio it has: a command it recognises still runs, by
+    design -- a tap abandons a recording, it does not recall a command.
+    A b'v' answer is played here, as in the main loop.
+    """
+    print("[listener] tap — ending the recording, awaiting the verdict")
+    terminate_ffmpeg(ffmpeg)
+    try:
+        sock.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+    deadline = time.time() + TAP_FINALIZE_WAIT_S
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            print(f"[listener] no verdict within {TAP_FINALIZE_WAIT_S}s")
+            return None
+        r, _, _ = select.select([sock], [], [], remaining)
+        if not r:
+            continue
+        try:
+            sig = sock.recv(1)
+        except OSError:
+            return None
+        if not sig:
+            return None
+        if sig == b"k":
+            continue
+        if sig == b"v":
+            receive_voice_response(sock)
+        return sig
+
 
 def stream_and_handle_response():
     """Serialized entry point for the tap cycle.
@@ -1294,6 +1363,14 @@ def _stream_and_handle_response():
         terminate_ffmpeg(ffmpeg)
         return
 
+    # --- Step 5b: watch for the tap that ends the recording (Phase 10) ---
+    # Started only now, after the chirp, so the tap that began this cycle --
+    # or a bounce of it -- cannot end it.  Not in Game Mode, where the cycle
+    # is a click and over in well under a second.
+    btmon_pid, btmon_fd = (None, None) if game_mode.is_set() else _start_btmon()
+    btmon_buf = ""
+    tap_ended = False
+
     # --- Step 6: select() loop — stream audio and watch for server response ---
     #
     # select() lets us watch two file descriptors simultaneously without
@@ -1309,7 +1386,10 @@ def _stream_and_handle_response():
     deadline = time.time() + RECORD_MAX_S
     try:
         while time.time() < deadline:
-            r, _, _ = select.select([ffmpeg.stdout, sock], [], [], 0.5)
+            fds = [ffmpeg.stdout, sock]
+            if btmon_fd is not None:
+                fds.append(btmon_fd)
+            r, _, _ = select.select(fds, [], [], 0.5)
 
             if sock in r:
                 sig = sock.recv(1)
@@ -1327,7 +1407,7 @@ def _stream_and_handle_response():
                     # Answered hail — this socket becomes the live intercom.
                     # No SHUT_WR: the uplink keeps flowing inside the channel.
                     signal_byte = sig
-                    run_channel(sock, ffmpeg)
+                    run_channel(sock, ffmpeg, (btmon_pid, btmon_fd))
                     break
                 signal_byte = sig
                 # Half-close our send side right away: the signal byte means
@@ -1343,6 +1423,18 @@ def _stream_and_handle_response():
                 if sig == b"v":
                     receive_voice_response(sock)   # read and play the voice WAV
                 break   # done regardless of signal type
+
+            # Checked AFTER the socket, so a verdict already waiting wins.
+            if btmon_fd is not None and btmon_fd in r:
+                tapped, btmon_buf, alive = _btmon_taps(btmon_fd, btmon_buf)
+                if not alive:
+                    _stop_btmon(btmon_pid, btmon_fd)
+                    btmon_pid = btmon_fd = None
+                    print("[listener] btmon ended — tap-to-end unavailable this cycle")
+                elif tapped:
+                    tap_ended = True
+                    signal_byte = _finish_tapped_recording(sock, ffmpeg)
+                    break
 
             if ffmpeg.stdout in r:
                 data = ffmpeg.stdout.read(4096)
@@ -1376,9 +1468,12 @@ def _stream_and_handle_response():
                 ffmpeg.kill()
                 ffmpeg.wait()
         sock.close()
+        _stop_btmon(btmon_pid, btmon_fd)
 
     # --- Step 7: play ack/nack, or nothing if voice response was already played ---
-    if signal_byte == b"c":
+    if tap_ended and signal_byte in (None, b"f"):
+        play_wav(CANCELLED_WAV) # a tap ended it and nothing came of it — "Cancelled."
+    elif signal_byte == b"c":
         play_wav(ACK_WAV)       # command matched and executed — success chirp
     elif signal_byte == b"g":
         # Game Mode click. Deliberately SILENT: fall straight through to the

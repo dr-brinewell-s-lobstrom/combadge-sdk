@@ -138,7 +138,7 @@ The three scripts in this folder (`transceiver.py`, `listener.py`, `computer.py`
 The TNG combadge presents itself to a Linux Bluetooth host as **two devices in one**:
 
 1. A **Bluetooth Hands-Free (HFP)** audio device - bidirectional 16 kHz mono audio over an SCO link. Visible in PipeWire as a `bluez_card.<MAC>` with profile `headset-head-unit`, exposing a `bluez_input.<MAC>` source and `bluez_output.<MAC>.1` sink.
-2. An **HID input device** - the physical badge tap surfaces as keypress events on `/dev/input/eventX`. A single tap fires `KEY_PAUSECD` (key code 201; some firmware revisions use 200). A double tap is *not* a separate keycode - it's an `AT+BVRA=1` command that the badge issues over the HFP control channel; you watch for it with `btmon`.
+2. An **HID input device** - the physical badge tap surfaces as keypress events on `/dev/input/eventX`. A single tap fires `KEY_PAUSECD` (key code 201; some firmware revisions use 200). A double tap is *not* a separate keycode - it's an `AT+BVRA=1` command that the badge issues over the HFP control channel; you watch for it with `btmon`. And while the SCO audio link is up, a *single* tap is not a keycode either: the button becomes call control and sends a hang-up, `AT+CHUP`, also visible only on `btmon`.
 
 The SDK builds the smallest end-to-end voice command pipeline that exercises both:
 
@@ -362,6 +362,8 @@ See `transceiver.py` in this folder for the runnable minimal version.
 **Find the badge input node.** Iterate `evdev.list_devices()` and pick the one whose `name` contains `TNG COMBADGE`, or whose `EV_KEY` capability includes `KEY_PAUSECD` (201). Single-tap surfaces as that key, sometimes as code 200 - accept both. The node path can change if you re-pair, so look it up at startup and re-look-up after disconnect.
 
 **Detect a single tap.** A clean `select()` loop on `device.fd`, reading events; trigger when `event.type == EV_KEY and event.code in (200, 201) and event.value == 1`. Debounce ~2 s - after SCO teardown the badge can re-fire spuriously.
+
+**End a recording with a second tap.** One tap starts a recording and the next tap ends it, the same rule as closing a channel. During SCO that second tap arrives as `AT+CHUP` on `btmon` (a double tap, `AT+BVRA=1`, does the same), so the listener starts `btmon` under a pty *after* the listening chirp - which also means the tap that started the cycle can never end it - and folds its fd into the streaming `select()`. On the tap it stops ffmpeg, half-closes the socket, and waits up to `TAP_FINALIZE_WAIT_S` (1.5 s) for the server's verdict. A verdict plays as usual, so a dictation ended by tap is still kept and confirmed; `b'f'` or no verdict plays the spoken `cancelled.wav`. The server finalizes on whatever audio it already has, so a command it recognised **still runs** - a tap abandons a recording, it does not recall a command. `btmon` needs the privileges to open the HCI monitor; without them the listener says so and taps simply do not end recordings.
 
 **Start capture first, THEN play the chirp.** `ffmpeg -f pulse -i bluez_input.<MAC> -ar 16000 -ac 1 -f wav -loglevel quiet pipe:1`. Opening `bluez_input.<MAC>` triggers HFP SCO negotiation from the capture side - the only reliable way to bring the link up. ffmpeg writes a standard 44-byte WAV header as soon as it opens the source; receipt of those 44 bytes is the signal that the SCO link is live. Only then does `pw-play --target bluez_output.<MAC>.1 --media-role=communication listening.wav` play the chirp, which reliably routes to the badge speaker because the SCO link is already established. Playing the chirp before ffmpeg starts causes it to fall through to default output (laptop speakers). The `--media-role=communication` hint nudges PipeWire toward the HFP sink rather than treating it as music.
 
@@ -640,7 +642,9 @@ End-to-end latency on a healthy adapter: ~1.5–2 s tap-to-chirp, ~300–800 ms 
 
 **Single tap fires code 200 *or* 201.** `KEY_PAUSECD` is 201, but the badge alternates after audio activity - accept both.
 
-**Double-tap is not a keypress.** It's emitted by the badge as `AT+BVRA=1` over the HFP control channel. Watch with `btmon` (running under a pty for line-buffered output) and pattern-match the line. The minimal SDK skips double-tap; add it when you need cancel/finalize semantics.
+**Double-tap is not a keypress.** It's emitted by the badge as `AT+BVRA=1` over the HFP control channel. Watch with `btmon` (running under a pty for line-buffered output) and pattern-match the line.
+
+**During SCO, neither is a single tap.** Once the audio link is up the badge button is call control, and a single tap sends `AT+CHUP` (a hang-up) instead of a key event - `btmon` shows `21 ef 11 41 54 2b 43 48 55 50 0d 80  !..AT+CHUP..`. BlueZ has no call to hang up, so if nothing watches for it the badge just chirps and nothing happens. The listener watches for both commands and treats either as "end this": it ends a recording or closes a channel. Drain the pty fully on each pass - SCO traffic floods `btmon`, and a single read per loop lets the tap line drown in backlog.
 
 **`pw-play` alone cannot establish a cold SCO output link.** On a cold HFP link, targeting the badge sink via `pw-play` often falls back to the default output. The only reliable cold-start path opens `ffmpeg -f pulse -i bluez_input.<MAC>` first - this triggers SCO negotiation from the capture side. The 44-byte WAV header emitted by ffmpeg when the source opens is the signal that the link is live; only then is `pw-play` reliable. See `play_wav_cold()` in §7.
 
