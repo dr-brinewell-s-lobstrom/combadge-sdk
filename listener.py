@@ -281,19 +281,35 @@ TAP_CANCEL_GUARD_S = 0.3
 # How long a REUSED cycle waits before playing "Listening.", so the badge's
 # own chirp is out of the way first.
 #
-# THE BADGE CHIRPS ~0.51 s AFTER A TAP ON A LIVE LINK, for ~0.4 s: measured
-# 3/3 on 2026-09-13 (controlpanel/chirp_probe.py) at +0.51, +0.51 and +0.52 s,
-# -4.6 to -10.3 dBFS against a room floor near -45. On a warm tap our clip
-# occupied roughly +0.05 to +0.9 s -- straight through that window -- and a
-# headset playing its own local tone owns the speaker while it does. pw-play
-# reported a clean ~1.0 s run every time and the Captain heard nothing, three
-# runs in a row. This waits it out rather than competing with it.
+# THE BADGE CHIRPS ~0.57 s AFTER A TAP ON A LIVE LINK and holds its speaker
+# for a while afterwards. A warm-tap clip played into that window is simply
+# not emitted: pw-play reported a clean ~1.0 s run every time and the Captain
+# heard nothing, three sessions running.
+#
+# THE VALUE IS SWEPT, NOT GUESSED (controlpanel/warm_wait_sweep.py,
+# 2026-09-13, ten taps on a held link, scored by microphone AND by ear):
+#
+#   W = 0.0   not heard          (the control -- today's behaviour)
+#   W = 0.8   clipped to "ning"  0/2
+#   W = 1.0   heard in full      2/2
+#   W = 1.2   heard in full      2/2
+#   W = 1.4   heard in full      2/2
+#
+# 1.2 RATHER THAN THE VERIFIED-GOOD 1.0, because the boundary is close and a
+# missed cue is the whole defect. The chirp's own acoustic end does NOT
+# explain the cutoff: at W=0.8 the clip starts ~0.30 s after the last chirp
+# energy and still dies, while at W=1.0 it starts ~0.50 s after and lives --
+# so the badge holds the speaker roughly 0.3 s past going quiet, and what
+# must clear the chirp is the 160 ms PRIME, not the clip. Measured chirp end
+# ranged 0.62-0.98 s over 7 detections; 1.0 leaves ~0.5 s against a spread
+# that wide, 1.2 leaves ~0.7 s. The 200 ms buys margin on the one thing the
+# Captain ruled paramount.
 #
 # COLD TAPS DO NOT WAIT, and must not: the link is down when the tap lands,
-# and the badge chirps only on link-DOWN, never on link-UP (0/5 on up, 5/5 on
-# down, same measurement). There is no hardware chirp to collide with, and
-# the cold path is already the slower one.
-WARM_CHIRP_WAIT_S = 1.0
+# and the badge chirps only on link-DOWN, never on link-UP (0/10 on up,
+# 10/10 on down, two probe runs). There is no hardware chirp to collide
+# with, and the cold path is already the slower one.
+WARM_CHIRP_WAIT_S = 1.2
 # How long after the HOLD's teardown a key event is read as the badge's own
 # re-fire rather than as a tap.  Its own short clock: the re-fire it guards
 # against lands within milliseconds of the link dropping, while the badge's

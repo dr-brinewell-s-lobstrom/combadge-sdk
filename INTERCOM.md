@@ -851,13 +851,24 @@ available at the moment a COLD tap's recording goes live, and the hardware
 chirp therefore cannot become the cue everywhere. It can only ever cover the
 warm half.
 
-⚠ **A parser bug of mine nearly buried this, and is worth recording.** btmon
-logged 5 `Setup Synchronous Connection` commands but the probe reported only
-**one** link-up: it marked on a pending `Handle:` line rather than the event's
-own header, and interleaved events (Max Slots Change carries a `Handle:` too)
-stole the mark. Fixed — it now marks on the header line, where btmon puts the
-timestamp. **The acoustic conclusion never depended on it:** the five link-up
-times were checked directly in the recording and all five are room noise.
+⚠ **A parser bug of mine nearly buried this, and my first explanation of it
+was wrong.** btmon logged 5 `Setup Synchronous Connection` commands but the
+probe reported only **one** link-up. I blamed interleaved Max Slots Change
+events stealing a pending `Handle:` line, and changed the parser to mark on
+the event header instead. The re-run on 2026-09-13 10:13 still scored 1 of 4,
+which is how the real cause surfaced: **btmon pads headers to a fixed width
+and truncates the event NAME by whatever the trailing packet number needs** —
+`Synchronou..` (#10), `Synchrono..` (#421), `Synchron..` (#1318) all in one
+run. A name prefix matches only the narrow-numbered packets; `Disconne..` is
+short enough to survive every truncation, which is why link-downs scored 5/5.
+Now matched by **opcode** (`0x2c` up, `0x05` down), which sits inside the
+padded region and cannot truncate.
+
+**The acoustic conclusion never depended on either bug** — link-up times come
+from the marker anchor and the probe's own schedule, and every one of them was
+checked directly in the recording. Worth keeping as a method note: *a parser
+that under-reports events makes a silent event and a missed event look
+identical*, and only the independent anchor told them apart.
 
 **The third row is the fix.** A tap on a live link produces *two* bursts: a
 tiny one at the `AT+CHUP` instant, then the real chirp **+0.51, +0.51, +0.52 s
@@ -879,20 +890,53 @@ The redirection is therefore withdrawn by the same reasoning that proposed
 it — it was offered to *remove* an inconsistency, and the measurement shows it
 would instead make one permanent (cold taps can never use the hardware chirp).
 
-`WARM_CHIRP_WAIT_S = 1.0` in `listener.py`: a **reused** cycle now sleeps past
-the badge's chirp (+0.51 s onset + ~0.4 s) before priming and playing, so the
-clip lands in clear air. A cold cycle does not wait and must not — nothing
-chirps on link-up to collide with, and the cold path is already the slow one.
+`WARM_CHIRP_WAIT_S` in `listener.py`: a **reused** cycle sleeps past the
+badge's chirp before priming and playing, so the clip lands in clear air. A
+cold cycle does not wait and must not — nothing chirps on link-up to collide
+with, and the cold path is already the slow one.
 
-**What this costs, stated plainly:** the warm tap's cue moves from ~300 ms to
-~1.3 s, giving back most of the reuse speed-up *as felt in the cue*. The
-recording is live for the whole wait, so a word spoken into it is still
-captured; what is delayed is the confirmation, not the listening.
+### ✅ The wait is SWEPT, not guessed — and 1.0 was one notch above failing
 
-⚠ **Unverified on a badge: whether the clip is actually HEARD after the wait.**
-The collision is measured, the remedy is inferred. If it is still silent, the
-other candidate stands — the held link's output path going idle — and the next
-move is the prime, not the delay.
+`controlpanel/warm_wait_sweep.py` holds the link up for a whole run (so every
+tap is warm), waits W after each tap, plays the SDK's own `listening.wav`
+through the SDK's own `pw-play` invocation, and scores what comes out against
+an uncontested **reference play** — because absolute milliseconds always
+undercount, the clip's quiet head and tail sitting below the room floor.
+Ten taps, 2026-09-13 10:51, **Captain scoring by ear in parallel**:
+
+| W | by ear | by microphone |
+|---|---|---|
+| 0.0 | not heard | SILENT (control reproduces) |
+| 0.8 | **clipped to "ning"** | 0/2 |
+| 1.0 | heard in full | 2/2 |
+| 1.2 | heard in full | 2/2 |
+| 1.4 | heard in full | 2/2 |
+
+**Set to 1.2, not the verified-good 1.0.** The boundary is close and a missed
+cue is the entire defect. Measured chirp end ranged **0.62–0.98 s** over 7
+detections; 1.0 leaves ~0.5 s against that spread, 1.2 leaves ~0.7 s, and
+200 ms is cheap against the thing the Captain ruled paramount.
+
+⭐ **The chirp's acoustic end does not explain the cutoff, which is the real
+finding.** At W=0.8 the clip begins ~0.30 s *after* the last chirp energy and
+still dies; at W=1.0 it begins ~0.50 s after and lives. So the badge holds its
+speaker roughly **0.3 s past the tone going quiet**, and what has to clear the
+chirp is the 160 ms **prime**, not the clip. Anyone tempted to tighten this
+constant by reading chirp-end alone will set it too low.
+
+**What it costs:** the warm cue moves from ~300 ms to ~1.5 s. The recording is
+live for the whole wait, so a word spoken into it is still captured — what is
+delayed is the confirmation, not the listening.
+
+⚠ **Two analyser artifacts, recorded because they nearly inverted the result.**
+The first scoring pass called W=0.0 a **FULL** clip at −5.4 dBFS, when real
+clips measure −27 to −29: at W=0 the chirp lands inside the clip's window, and
+a chirp blended with clip audio drags hi/lo back under `CHIRP_RATIO`. The ear
+said otherwise and the ear was right. Now excluded two ways — runs starting
+before the detected chirp ends, and runs louder than the reference +12 dB (the
+backstop for the 3 trials of 10 where the chirp itself was not detected).
+**The microphone is a proxy for the Captain's ear, and when they disagree the
+ear wins.**
 
 ## Resume Point (2026-07-17)
 
