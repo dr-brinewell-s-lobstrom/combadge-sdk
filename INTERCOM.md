@@ -776,10 +776,56 @@ follows. TOS does not show this, for two reasons worth keeping in mind: its
 reuse cue is a 309 ms **tone**, which survives what speech does not, and TOS
 never holds after a spoken answer, which is exactly where this appears.
 
-**Next:** a Yeti run with the badge beside it, cross-correlating the
-recording against `listening.wav` itself to compare emission on cold versus
-reused taps. If it is emission, the first thing to try is dropping the prime
-on the reused path only.
+**The Yeti run was inconclusive, and the analysis was the reason.** Recorded
+2026-09-13 04:24 with the badge beside the microphone; the SDK log shows the
+six chirps, the recording is good (146 s, peak −4.6 dBFS), but scoring it
+against `listening.wav` proved nothing: a 671 ms speech envelope matches
+almost any speech, including the Captain's own voice, so every window scored
+0.83-0.95 against a whole-file baseline whose p90 is already 0.44. One cold
+window even landed on digital silence, which says the recording's t=0 was
+inferred rather than measured. Saved as
+`log/sdk_chirp_yeti_20260913_042354.wav` for a better-anchored re-score; the
+method needs a measured anchor, a band-limited detector and a null control.
+
+### ⭐ The Captain's redirection: stop fighting for the clip, use the badge's own chirp
+
+> *"if we can figure out a trick to trigger the hardware chirp when it's
+> listening instead of playing listening.wav, that would make the experience
+> more consistent... right now, some taps (cold) use listening.wav to indicate
+> readiness, while other taps (warm) may simply do the hardware chirp yet be
+> equally ready — so I'd think that forcing listening.wav into a pipeline that
+> is resisting it seems harder than using the hardware chirp as the reliable
+> listening indicator."*
+
+He is describing a real inconsistency, and the cheap test confirmed it again:
+a tap inside the linger still produces the badge's chirp and no "Listening.",
+and the badge is **equally ready either way**. The clip is the unreliable
+half of the pair, and it is the half we are pushing uphill.
+
+**What the badge is known to chirp on**, from tonight's btmon work: its own
+button while SCO is up (the `AT+CHUP` it sends is refused by BlueZ and the
+badge beeps anyway), and the SCO link dropping (the teardown chirp, which is
+already TOS's end-of-cycle cue). Unknown, and the key question: whether it
+also chirps on SCO coming UP — because if it does, a cold tap already has a
+hardware marker at the exact moment recording becomes live, and
+`listening.wav` is redundant everywhere rather than merely unreliable.
+
+**Routes to triggering it deliberately, honestly assessed.** Cycling SCO
+works and is what the teardown chirp already is, but it costs the link and
+the ~900 ms rebuild, which defeats the purpose on a warm tap. The HFP way is
+to have the AG send an unsolicited `RING`, which makes an HF with in-band
+ringing off play its own alert — but the AG side here is PipeWire's native
+HFP backend, so injecting one means patching that backend or going through
+oFono, and both are well outside a reference implementation. An indicator
+change (`+CIEV`) is the same problem. So the realistic finding may be that we
+cannot *trigger* the chirp, only *rely* on the ones the badge already makes.
+
+**Next, and it needs proper anchoring this time:** btmon and the Yeti
+together, as the 2026-09-13 02:29 hold test did — btmon timestamps every SCO
+transition exactly, so the recording can be aligned to real events rather
+than to a schedule, and the question "does the badge chirp on SCO up" is then
+a direct read. That experiment also answers whether `listening.wav` can be
+dropped from the SDK altogether.
 
 ## Resume Point (2026-07-17)
 
