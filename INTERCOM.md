@@ -753,15 +753,33 @@ cue. Second, *an accurate cue is not automatically a wanted one*: the test
 that matters is whether the sound tells the user something they need at a
 moment they need it.
 
-⚠ **OPEN, and instrumented for the next run:** on the reused tap the Captain
-heard the badge's own tap chirp and **no "Listening." at all**, then spoke
-and found it had been recording after all. The code does reach step 4 on a
-reused cycle, and the log's one-second resolution cannot say whether the clip
-played, so step 4 now prints how long the chirp took: near zero means
-`pw-play` bailed, ~830 ms means it ran and the question is acoustic. A
-candidate for what he heard: the badge chirps by itself when tapped on a live
-link, so "Listening." may have arrived ~0.8 s later, into speech already
-under way.
+⚠ **OPEN: "Listening." is not heard on a REUSED tap, and the software is not
+why.** The Captain, twice: on a tap inside the linger he hears the badge's
+own tap chirp and **no "Listening." at all**, then speaks and finds it had
+been recording. Step 4 is reached on a reused cycle and now times itself:
+
+    listening chirp: 1015ms (cold link)      <- heard
+    listening chirp: 1033ms (reused link)    <- not heard
+    listening chirp: 1018ms (cold link)      <- heard
+    listening chirp: 1007ms (reused link)    <- not heard
+
+`pw-play` runs for the same ~1.0 s on both paths (160 ms prime + a 671 ms
+clip + overhead), so the clip is being played identically and the question is
+whether the badge EMITS it. That is the "ok=True while silent" shape again,
+and the relay cannot see it: only a second microphone can.
+
+Two candidates, both testable: the held link's output side may have gone idle
+in a way that swallows the first playback, or the prime itself may be the
+problem — TOS.conf records that priming a HOT link actively hurts, because
+the gap between the two plays lets PipeWire release the path and clip what
+follows. TOS does not show this, for two reasons worth keeping in mind: its
+reuse cue is a 309 ms **tone**, which survives what speech does not, and TOS
+never holds after a spoken answer, which is exactly where this appears.
+
+**Next:** a Yeti run with the badge beside it, cross-correlating the
+recording against `listening.wav` itself to compare emission on cold versus
+reused taps. If it is emission, the first thing to try is dropping the prime
+on the reused path only.
 
 ## Resume Point (2026-07-17)
 
