@@ -753,8 +753,9 @@ cue. Second, *an accurate cue is not automatically a wanted one*: the test
 that matters is whether the sound tells the user something they need at a
 moment they need it.
 
-⚠ **OPEN: "Listening." is not heard on a REUSED tap, and the software is not
-why.** The Captain, twice: on a tap inside the linger he hears the badge's
+⚠ **OPEN — answered below, and the answer is that the badge's own chirp lands
+on top of it: "Listening." is not heard on a REUSED tap, and the software is
+not why.** The Captain, twice: on a tap inside the linger he hears the badge's
 own tap chirp and **no "Listening." at all**, then speaks and finds it had
 been recording. Step 4 is reached on a reused cycle and now times itself:
 
@@ -826,6 +827,72 @@ transition exactly, so the recording can be aligned to real events rather
 than to a schedule, and the question "does the badge chirp on SCO up" is then
 a direct read. That experiment also answers whether `listening.wav` can be
 dropped from the SDK altogether.
+
+### ⭐ The probe ran, and it refutes the redirection: the badge is SILENT on link-up
+
+`controlpanel/chirp_probe.py`, run 2026-09-13 (`chirp_probe_20260913_093105`),
+anchored the way the two failed analyses were not — PAN↔CUBE clock offset
+measured NTP-style over SSH, and a 1 kHz marker tone *found in the recording
+by frequency* rather than assumed from a schedule. Bursts were scored by
+hi/lo band ratio, which separates the badge's chirp from room noise and from
+speech. The result, three ways:
+
+| event | bursts | level | hi/lo ratio |
+|---|---|---|---|
+| SCO link **down** | **5/5** | −5 to −8 dBFS | 15–443 |
+| SCO link **up** | **0/5** | −39.9 to −45.9 dBFS | 0.04–0.96 |
+| tap on a live link | **3/3** | −4.6 to −10.3 dBFS | 175–644 |
+
+The link-up row is the finding. At all five link-up instants the loudest
+thing near the event is room noise — the same level and the same flat
+spectrum as the silence around it. **The badge does not chirp when SCO comes
+up**, so the redirection's premise does not hold: there is no hardware marker
+available at the moment a COLD tap's recording goes live, and the hardware
+chirp therefore cannot become the cue everywhere. It can only ever cover the
+warm half.
+
+⚠ **A parser bug of mine nearly buried this, and is worth recording.** btmon
+logged 5 `Setup Synchronous Connection` commands but the probe reported only
+**one** link-up: it marked on a pending `Handle:` line rather than the event's
+own header, and interleaved events (Max Slots Change carries a `Handle:` too)
+stole the mark. Fixed — it now marks on the header line, where btmon puts the
+timestamp. **The acoustic conclusion never depended on it:** the five link-up
+times were checked directly in the recording and all five are room noise.
+
+**The third row is the fix.** A tap on a live link produces *two* bursts: a
+tiny one at the `AT+CHUP` instant, then the real chirp **+0.51, +0.51, +0.52 s
+later**, running ~0.4 s. Our warm-tap clip occupied roughly +0.05 to +0.9 s —
+straight through it. A headset playing its own local tone owns the speaker
+while it does, which is why `pw-play` reported a clean ~1.0 s run on every
+warm tap and the Captain heard nothing, twice.
+
+### ⭐ The Captain's ruling: consistency wins, so wait the chirp out
+
+> *"Since cold taps always play listening.wav, we should continue to do so on
+> warm taps — consistency is the most important thing. The fact that cold taps
+> play listening.wav and cannot use the hardware chirp is itself what makes the
+> hardware chirp undesirable as an indicator, since it's not ALWAYS the
+> indicator, however reliable it may be in that scenario... perhaps wait it out,
+> then play listening.wav immediately after the duration of that?"*
+
+The redirection is therefore withdrawn by the same reasoning that proposed
+it — it was offered to *remove* an inconsistency, and the measurement shows it
+would instead make one permanent (cold taps can never use the hardware chirp).
+
+`WARM_CHIRP_WAIT_S = 1.0` in `listener.py`: a **reused** cycle now sleeps past
+the badge's chirp (+0.51 s onset + ~0.4 s) before priming and playing, so the
+clip lands in clear air. A cold cycle does not wait and must not — nothing
+chirps on link-up to collide with, and the cold path is already the slow one.
+
+**What this costs, stated plainly:** the warm tap's cue moves from ~300 ms to
+~1.3 s, giving back most of the reuse speed-up *as felt in the cue*. The
+recording is live for the whole wait, so a word spoken into it is still
+captured; what is delayed is the confirmation, not the listening.
+
+⚠ **Unverified on a badge: whether the clip is actually HEARD after the wait.**
+The collision is measured, the remedy is inferred. If it is still silent, the
+other candidate stands — the held link's output path going idle — and the next
+move is the prime, not the delay.
 
 ## Resume Point (2026-07-17)
 

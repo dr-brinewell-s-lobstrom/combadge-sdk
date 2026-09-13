@@ -278,6 +278,22 @@ HOLD_TAP_GUARD_S = 0.5
 # starting tap could end its own cycle, and with btmon started later (as it
 # was before 2026-09-13) a tap in between was seen by nobody at all.
 TAP_CANCEL_GUARD_S = 0.3
+# How long a REUSED cycle waits before playing "Listening.", so the badge's
+# own chirp is out of the way first.
+#
+# THE BADGE CHIRPS ~0.51 s AFTER A TAP ON A LIVE LINK, for ~0.4 s: measured
+# 3/3 on 2026-09-13 (controlpanel/chirp_probe.py) at +0.51, +0.51 and +0.52 s,
+# -4.6 to -10.3 dBFS against a room floor near -45. On a warm tap our clip
+# occupied roughly +0.05 to +0.9 s -- straight through that window -- and a
+# headset playing its own local tone owns the speaker while it does. pw-play
+# reported a clean ~1.0 s run every time and the Captain heard nothing, three
+# runs in a row. This waits it out rather than competing with it.
+#
+# COLD TAPS DO NOT WAIT, and must not: the link is down when the tap lands,
+# and the badge chirps only on link-DOWN, never on link-UP (0/5 on up, 5/5 on
+# down, same measurement). There is no hardware chirp to collide with, and
+# the cold path is already the slower one.
+WARM_CHIRP_WAIT_S = 1.0
 # How long after the HOLD's teardown a key event is read as the badge's own
 # re-fire rather than as a tap.  Its own short clock: the re-fire it guards
 # against lands within milliseconds of the link dropping, while the badge's
@@ -1609,10 +1625,15 @@ def _stream_and_handle_response(reuse=None):
         # figure near zero means it bailed; ~830 ms (160 ms prime + a 671 ms
         # clip) means it ran and the question is acoustic, not logical.
         _t_chirp = time.time()
+        if reused:
+            # Wait out the badge's own tap chirp -- see WARM_CHIRP_WAIT_S. The
+            # recording is already live throughout, so this delays the CUE and
+            # nothing else; a word spoken during the wait is still captured.
+            time.sleep(WARM_CHIRP_WAIT_S)
         play_silence(PRIME_MS_LISTENING)
         play_wav(LISTENING_WAV, prime=False)
         print(f"[listener] listening chirp: {(time.time() - _t_chirp) * 1000:.0f}ms "
-              f"({'reused link' if reused else 'cold link'})")
+              f"({'reused link, after a ' + str(WARM_CHIRP_WAIT_S) + 's wait' if reused else 'cold link'})")
 
     # --- Step 5: connect to server ---
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
