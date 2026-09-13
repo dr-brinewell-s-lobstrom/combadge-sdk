@@ -103,18 +103,19 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSET_DIR  = os.path.join(SCRIPT_DIR, "assets")
 
 LISTENING_WAV           = os.path.join(ASSET_DIR, "listening.wav")
-# "Ready." -- the end-of-cycle cue on a HELD link, where nothing is torn down
-# and so the badge's own chirp does not sound until the linger expires.
-#
-# ⚠ IT MUST NOT BE listening.wav, and that is not a style preference. THIS
-# ASSET IS SPEECH: the clip says the word "Listening", where TOS's file of the
-# same name is a 309 ms tone (measured 2026-09-13: 1050 vs 10275 zero
-# crossings per second, energy at 150 Hz vs 4 kHz). Playing it here told the
-# Captain the badge was listening when it was merely reusable, he spoke, and
-# nothing answered -- the same fault Phase 9 fixed for the answering tap and
-# the closing channel, reintroduced by copying TOS's ready_chirp = listening
-# .wav across a filename that means something different on this side.
-READY_WAV               = os.path.join(ASSET_DIR, "ready.wav")
+# ~~READY_WAV~~ REMOVED 2026-09-13 -- there is NO end-of-cycle cue on a held
+# link, by the Captain's ruling, and two attempts at one are why:
+#   listening.wav  said "Listening." when nothing was listening (this asset is
+#                  SPEECH; TOS's file of the same name is a 309 ms tone --
+#                  1050 vs 10275 zero crossings/s, 150 Hz vs 4 kHz). He spoke
+#                  to a badge that was merely reusable.
+#   ready.wav      accurate, and still unwanted: "I think the answer is, we
+#                  don't need to play ready.wav at all -- if I tap within 5s
+#                  and it reuses the link, great."
+# The answer the cycle just played IS the signal that the cycle is over. What
+# the NEXT tap needs to hear is "Listening.", which that cycle plays for
+# itself; and if the linger expires instead, the badge's own teardown chirp
+# closes the sequence, which he confirms reads correctly.
 ACK_WAV                 = os.path.join(ASSET_DIR, "commandexecuted.wav")
 # Spoken channel cues (INTERCOM.md Phase 9), generated with tts.sh like the
 # rest.  "Listening" and "Command executed" are wrong at those two moments:
@@ -1601,8 +1602,17 @@ def _stream_and_handle_response(reuse=None):
     if answering:
         print("[listener] answering hail -- no listening chirp")
     elif not game_mode.is_set():
+        # TIMED, AND PRINTED EITHER WAY (2026-09-13). On a REUSED cycle the
+        # Captain reported hearing the badge's own tap chirp and no
+        # "Listening." at all, and nothing in the log could say whether the
+        # clip had been played -- pw-play's own result is discarded here. A
+        # figure near zero means it bailed; ~830 ms (160 ms prime + a 671 ms
+        # clip) means it ran and the question is acoustic, not logical.
+        _t_chirp = time.time()
         play_silence(PRIME_MS_LISTENING)
         play_wav(LISTENING_WAV, prime=False)
+        print(f"[listener] listening chirp: {(time.time() - _t_chirp) * 1000:.0f}ms "
+              f"({'reused link' if reused else 'cold link'})")
 
     # --- Step 5: connect to server ---
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1778,14 +1788,10 @@ def _stream_and_handle_response(reuse=None):
     # That exit IS the "last audio frame left the pipeline" event — no timer
     # needed.  Tearing down here is instantaneous and cannot be premature.
     #
-    # Held (Phase 11): nothing is torn down, so the badge's own chirp -- the
-    # usual "tap when you like" cue on Linux -- does not sound until the
-    # linger expires.  "Ready." takes its place; no prime, the link is hot.
-    # NOT listening.wav, which on this side is the spoken word and would
-    # promise a recording that is not running -- see READY_WAV.
-    if holding:
-        play_wav(READY_WAV, prime=False)
-    else:
+    # Held (Phase 11): nothing is torn down, and nothing is played -- see the
+    # READY_WAV gravestone above for the two cues that were tried here and
+    # why neither survived contact with the badge.
+    if not holding:
         force_sco_teardown()
     # The instant another tap can be acted on.  "waiting for tap..." is the
     # main loop reopening the input device, which with a held link is neither

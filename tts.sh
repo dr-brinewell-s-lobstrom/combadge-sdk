@@ -26,7 +26,6 @@
 #   ./tts.sh "Channel open."                 assets/channelopen.wav
 #   ./tts.sh "Channel closed."               assets/channelclosed.wav
 #   ./tts.sh "Cancelled."                    assets/cancelled.wav
-#   ./tts.sh "Ready."                        assets/ready.wav
 #   ./tts.sh "Listening."                    assets/listening.wav
 #
 # ⚠ EVERY ASSET IN THIS LIST IS SPEECH, listening.wav included -- it says the

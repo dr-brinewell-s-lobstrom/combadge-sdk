@@ -641,11 +641,10 @@ running capture — and watches that capture.
 - **The capture is the link.** At the end of a cycle, `_sco_hold.begin()`
   takes the still-running ffmpeg *before* the confirmation plays (its pipe
   must be drained or ffmpeg blocks and drops the link) and lingers
-  `SCO_HOLD_MS` (5000). The cycle ends with a spoken **"Ready."**
-  (`ready.wav`) as the "tap when you like" cue, because the badge's own
-  teardown chirp — the usual cue on Linux — now sounds at the end of the
-  *linger*. (It replayed `listening.wav` until the badge test; see the end of
-  Phase 12 for why that was wrong here and right in TOS.) On expiry,
+  `SCO_HOLD_MS` (5000). **The cycle ends silently on a held link** — no cue
+  at all, by the Captain's ruling after two attempts at one failed on the
+  badge; see the end of Phase 12. If the linger expires instead, the badge's
+  own teardown chirp closes the sequence. On expiry,
   `drop()` reaps and tears down as before. If the capture ends on its own,
   the hold is gone, the profile is switched off to resync, and the next tap
   arrives on evdev and takes the full path.
@@ -735,10 +734,34 @@ This is exactly the fault **Phase 9** fixed for the answering tap and the
 closing channel — *the SDK's cues are spoken, so they must say the true
 thing* — reintroduced by porting a TOS filename rather than a TOS meaning.
 
-Fixed with a new `ready.wav`, spoken **"Ready."** (`tts.sh`, 974 ms, same
-voice as every other clip). ⚠ **The rule this leaves behind: a TOS asset
-name is not an SDK asset meaning.** Before reusing either side's cue, check
-what the file actually says.
+The first fix was a new `ready.wav`, spoken **"Ready."**. It was accurate,
+and the Captain ruled it out on the next test anyway:
+
+> *"I think the answer is, we don't need to play ready.wav at all — if I tap
+> within 5s and it reuses the link, great — it should definitely play
+> listening.wav on that tap if able... if I don't tap within the 5s and I
+> hear the teardown chirp, that's fine and seems to work ok from there."*
+
+**So a held cycle now ends silently.** The answer it just played is the
+signal that it is over; what the next tap needs to hear is "Listening.",
+which that cycle plays for itself; and an expiring linger still ends in the
+badge's own chirp. `ready.wav` is deleted rather than left unused.
+
+⚠ **Two rules this leaves behind.** First, *a TOS asset name is not an SDK
+asset meaning* — check what a file actually says before reusing either side's
+cue. Second, *an accurate cue is not automatically a wanted one*: the test
+that matters is whether the sound tells the user something they need at a
+moment they need it.
+
+⚠ **OPEN, and instrumented for the next run:** on the reused tap the Captain
+heard the badge's own tap chirp and **no "Listening." at all**, then spoke
+and found it had been recording after all. The code does reach step 4 on a
+reused cycle, and the log's one-second resolution cannot say whether the clip
+played, so step 4 now prints how long the chirp took: near zero means
+`pw-play` bailed, ~830 ms means it ran and the question is acoustic. A
+candidate for what he heard: the badge chirps by itself when tapped on a live
+link, so "Listening." may have arrived ~0.8 s later, into speech already
+under way.
 
 ## Resume Point (2026-07-17)
 
