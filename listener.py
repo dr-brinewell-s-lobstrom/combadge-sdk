@@ -258,6 +258,20 @@ SCO_HOLD_MS = 5000
 # An AT+CHUP inside this many seconds of the hold beginning is a bounce of
 # the tap that ended the cycle, not a new tap.
 HOLD_TAP_GUARD_S = 0.5
+# An AT+CHUP inside this many seconds of btmon starting for a cycle is the tap
+# that STARTED the cycle, reported once more, rather than a tap meaning "stop".
+# btmon starts as soon as the capture is live, which is also the moment a tap
+# stops being a key event and becomes AT+CHUP -- so without this guard the
+# starting tap could end its own cycle, and with btmon started later (as it
+# was before 2026-09-13) a tap in between was seen by nobody at all.
+TAP_CANCEL_GUARD_S = 0.3
+# How long after the HOLD's teardown a key event is read as the badge's own
+# re-fire rather than as a tap.  Its own short clock: the re-fire it guards
+# against lands within milliseconds of the link dropping, while the badge's
+# chirp -- the cue to tap again -- sounds ~0.3 s in, during the profile
+# switch.  Borrowing TAP_DEBOUNCE's 2.0 s here ate deliberate taps 1 time in 3
+# on TOS hardware, and seven teardowns there produced no re-fire at all.
+TEARDOWN_TAP_GUARD_S = 0.5
 
 # Game Mode, mirrored from the server over the downlink (b'M' on, b'N' off).
 # M/N rather than G/N because the full TOS relay protocol already spends b'G' on
@@ -521,7 +535,24 @@ def terminate_ffmpeg(proc):
 # link is down, btmon while it is held.  The main loop's debounce reads it,
 # and the hold bumps it whenever it tears the link down, so the spurious key
 # events a teardown can emit are swallowed as they are after a normal cycle.
-_tap_clock = {"last": 0.0}
+_tap_clock = {"last": 0.0, "teardown": 0.0}
+
+
+def tap_blocked_reason(now=None):
+    """Why a key event arriving now would be refused, or None to accept it.
+
+    Two clocks, and keeping them separate is the point: the teardown guard is
+    about a link-drop re-fire arriving in milliseconds, the debounce about a
+    second press inside a ten-second voice cycle.
+    """
+    now = now or time.time()
+    if now - _tap_clock["teardown"] < TEARDOWN_TAP_GUARD_S:
+        return (f"within {TEARDOWN_TAP_GUARD_S}s of the hold's teardown, read as a "
+                f"link-drop re-fire")
+    if now - _tap_clock["last"] < TAP_DEBOUNCE:
+        return (f"debounce ({now - _tap_clock['last']:.1f}s since the last tap, "
+                f"limit {TAP_DEBOUNCE}s)")
+    return None
 
 
 class _ScoHold:
@@ -608,7 +639,7 @@ class _ScoHold:
             self.btmon = (None, None)
             print(f"[listener] SCO hold: capture ended on its own after {held:.0f}ms "
                   f"(badge dropped the link?) -- resyncing with a teardown")
-            _tap_clock["last"] = time.time()
+            _tap_clock["teardown"] = time.time()
             force_sco_teardown()
 
     def begin(self, proc, header, btmon, btmon_buf):
@@ -674,7 +705,7 @@ class _ScoHold:
             self.up_at = None
             print(f"[listener] SCO hold: released after {held:.0f}ms ({reason})")
             if teardown:
-                _tap_clock["last"] = time.time()
+                _tap_clock["teardown"] = time.time()
                 force_sco_teardown()
 
 
@@ -1524,6 +1555,19 @@ def _stream_and_handle_response(reuse=None):
                 break
             wav_header += chunk
 
+    # --- Step 3b: start watching for taps, BEFORE the chirp ---
+    # The link is live from here, and a tap on a live link is AT+CHUP on
+    # btmon, never a key event.  btmon used to start after the chirp (step 5b
+    # until 2026-09-13), so a tap in between -- measured on TOS hardware at
+    # +749 and +744 ms, well inside this stretch -- was seen by nobody.
+    # TAP_CANCEL_GUARD_S keeps the tap that started this cycle from ending it.
+    # A reused cycle already has the hold's btmon, still running.
+    if not reused:
+        btmon_pid, btmon_fd = (None, None) if game_mode.is_set() else _start_btmon()
+        btmon_buf = ""
+    btmon_started = time.time()
+    tap_ended = False
+
     # --- Step 4: play the listening chirp ---
     # SCO is confirmed live on the INPUT side; the output side may still be
     # negotiating, which is what PRIME_MS_LISTENING covers.  Note that the
@@ -1576,16 +1620,6 @@ def _stream_and_handle_response(reuse=None):
         if reused:
             _stop_btmon(btmon_pid, btmon_fd)   # the hold's btmon came with the capture
         return
-
-    # --- Step 5b: watch for the tap that ends the recording (Phase 10) ---
-    # Started only now, after the chirp, so the tap that began this cycle --
-    # or a bounce of it -- cannot end it.  Not in Game Mode, where the cycle
-    # is a click and over in well under a second.  A reused cycle already has
-    # the hold's btmon.
-    if not reused:
-        btmon_pid, btmon_fd = (None, None) if game_mode.is_set() else _start_btmon()
-        btmon_buf = ""
-    tap_ended = False
 
     # --- Step 6: select() loop — stream audio and watch for server response ---
     #
@@ -1648,6 +1682,11 @@ def _stream_and_handle_response(reuse=None):
                     btmon_pid = btmon_fd = None
                     print("[listener] btmon ended — tap-to-end unavailable this cycle")
                 elif tapped:
+                    if time.time() - btmon_started < TAP_CANCEL_GUARD_S:
+                        print("[listener] tap IGNORED — within "
+                              f"{TAP_CANCEL_GUARD_S}s of the cycle starting, read "
+                              f"as the tap that started it")
+                        continue
                     tap_ended = True
                     signal_byte = _finish_tapped_recording(sock, ffmpeg)
                     break
@@ -1735,6 +1774,11 @@ def _stream_and_handle_response(reuse=None):
         play_wav(LISTENING_WAV, prime=False)
     else:
         force_sco_teardown()
+    # The instant another tap can be acted on.  "waiting for tap..." is the
+    # main loop reopening the input device, which with a held link is neither
+    # when readiness begins nor the path the next tap takes.
+    print(f"[listener] READY for the next tap "
+          f"({'held link' if holding else 'link down'})")
 
 
 # ---------------------------------------------------------------------------
@@ -1810,10 +1854,15 @@ def main():
                     if not tapped:
                         continue
                     if time.time() - _sco_hold.began < HOLD_TAP_GUARD_S:
-                        continue   # a bounce of the tap that ended the cycle
+                        print(f"[listener] tap IGNORED — within {HOLD_TAP_GUARD_S}s of "
+                              f"the hold starting, read as a bounce of the tap that "
+                              f"ended the cycle")
+                        continue
                     reuse = _sco_hold.claim()
                     if reuse is None:
-                        continue   # expired or died between the tap and here
+                        print("[listener] tap on a hold that has gone — taking the "
+                              "full path on the next key event")
+                        continue
                     _tap_clock["last"] = time.time()
                     print("[listener] tap (held link)")
                     stream_and_handle_response(reuse)
@@ -1831,8 +1880,14 @@ def main():
                     if (ev.type == evdev.ecodes.EV_KEY
                             and ev.code in (200, 201)
                             and ev.value == 1):
-                        if time.time() - _tap_clock["last"] < TAP_DEBOUNCE:
-                            continue   # too soon after last tap — debounce
+                        # Say so rather than dropping it silently: a tap that
+                        # produces nothing is indistinguishable from a dead
+                        # badge, which is the whole complaint behind the tap
+                        # windows this guards.
+                        blocked = tap_blocked_reason()
+                        if blocked:
+                            print(f"[listener] tap IGNORED — {blocked}")
+                            continue
                         _tap_clock["last"] = time.time()
                         print("[listener] tap")
                         stream_and_handle_response()

@@ -673,6 +673,47 @@ already does."* Off-badge harness 10/10 (lifecycle, claim hands back
 capture + btmon, expiry, capture death, drop without teardown, btmon death).
 ✅ **Verified on the badge 2026-09-13** (Captain: test passed).
 
+### Phase 12 — the tap windows: no tap vanishes silently ✓ code (2026-09-13)
+
+Ported from TOS hours after Phase 11, once TOS had **measured** what a badge
+does with a tap the relay is not ready for (TOS `controlpanel/TUNING.md`
+item 7, thirteen cued trials on PAN). Its 4.9-14.3 s of silent deafness was
+already gone — a tap during a recording ends it, a held link takes the next
+one — but three narrow windows remained, and the same three exist here.
+
+- **A tap between the link coming up and btmon starting was seen by nobody.**
+  Phase 10 started btmon *after* the listening chirp, reasoning that the tap
+  which began the cycle could not then end it. But the link is live from the
+  moment the capture opens, and from that moment a tap is `AT+CHUP` and not a
+  key event — so it fell in the gap. TOS measured taps landing there at +749
+  and +744 ms. **btmon now starts as soon as the capture is live** (step 3b,
+  before the chirp), and `TAP_CANCEL_GUARD_S` (0.3 s) keeps the starting tap
+  from ending its own cycle.
+- **The teardown guard was the tap debounce, and too long for the job.**
+  `drop()` and `_died()` bumped `_tap_clock["last"]`, so `TAP_DEBOUNCE`'s
+  2.0 s applied after an expiry teardown. On TOS that ate a deliberate tap 1
+  time in 3, while seven teardowns produced no re-fire at all. Now
+  `_tap_clock["teardown"]` with **`TEARDOWN_TAP_GUARD_S` = 0.5 s**, and both
+  refusals are decided in one place, `tap_blocked_reason()`.
+- **Every refusal now prints**, plus a `READY for the next tap` line at the
+  instant another tap can be acted on. A tap that produces nothing is
+  indistinguishable from a dead badge, which is the whole complaint these
+  guards create; the listener can at least say which guard ate it.
+
+⚠ **The third TOS window needs nothing here, and the reason is worth
+knowing.** There, a tap during the confirmation is lost because the cycle
+still holds its lock, so TOS queues it. Here the confirmation plays at step 7,
+*after* the hold has taken btmon, and the tap simply sits in the pty buffer
+until `main()` loops and `poll_taps()` drains it — the buffer is the queue,
+and it fires at the same moment TOS's queue does. One difference: TOS drops a
+queued tap older than `PENDING_TAP_MAX_S` (2 s), while a buffered one here has
+no age limit, so a tap made during a long spoken answer is honoured whenever
+the cycle ends. Acceptable, and stated so nobody reads it as an oversight.
+
+Off-badge harness 7/7 (both clocks, the hold writing the teardown clock at
+expiry and at capture death, claim still handing back capture + btmon).
+⚠ **Not yet run on a badge.**
+
 ## Resume Point (2026-07-17)
 
 **ALL PHASES (1–6) COMPLETE AND ON-BADGE VALIDATED.** The SDK
