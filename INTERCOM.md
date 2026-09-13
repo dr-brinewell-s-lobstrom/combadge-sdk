@@ -671,7 +671,7 @@ held link against ~490 ms cold; the audible gap is larger since the output
 side is warm too. Captain: *"noticeably faster, more like the Windows relay
 already does."* Off-badge harness 10/10 (lifecycle, claim hands back
 capture + btmon, expiry, capture death, drop without teardown, btmon death).
-⚠ **Not yet run on a badge in the SDK.**
+✅ **Verified on the badge 2026-09-13** (Captain: test passed).
 
 ## Resume Point (2026-07-17)
 
