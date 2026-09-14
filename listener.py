@@ -889,8 +889,76 @@ def read_voice_payload(sock):
     return path
 
 
-def receive_voice_response(sock):
+def _discard_btmon(watch):
+    """Throw away what btmon has queued: reports of a tap already acted on.
+    One bounded pass -- during SCO btmon never goes fully quiet."""
+    fd = watch.get("fd")
+    if fd is None or watch.get("dead"):
+        return
+    r, _, _ = select.select([fd], [], [], 0)
+    if r:
+        _, _, alive = _btmon_taps(fd, watch["buf"])
+        watch["buf"] = ""
+        if not alive:
+            watch["dead"] = True
+
+
+def _play_cuttable(path, watch):
+    """Play a spoken answer that a tap can cut off.  Returns the time.time()
+    of the cutting tap, or 0.0 if the answer played to the end.
+
+    A tap during the answer means "I no longer care about this response"
+    (Captain, 2026-09-13): the answer stops and the cycle ends as a cancel.
+    It does not recall the command, which has already run.  The listener is
+    single-threaded, so the playback itself watches the cycle's btmon:
+    `watch` is {"fd": ..., "buf": ...}, updated in place ("dead" is set if
+    btmon ends).  With no btmon the answer simply plays.  Mirrors TOS
+    relay-linux receive_and_play_voice (2026-09-13).
+    """
+    fd = watch.get("fd") if watch else None
+
+    def tapped(timeout):
+        if fd is None or watch.get("dead"):
+            return False
+        r, _, _ = select.select([fd], [], [], timeout)
+        if not r:
+            return False
+        hit, watch["buf"], alive = _btmon_taps(fd, watch["buf"])
+        if not alive:
+            watch["dead"] = True
+        return hit
+
+    if tapped(0):
+        print("[listener] tap — answer cut off before it began")
+        return time.time()
+    t0 = time.monotonic()
+    proc = subprocess.Popen(["pw-play", "--target", SINK, "--media-role=communication",
+                             "--volume", "0.5", path],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    while proc.poll() is None:
+        if fd is None or watch.get("dead"):
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            break
+        if tapped(0.05):
+            cut_at = time.time()
+            terminate_ffmpeg(proc)   # SIGTERM, escalated to SIGKILL -- any process
+            print(f"[listener] tap — answer cut off after {time.monotonic() - t0:.2f}s")
+            return cut_at
+        if time.monotonic() - t0 > 15:
+            proc.kill()
+            proc.wait()
+            break
+    check_playback(path, time.monotonic() - t0)
+    return 0.0
+
+
+def receive_voice_response(sock, watch=None):
     """Read a framed voice response WAV from the server and play it.
+    Returns the time of a tap that cut it off (_play_cuttable), else 0.0.
 
     Called after the leading b'v' signal byte has already been consumed
     by the caller (stream_and_handle_response).
@@ -906,9 +974,9 @@ def receive_voice_response(sock):
     """
     path = read_voice_payload(sock)
     if not path:
-        return
+        return 0.0
     try:
-        play_wav(path, prime=False)
+        return _play_cuttable(path, watch)
     finally:
         try:
             os.unlink(path)
@@ -1511,7 +1579,7 @@ def _drain_capture(ffmpeg):
     threading.Thread(target=pump, daemon=True).start()
 
 
-def _play_after_tap_chirp(path, tap_at, label):
+def _play_after_tap_chirp(path, tap_at, label, watch=None):
     """Play a sound in a tap-ended cycle, once the badge's own tap chirp is
     out of the way.
 
@@ -1523,6 +1591,11 @@ def _play_after_tap_chirp(path, tap_at, label):
     2026-09-13).  So the swept arrangement is reused unchanged: tap +
     WARM_CHIRP_WAIT_S, the listening prime, then the sound.  Dated from the
     TAP, so a verdict that was slow to arrive waits less, or not at all.
+
+    With `watch` (a spoken answer) a further tap cuts it off: returns that
+    tap's time, else 0.0.  btmon's backlog is discarded first -- it holds
+    only the tap that ended the recording, which must not cut its own
+    answer.  A second tap made during the wait is lost with it, as on TOS.
     """
     wait = tap_at + WARM_CHIRP_WAIT_S - time.time()
     if wait > 0:
@@ -1530,13 +1603,18 @@ def _play_after_tap_chirp(path, tap_at, label):
     print(f"[listener] after the tap chirp: {label} at "
           f"+{(time.time() - tap_at) * 1000:.0f}ms")
     play_silence(PRIME_MS_LISTENING)
-    play_wav(path, prime=False)
+    if watch is None:
+        play_wav(path, prime=False)
+        return 0.0
+    _discard_btmon(watch)
+    return _play_cuttable(path, watch)
 
 
-def _finish_tapped_recording(sock, tap_at):
+def _finish_tapped_recording(sock, tap_at, watch=None):
     """A tap ended the recording: half-close, and wait up to
-    TAP_FINALIZE_WAIT_S for the server's verdict.  Returns the terminal
-    signal byte, or None.
+    TAP_FINALIZE_WAIT_S for the server's verdict.  Returns (the terminal
+    signal byte or None, cut_at): cut_at is the time of a further tap that
+    cut the answer off, else 0.0.
 
     The half-close is the end of utterance the server always sees, so it
     finalizes on the audio it has: a command it recognises still runs, by
@@ -1554,29 +1632,30 @@ def _finish_tapped_recording(sock, tap_at):
         remaining = deadline - time.time()
         if remaining <= 0:
             print(f"[listener] no verdict within {TAP_FINALIZE_WAIT_S}s")
-            return None
+            return None, 0.0
         r, _, _ = select.select([sock], [], [], remaining)
         if not r:
             continue
         try:
             sig = sock.recv(1)
         except OSError:
-            return None
+            return None, 0.0
         if not sig:
-            return None
+            return None, 0.0
         if sig == b"k":
             continue
+        cut_at = 0.0
         if sig == b"v":
             path = read_voice_payload(sock)
             if path:
                 try:
-                    _play_after_tap_chirp(path, tap_at, "answer")
+                    cut_at = _play_after_tap_chirp(path, tap_at, "answer", watch)
                 finally:
                     try:
                         os.unlink(path)
                     except OSError:
                         pass
-        return sig
+        return sig, cut_at
 
 
 def stream_and_handle_response(reuse=None):
@@ -1661,6 +1740,7 @@ def _stream_and_handle_response(reuse=None):
     btmon_started = time.time()
     tap_ended = False
     tap_at = 0.0
+    answer_cut = False   # a tap cut the spoken answer off; the cycle ends as a cancel
 
     # --- Step 4: play the listening chirp ---
     # SCO is confirmed live on the INPUT side; the output side may still be
@@ -1779,7 +1859,17 @@ def _stream_and_handle_response(reuse=None):
                 except OSError:
                     pass
                 if sig == b"v":
-                    receive_voice_response(sock)   # read and play the voice WAV
+                    # Read and play the voice WAV; a tap during it cuts it off.
+                    watch = {"fd": btmon_fd, "buf": btmon_buf}
+                    cut_at = receive_voice_response(sock, watch)
+                    btmon_buf = watch["buf"]
+                    if watch.get("dead"):
+                        _stop_btmon(btmon_pid, btmon_fd)
+                        btmon_pid = btmon_fd = None
+                    if cut_at:
+                        answer_cut = tap_ended = True
+                        tap_at = cut_at
+                        _drain_capture(ffmpeg)   # the link outlives the cut by one sound
                 break   # done regardless of signal type
 
             # Checked AFTER the socket, so a verdict already waiting wins.
@@ -1798,7 +1888,15 @@ def _stream_and_handle_response(reuse=None):
                     tap_ended = True
                     tap_at = time.time()
                     _drain_capture(ffmpeg)   # the link outlives the tap by one sound
-                    signal_byte = _finish_tapped_recording(sock, tap_at)
+                    watch = {"fd": btmon_fd, "buf": btmon_buf}
+                    signal_byte, cut_at = _finish_tapped_recording(sock, tap_at, watch)
+                    btmon_buf = watch["buf"]
+                    if watch.get("dead"):
+                        _stop_btmon(btmon_pid, btmon_fd)
+                        btmon_pid = btmon_fd = None
+                    if cut_at:
+                        answer_cut = True
+                        tap_at = cut_at
                     break
 
             if ffmpeg.stdout in r:
@@ -1816,7 +1914,16 @@ def _stream_and_handle_response(reuse=None):
                         if sig:
                             signal_byte = sig
                             if sig == b"v":
-                                receive_voice_response(sock)
+                                watch = {"fd": btmon_fd, "buf": btmon_buf}
+                                cut_at = receive_voice_response(sock, watch)
+                                btmon_buf = watch["buf"]
+                                if watch.get("dead"):
+                                    _stop_btmon(btmon_pid, btmon_fd)
+                                    btmon_pid = btmon_fd = None
+                                if cut_at:
+                                    answer_cut = tap_ended = True
+                                    tap_at = cut_at
+                                    _drain_capture(ffmpeg)
                     except OSError:
                         pass
                     break
@@ -1859,8 +1966,9 @@ def _stream_and_handle_response(reuse=None):
         # drained for it -- reaped even if playing fails, since a stranded
         # capture on bluez_input is a second consumer on the next cycle's link.
         try:
-            if signal_byte in (None, b"f"):
-                # a tap ended it and nothing came of it — "Cancelled."
+            if answer_cut or signal_byte in (None, b"f"):
+                # a tap ended it and nothing came of it, or cut its answer
+                # off — "Cancelled."
                 _play_after_tap_chirp(CANCELLED_WAV, tap_at, "cancelled.wav")
             elif signal_byte == b"c":
                 _play_after_tap_chirp(ACK_WAV, tap_at, "ack")

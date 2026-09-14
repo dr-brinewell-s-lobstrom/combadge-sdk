@@ -705,22 +705,24 @@ one — but three narrow windows remained, and the same three exist here.
   indistinguishable from a dead badge, which is the whole complaint these
   guards create; the listener can at least say which guard ate it.
 
-⚠ **The third TOS window is NOT queued here — corrected on the badge.** In
-TOS a tap during the confirmation is queued and run once the cycle frees its
-lock. This section used to say the SDK needed nothing, because the tap would
-sit in btmon's pty buffer until `main()` looped and then fire. **It does not
-fire.** The buffered `AT+CHUP` is read the instant the hold begins, which is
-inside `HOLD_TAP_GUARD_S`, so it is refused as a bounce of the tap that
-ended the cycle. Measured 2026-09-13 with a tap during the spoken answer to
-"computer time", four times: `tap IGNORED — within 0.5s of the hold
-starting`.
+⚠ **The third TOS window: queued during a confirmation, and a tap during a
+spoken answer now cuts it — both verified on the badge.** In TOS a tap during
+the confirmation is queued and run once the cycle frees its lock. Here the
+tap waits in btmon's pty buffer and is read when `main()` loops, and whether
+it fires depends on `HOLD_TAP_GUARD_S`, which counts from the hold's start:
 
-⚖ **Left as it is, by the Captain's ruling:** *"user expectation of tap
-during playback would be that it's ignored - if it finishes playback and then
-says listening, that's OK too … either is fine."* The refusal is printed,
-so the tap does not vanish silently. Nothing announces it, and nothing
-should: saying "Cancelled." would be false, because the command has already
-run.
+- **During a confirmation clip, it fires.** The hold begins before the clip,
+  and the SDK's clips are spoken (1.4–1.6 s plus the prime), so the guard has
+  expired by the time the tap is read. A tap during "Command failed." was
+  accepted `reused after 1917ms` and recorded normally (2026-09-13). Two
+  differences from TOS remain, both accepted: the cue's 1.2 s wait counts
+  from when the queued cycle starts rather than from the tap, so "Listening."
+  comes later than it needs to, and nothing logs the tap as queued.
+- **During a spoken answer, it was refused, and is now a cut.** That tap was
+  read the instant the hold began, inside the guard: `tap IGNORED — within
+  0.5s of the hold starting`, four times. The Captain first ruled that
+  acceptable, then ruled that such a tap should cancel. It now cuts the
+  answer off; see the end of Phase 12.
 
 Off-badge harness 7/7 (both clocks, the hold writing the teardown clock at
 expiry and at capture death, claim still handing back capture + btmon).
@@ -991,6 +993,50 @@ warm reused tap was re-checked and is unchanged. Off-badge harness 12/12
 difference: TOS reaps the capture *before* a spoken answer rather than
 draining it underneath, because TOS recorded a corrupted-packet flood with a
 capture open under a voice answer (2026-08-23).
+
+### ✅ A tap during the spoken answer cuts it off
+
+The Captain's ruling, 2026-09-13: a tap during the answer means *"i no longer
+care about this response"*. It does not recall the command, which has
+already run; it cancels the request. *"If it cuts it off and plays
+cancelled.wav that would seem to be best."* Ported from TOS relay-linux the
+same night, where it was badge-verified first.
+
+- **`_play_cuttable()`** plays the answer through `Popen`. The listener is
+  single-threaded, so the playback loop itself selects on the cycle's btmon
+  every 50 ms. A tap stops `pw-play` and returns the tap's time; a tap already
+  waiting cuts before playback starts. With no btmon the answer just plays.
+- **All three answer paths use it:** the normal `b'v'`, the BrokenPipe
+  recovery, and an answer after a tap-ended recording. On that last path,
+  `_discard_btmon()` first throws away btmon's backlog, which holds only the
+  tap that ended the recording, so it cannot cut its own answer. A second tap
+  made during the 1.2 s wait is lost with it, as on TOS.
+- **A cut ends as a cancel:** the capture is drained, "Cancelled." plays via
+  `_play_after_tap_chirp` dated from the cutting tap, then the link is torn
+  down. The cycle does not hold.
+
+**Verified on the badge 2026-09-13** (PAN, `:60`):
+
+| test | log | heard |
+|---|---|---|
+| tap mid-answer | `answer cut off after 0.88s` → `cancelled.wav at +1200ms` | badge chirp, "Cancelled.", link-drop chirp |
+| tap as the answer begins | `answer cut off after 0.92s` | answer cut, badge chirp, "Cancelled.", link-drop chirp |
+| tap just after "computer time" | `ending the recording` → `answer at +1200ms` | badge chirp, the whole time, link-drop chirp |
+| no extra tap | `lingering` → `linger expired` | the time, ~5 s, link-drop chirp |
+| cancel a silent recording | `cancelled.wav at +1200ms` | badge chirp, "Cancelled.", link-drop chirp |
+| warm tap | `reused after 3971ms` | badge chirp, "Listening.", the time |
+| tap during "Command failed." | `reused after 1917ms` | badge chirp, "Listening.", the time |
+
+⚠ **Not reached on the badge:** a second tap during an answer that follows a
+tap-ended recording. The run meant for it produced an ordinary mid-answer cut
+(`cut off after 1.09s`, with no `ending the recording` before it). That path
+is covered only by the off-badge harness.
+
+Off-badge harness 8/8. It covers an answer played in full with no tap; a tap
+at 0.5 s cutting it and ending the player; a waiting tap cutting before
+playback; no btmon meaning no cut; a stale report not cutting its own answer
+while a fresh tap does; and `_finish_tapped_recording` returning
+`(b'v', cut_at)` and `(b'f', 0.0)`.
 
 ## Resume Point (2026-07-17)
 
