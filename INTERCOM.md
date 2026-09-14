@@ -986,9 +986,11 @@ warm reused tap was re-checked and is unchanged. Off-badge harness 12/12
 (timing, late verdict, `b'f'` / no verdict / `b'v'`, temp-file cleanup, an
 8 MB capture pipe drained without blocking).
 
-**TOS relay-linux has the same shape and is unexamined:** its tap-ended cycle
-plays `cancelled.wav` after `AT+CHUP` too. Its cancel is a 309 ms tone,
-which may survive where speech does not, so check it by ear before porting.
+**TOS relay-linux had the same fault, and got the same fix the same night**
+(`wait_out_tap_chirp`, badge-verified; TOS `relay-linux/RELAY.md`). One
+difference: TOS reaps the capture *before* a spoken answer rather than
+draining it underneath, because TOS recorded a corrupted-packet flood with a
+capture open under a voice answer (2026-08-23).
 
 ## Resume Point (2026-07-17)
 
