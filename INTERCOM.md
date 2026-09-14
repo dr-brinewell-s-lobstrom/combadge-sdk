@@ -602,8 +602,9 @@ closes a channel.**
 - **A command recording** now watches btmon too. The monitor starts after
   the listening chirp, so the starting tap cannot end its own cycle, and it is
   handed to `run_channel` if the tap answers a hail. It is skipped in Game
-  Mode. On a tap, `_finish_tapped_recording` stops ffmpeg, half-closes, and
-  waits `TAP_FINALIZE_WAIT_S` (1.5 s) for the verdict. A verdict plays as
+  Mode. On a tap, `_finish_tapped_recording` half-closes and waits
+  `TAP_FINALIZE_WAIT_S` (1.5 s) for the verdict. (The capture now runs on,
+  drained, until the cycle's last sound has played; see the end of Phase 12.) A verdict plays as
   usual, so a dictation ended by tap is kept and confirmed. `b'f'` or no
   verdict plays **"Cancelled."** (`cancelled.wav`, new, spoken with `tts.sh`
   like the other SDK clips; TOS plays a tone here).
@@ -621,7 +622,10 @@ Behaviour-tested off-badge, 8/8: `_finish_tapped_recording` against a real
 socketpair (b'f' returned in 0.05 s; keepalive then b'l' in 0.10 s; no verdict
 gives up at 1.51 s), and `_btmon_taps` against a real pipe (the `AT+CHUP`
 hexdump line with ANSI codes, `AT+BVRA=1` split across two reads, unrelated
-HCI traffic, EOF). ⚠ **Not yet run on the badge in the SDK.**
+HCI traffic, EOF). ✅ **Verified on the badge 2026-09-13** (PAN, `:60`): a
+tap ended a silent recording with "Cancelled.", and a tap straight after
+"computer time" still delivered the time. Both sounds were inaudible until
+the fix at the end of Phase 12.
 
 **Single-tap channel close, verified in TOS on the badge (2026-09-12),**
 across every relay pairing: hailed mobile → Windows, closed from mobile;
@@ -674,7 +678,7 @@ already does."* Off-badge harness 10/10 (lifecycle, claim hands back
 capture + btmon, expiry, capture death, drop without teardown, btmon death).
 ✅ **Verified on the badge 2026-09-13** (Captain: test passed).
 
-### Phase 12 — the tap windows: no tap vanishes silently ✓ code (2026-09-13)
+### Phase 12 — the tap windows: no tap vanishes silently ✓ ON-BADGE (2026-09-13)
 
 Ported from TOS hours after Phase 11, once TOS had **measured** what a badge
 does with a tap the relay is not ready for (TOS `controlpanel/TUNING.md`
@@ -701,19 +705,30 @@ one — but three narrow windows remained, and the same three exist here.
   indistinguishable from a dead badge, which is the whole complaint these
   guards create; the listener can at least say which guard ate it.
 
-⚠ **The third TOS window needs nothing here, and the reason is worth
-knowing.** There, a tap during the confirmation is lost because the cycle
-still holds its lock, so TOS queues it. Here the confirmation plays at step 7,
-*after* the hold has taken btmon, and the tap simply sits in the pty buffer
-until `main()` loops and `poll_taps()` drains it — the buffer is the queue,
-and it fires at the same moment TOS's queue does. One difference: TOS drops a
-queued tap older than `PENDING_TAP_MAX_S` (2 s), while a buffered one here has
-no age limit, so a tap made during a long spoken answer is honoured whenever
-the cycle ends. Acceptable, and stated so nobody reads it as an oversight.
+⚠ **The third TOS window is NOT queued here — corrected on the badge.** In
+TOS a tap during the confirmation is queued and run once the cycle frees its
+lock. This section used to say the SDK needed nothing, because the tap would
+sit in btmon's pty buffer until `main()` looped and then fire. **It does not
+fire.** The buffered `AT+CHUP` is read the instant the hold begins, which is
+inside `HOLD_TAP_GUARD_S`, so it is refused as a bounce of the tap that
+ended the cycle. Measured 2026-09-13 with a tap during the spoken answer to
+"computer time", four times: `tap IGNORED — within 0.5s of the hold
+starting`.
+
+⚖ **Left as it is, by the Captain's ruling:** *"user expectation of tap
+during playback would be that it's ignored - if it finishes playback and then
+says listening, that's OK too … either is fine."* The refusal is printed,
+so the tap does not vanish silently. Nothing announces it, and nothing
+should: saying "Cancelled." would be false, because the command has already
+run.
 
 Off-badge harness 7/7 (both clocks, the hold writing the teardown clock at
 expiry and at capture death, claim still handing back capture + btmon).
-⚠ **Not yet run on a badge.**
+✅ **On the badge 2026-09-13** (PAN, `:60`): refusals print; a tap 1 s after
+the hold's teardown is accepted where the old 2.0 s guard refused it (its
+cue clipped to "ning", TOS's accepted 7d case); and taps that end a
+recording work. The narrow window A was not hit deliberately: no tap landed
+between link-up and the end of the chirp.
 
 ### ⚠ Found on the badge, and fixed: the ready cue said "Listening."
 
@@ -937,6 +952,43 @@ before the detected chirp ends, and runs louder than the reference +12 dB (the
 backstop for the 3 trials of 10 where the chirp itself was not detected).
 **The microphone is a proxy for the Captain's ear, and when they disagree the
 ear wins.**
+
+### ✅ Found on the badge, and fixed: a tap-ended cycle played into the tap chirp
+
+The Phase 12 badge test turned it up at once. A tap that ends a recording
+always lands on a **live** link, so the badge chirps ~0.5 s later, exactly
+as it does on a reused tap. The cycle then played its last sound ~0.3 s
+after the tap, straight into that chirp:
+
+- **Nothing said, then a tap:** the Captain heard two hardware chirps and no
+  "Cancelled." at all.
+- **"computer time", then a tap the instant it was said:** the badge chirp
+  stepped on the answer, which was *"only slightly partially"* heard.
+
+**Fix, and it reuses the swept numbers rather than inventing new ones.**
+`_play_after_tap_chirp()` plays every sound in a tap-ended cycle ("Cancelled.",
+a spoken answer, the ack) at **tap + `WARM_CHIRP_WAIT_S`, then the
+160 ms listening prime, then the sound**. That is the arrangement the warm-wait
+sweep verified. It is dated from the tap, so a verdict that arrives late
+waits less.
+
+⚠ **The capture is no longer killed at the tap.** `_drain_capture()` reads
+and discards it until that last sound has played, and it is reaped straight
+after, even if playback fails. On Linux the capture *is* the link; a 1.2 s
+idle gap on a hot link is the documented way to clip what follows. A
+tap-ended cycle still never holds, so a cancel drops the link at once, as
+before.
+
+**Verified on the badge 2026-09-13** (PAN, `:60`): `after the tap chirp:
+cancelled.wav at +1200ms`, *"hardware chirp + 'cancelled' + another hardware
+chirp"*; `answer at +1200ms`, *"time response + another chirp, clean"*. The
+warm reused tap was re-checked and is unchanged. Off-badge harness 12/12
+(timing, late verdict, `b'f'` / no verdict / `b'v'`, temp-file cleanup, an
+8 MB capture pipe drained without blocking).
+
+**TOS relay-linux has the same shape and is unexamined:** its tap-ended cycle
+plays `cancelled.wav` after `AT+CHUP` too. Its cancel is a 309 ms tone,
+which may survive where speech does not, so check it by ear before porting.
 
 ## Resume Point (2026-07-17)
 

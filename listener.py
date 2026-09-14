@@ -1493,18 +1493,58 @@ def run_channel(sock, ffmpeg, btmon=(None, None)):
 # Core tap cycle: establish audio, stream to server, play response
 # ---------------------------------------------------------------------------
 
-def _finish_tapped_recording(sock, ffmpeg):
-    """A tap ended the recording: stop the mic, half-close, and wait up to
+def _drain_capture(ffmpeg):
+    """Keep reading a capture that no longer feeds anything, so the link it
+    holds stays live.  The thread ends when ffmpeg does.
+
+    On Linux the capture IS the link (see _ScoHold), and an unread pipe fills
+    in ~2 s and blocks ffmpeg.  A tap-ended cycle still has one sound to play
+    after the tap -- see _play_after_tap_chirp -- and must not let the link
+    go idle during the wait in front of it.
+    """
+    def pump():
+        try:
+            while ffmpeg.stdout.read(4096):
+                pass
+        except Exception:
+            pass
+    threading.Thread(target=pump, daemon=True).start()
+
+
+def _play_after_tap_chirp(path, tap_at, label):
+    """Play a sound in a tap-ended cycle, once the badge's own tap chirp is
+    out of the way.
+
+    A tap that ends a recording always lands on a LIVE link, so the badge
+    chirps ~0.5 s later and keeps its speaker for a while after -- the same
+    collision WARM_CHIRP_WAIT_S settled for reused taps.  Played at once,
+    "Cancelled." was never heard and the answer to a command spoken just
+    before the tap was clipped to a fragment (Captain, on the badge,
+    2026-09-13).  So the swept arrangement is reused unchanged: tap +
+    WARM_CHIRP_WAIT_S, the listening prime, then the sound.  Dated from the
+    TAP, so a verdict that was slow to arrive waits less, or not at all.
+    """
+    wait = tap_at + WARM_CHIRP_WAIT_S - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    print(f"[listener] after the tap chirp: {label} at "
+          f"+{(time.time() - tap_at) * 1000:.0f}ms")
+    play_silence(PRIME_MS_LISTENING)
+    play_wav(path, prime=False)
+
+
+def _finish_tapped_recording(sock, tap_at):
+    """A tap ended the recording: half-close, and wait up to
     TAP_FINALIZE_WAIT_S for the server's verdict.  Returns the terminal
     signal byte, or None.
 
     The half-close is the end of utterance the server always sees, so it
     finalizes on the audio it has: a command it recognises still runs, by
     design -- a tap abandons a recording, it does not recall a command.
-    A b'v' answer is played here, as in the main loop.
+    A b'v' answer is played here, after the badge's tap chirp.  The caller
+    keeps the capture drained until the cycle's last sound has played.
     """
     print("[listener] tap — ending the recording, awaiting the verdict")
-    terminate_ffmpeg(ffmpeg)
     try:
         sock.shutdown(socket.SHUT_WR)
     except OSError:
@@ -1527,7 +1567,15 @@ def _finish_tapped_recording(sock, ffmpeg):
         if sig == b"k":
             continue
         if sig == b"v":
-            receive_voice_response(sock)
+            path = read_voice_payload(sock)
+            if path:
+                try:
+                    _play_after_tap_chirp(path, tap_at, "answer")
+                finally:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
         return sig
 
 
@@ -1612,6 +1660,7 @@ def _stream_and_handle_response(reuse=None):
         btmon_buf = ""
     btmon_started = time.time()
     tap_ended = False
+    tap_at = 0.0
 
     # --- Step 4: play the listening chirp ---
     # SCO is confirmed live on the INPUT side; the output side may still be
@@ -1747,7 +1796,9 @@ def _stream_and_handle_response(reuse=None):
                               f"as the tap that started it")
                         continue
                     tap_ended = True
-                    signal_byte = _finish_tapped_recording(sock, ffmpeg)
+                    tap_at = time.time()
+                    _drain_capture(ffmpeg)   # the link outlives the tap by one sound
+                    signal_byte = _finish_tapped_recording(sock, tap_at)
                     break
 
             if ffmpeg.stdout in r:
@@ -1770,6 +1821,10 @@ def _stream_and_handle_response(reuse=None):
                         pass
                     break
 
+    except BaseException:
+        if tap_ended:
+            terminate_ffmpeg(ffmpeg)   # the drained capture must not outlive a failed cycle
+        raise
     finally:
         # HOLD OR REAP, decided once, here, before the confirmation plays.
         #
@@ -1780,24 +1835,37 @@ def _stream_and_handle_response(reuse=None):
         # never answered gets the teardown, as before), only outside Game
         # Mode (its cue IS the teardown chirp), and only with a live btmon --
         # a held link emits no key events, so without btmon the badge would
-        # be deaf for the whole linger.  A tap-ended cycle never holds: that
-        # path reaped the capture before waiting for its verdict.
+        # be deaf for the whole linger.  A tap-ended cycle never holds -- a
+        # cancel usually means the user is going elsewhere (TOS ruling,
+        # 2026-09-13) -- but its capture is kept, drained, until step 7's
+        # sound has played, and reaped just after it.
         #
         # Reap otherwise: ffmpeg.terminate() sends SIGTERM, escalated to
         # SIGKILL if it doesn't exit within 0.5 s.
         holding = (SCO_HOLD_MS > 0 and signal_byte is not None
                    and not game_mode.is_set() and btmon_fd is not None
-                   and ffmpeg.poll() is None)
+                   and not tap_ended and ffmpeg.poll() is None)
         if holding:
             _sco_hold.begin(ffmpeg, wav_header, (btmon_pid, btmon_fd), btmon_buf)
         else:
-            terminate_ffmpeg(ffmpeg)
+            if not tap_ended:
+                terminate_ffmpeg(ffmpeg)
             _stop_btmon(btmon_pid, btmon_fd)
         sock.close()
 
     # --- Step 7: play ack/nack, or nothing if voice response was already played ---
-    if tap_ended and signal_byte in (None, b"f"):
-        play_wav(CANCELLED_WAV) # a tap ended it and nothing came of it — "Cancelled."
+    if tap_ended:
+        # After the badge's tap chirp, then reap the capture that was kept
+        # drained for it -- reaped even if playing fails, since a stranded
+        # capture on bluez_input is a second consumer on the next cycle's link.
+        try:
+            if signal_byte in (None, b"f"):
+                # a tap ended it and nothing came of it — "Cancelled."
+                _play_after_tap_chirp(CANCELLED_WAV, tap_at, "cancelled.wav")
+            elif signal_byte == b"c":
+                _play_after_tap_chirp(ACK_WAV, tap_at, "ack")
+        finally:
+            terminate_ffmpeg(ffmpeg)
     elif signal_byte == b"c":
         play_wav(ACK_WAV)       # command matched and executed — success chirp
     elif signal_byte == b"g":
