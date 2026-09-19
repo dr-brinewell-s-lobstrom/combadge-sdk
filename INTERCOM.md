@@ -439,10 +439,17 @@ The SDK is *more* exposed than TOS was, because `SDK_CHANNEL_GATE_CLOSE` can be
 pinned by env var while `SDK_CHANNEL_GATE` is tuned independently. There is now
 a load-time clamp (to 40% of open, with a message saying what it did) plus a
 warning when `CLOSE` falls below **8**, the floor below which measured room noise
-keeps the hold timer alive. The default is left as the **auto 40%-of-`OPEN`
+keeps the hold timer alive. ~~The default is left as the **auto 40%-of-`OPEN`
 rule** rather than TOS's pinned 16, because the rule survives someone re-tuning
 `OPEN` and a pinned number would not — that gives `CLOSE` = 20 here against
-TOS's 16, a small difference in the safe direction.
+TOS's 16, a small difference in the safe direction.~~
+
+**Changed 2026-09-18 (Captain): the default is now TOS's pinned 16**, the value
+tested at 5 ft and in one room, in place of the untested 20. The cost is the one
+the struck reasoning names: 16 does not follow `OPEN`. The clamp covers the
+dangerous direction. Lower `SDK_CHANNEL_GATE` to 16 or below without also
+setting `SDK_CHANNEL_GATE_CLOSE`, and close falls back to 40% of open, with the
+warning. Not yet tested on the badge.
 
 ⚠ Both warnings are **ASCII-only on purpose**: they run at module import, before
 `__main__` reconfigures stdout to UTF-8, so a non-ASCII character in them is a
@@ -488,7 +495,7 @@ magnitude entirely.
 |---|---|---|
 | `SDK_CHANNEL_GAIN` | **3** | calibration — per badge/host. Raise if the peer is too quiet |
 | `SDK_CHANNEL_GATE` | **50** | calibration — per badge/room/transport. The one to tune first |
-| `SDK_CHANNEL_GATE_CLOSE` | 40% of `GATE` (= 20) | derived; clamped if >= `GATE`, warns below 8 |
+| `SDK_CHANNEL_GATE_CLOSE` | **16** | calibration — TOS's tested value, pinned 2026-09-18 (was 40% of `GATE` = 20). Clamped to 40% of `GATE` if >= `GATE`; warns below 8 |
 | `SDK_CHANNEL_GATE_HOLD` | **0.5** | finding — floor is 0.4 |
 | `SDK_CHANNEL_GATE_FADE_MS` | 10 | structural |
 | `SDK_CHANNEL_HALF_DUPLEX_MS` | **150** | finding — **do not go to 0** (Phase 8) |

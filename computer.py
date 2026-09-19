@@ -1657,26 +1657,27 @@ CHANNEL_GATE_OPEN  = float(os.environ.get("SDK_CHANNEL_GATE", "50"))
                                   # a 128 ms average smooths away clear the
                                   # bar outright).  TOS fixed this with a
                                   # fixed-interval window; the SDK has not.
-CHANNEL_GATE_CLOSE = float(os.environ.get("SDK_CHANNEL_GATE_CLOSE",
-                                            str(CHANNEL_GATE_OPEN * 0.4)))
+CHANNEL_GATE_CLOSE = float(os.environ.get("SDK_CHANNEL_GATE_CLOSE", "16"))
                                   # Hysteresis: once open, the gate stays
                                   # open until the average drops below THIS
                                   # (lower) threshold for CHANNEL_GATE_HOLD
                                   # seconds.  A single-threshold gate flaps
                                   # on marginal signals (distant audio, quiet
                                   # room speech) — the second threshold
-                                  # blocks that flap.  Env-var default is
-                                  # 40% of OPEN, which auto-scales when you
-                                  # tune OPEN; override to pin it per-room.
+                                  # blocks that flap.
                                   #
-                                  # The rig this was calibrated on runs an
-                                  # explicit 16 against OPEN 50 (32%) rather
-                                  # than the 20 this formula gives.  The
-                                  # difference is small and 20 errs toward
-                                  # shutting sooner, which is the safe
-                                  # direction; the auto rule is kept because
-                                  # it survives someone re-tuning OPEN and a
-                                  # pinned 16 would not.
+                                  # 16, pinned: the value the calibration
+                                  # rig actually runs (TOS.conf, against
+                                  # OPEN 50), and the one tested at 5 ft and
+                                  # in one room.  Until 2026-09-18 this was
+                                  # 40% of OPEN (= 20), kept because a rule
+                                  # survives someone re-tuning OPEN and a
+                                  # pinned number does not.  The Captain
+                                  # chose parity with the tested value
+                                  # instead.  ⚠ If you lower SDK_CHANNEL_GATE,
+                                  # lower this with it: at OPEN <= 16 the
+                                  # clamp below fires and falls back to 40%
+                                  # of OPEN.
 
 # ⚠ INVERTED HYSTERESIS IS AN OSCILLATOR, NOT A GATE.  If CLOSE >= OPEN the
 # gate can never shut: it opens at OPEN, and the average is already above CLOSE
