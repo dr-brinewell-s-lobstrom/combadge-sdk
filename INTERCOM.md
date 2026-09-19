@@ -449,7 +449,10 @@ tested at 5 ft and in one room, in place of the untested 20. The cost is the one
 the struck reasoning names: 16 does not follow `OPEN`. The clamp covers the
 dangerous direction. Lower `SDK_CHANNEL_GATE` to 16 or below without also
 setting `SDK_CHANNEL_GATE_CLOSE`, and close falls back to 40% of open, with the
-warning. Not yet tested on the badge.
+warning. The pair 50/16 is the one TOS has run and heard through every
+intercom session since 2026-09-07, including the 5 ft settlement and the
+same-room retest. How the two relate, and how to move them together: *How
+`GATE` and `CLOSE` relate* under the defaults table below.
 
 ⚠ Both warnings are **ASCII-only on purpose**: they run at module import, before
 `__main__` reconfigures stdout to UTF-8, so a non-ASCII character in them is a
@@ -511,6 +514,42 @@ starting point and not a universal default.
 **As a whole this set is a tested configuration**, not an assembly of
 independently-chosen numbers: two badges held a clean channel on it down to
 about 5 ft. Change one at a time and watch the gate log.
+
+#### How `GATE` and `CLOSE` relate — tune them as a pair
+
+The gate has two thresholds and they do different jobs. **`SDK_CHANNEL_GATE`
+(open) decides what starts a transmission. `SDK_CHANNEL_GATE_CLOSE` decides
+when it ends.** Once open, the gate stays open until the level has been below
+close for `SDK_CHANNEL_GATE_HOLD` (0.5 s). Both are in the same units, the
+mean |sample| over a 128 ms window. That is one 4096-byte read from the stock
+transceiver, and the same figure the server's `channel gate:` log line prints.
+
+The defaults, against what was measured on the calibration rig (two badges,
+one quiet home, TOS `controlpanel/TUNING.md` §4b and Part I):
+
+| measured at the badge mic | level | what it means for the pair |
+|---|---|---|
+| room noise | max **5.6** | close must sit clearly above it or the gate never shuts. 16 is about 3x |
+| this badge's own speaker, still ringing in its mic after the far side stops talking | peaks **~18-36** | open must sit above it or every transmission bounces back (Phase 8). 50 does |
+| quietest quarter of the talker's speech | **~90** (p25) | open must sit below it or quiet words are lost. 50 does |
+| typical speech | **145** median, 370 at p90 | comfortably above both |
+
+So the working band is **noise floor < close < bounce level < open < quiet
+speech**: 5.6 < 16 < ~36 < 50 < 90. Two rules keep it working:
+
+1. **Close strictly below open.** Equal or above is an oscillator (above).
+   The code clamps it to 40% of open and warns.
+2. **Close clearly above the room.** Below 8 the gate may never shut, and
+   floor control releases only on a close, so one badge can hold the channel.
+   The code warns and does not clamp.
+
+**Moving them.** Tune open first. Raise `SDK_CHANNEL_GAIN` first if the
+far side is only *quiet*: gain is applied after the gate decision, so it
+makes speech louder without changing what opens the gate. Then set close
+**explicitly** to about a third of open (16/50 = 32%). It is pinned, not
+derived, so it will not follow open on its own. If you lower open
+toward 20, close ends up near the noise floor. That is the point to measure
+your own room rather than keep lowering.
 
 ### Phase 8 — Same-room use, no more static loops: muted audio no longer opens the gate ✓ (2026-09-11; verified in TOS and on-badge in the SDK)
 
