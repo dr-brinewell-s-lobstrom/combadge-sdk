@@ -1084,6 +1084,78 @@ playback; no btmon meaning no cut; a stale report not cutting its own answer
 while a fresh tap does; and `_finish_tapped_recording` returning
 `(b'v', cut_at)` and `(b'f', 0.0)`.
 
+### Phase 13 — Two badges on one host; answering a hail while it plays ✓ ON-BADGE (2026-09-26)
+
+Until now the intercom's two ends were always two relay hosts, one badge
+each. `multiuser/PI.md` phase 1 made one host carry both: `transceiver.py`
+supervises every badge paired to the host, one per Bluetooth adapter, one
+`listener.py` each (README §4). Nothing in the protocol changed. The server
+already told badges apart by the MAC in the handshake, never by address, so
+two listeners on one IP are two independent sessions. Verified on PAN with
+two UB500s and the server on CUBE: commands from both badges at once, each
+answer on its own badge; a hail into a badge busy with a command; the channel
+both ways.
+
+The first on-badge runs of the combined system turned up four intercom faults.
+Three were new here; one had been there all along:
+
+- **A long hail could not be answered: the caller hung up first.** The
+  caller's listener abandons a recording `RECORD_MAX_S` (13 s) after it
+  starts unless a `b'k'` slides the deadline. The server sent its first
+  keepalive 4 s into capture, and a hail phrase can match late in a long
+  utterance. A 10 s hail ran the caller out of time: its listener closed, and
+  the server withdrew the hail (`caller closed during answer window`, then
+  `b'E'`) before the target could answer it. **The first keepalive now goes
+  out on the first beat** of capture and of the answer window.
+- **The answer window started when the hail was sent, not when it finished.**
+  A 15 s hail left 15 s to answer. The 30 s (`HAIL_ANSWER_S`) now runs from
+  the **end** of the hail. The listener's pending-hail backstop
+  (`HAIL_PENDING_MAX_S`) rose from 45 to 60 s to outlast the longest window
+  (20 s of hail plus 30 s).
+- **A tap during the hail was lost; now it answers.** While a prewarmed hail
+  plays, the link is up, so a tap is `AT+CHUP` on btmon and no key event, and
+  nothing was watching. The hail now plays through `_play_cuttable()` with the
+  badge's own btmon: a tap cuts it off and answers it at once. Afterwards the
+  live link goes into the **SCO hold** instead of being torn down (Phase 11),
+  so a tap just after the hail answers on the live link, with no bring-up and
+  no teardown chirp to wait through. The downlink thread sees the tap, but
+  taps are acted on by `main()`, so it wakes `main()` through a pipe; `main()`
+  claims the hold and runs the answering cycle. The prewarmed capture was not
+  read during the hail, so its backlog is discarded at handover; otherwise the
+  room during the hail would be the first thing the channel carried.
+- **"Channel closed." was masked on the badge that closed it.** The tap that
+  closes a channel lands on a live link, so the badge chirps ~0.5 s later and
+  holds its speaker past that, exactly as with a tap-ended command (Phase 12).
+  Played at once, the cue was heard only on the far badge. The tapped side now
+  waits the chirp out through `_play_after_tap_chirp()`, the arrangement swept
+  for "Cancelled."; the far side, closed by `b'X'`, plays at once as before.
+  This one was not new to two badges on one host, only newly noticed with
+  both badges in hand.
+
+Two faults that silenced the channel came from the new setup, not from
+this code:
+
+- **Every channel was inaudible: a stored per-application volume.**
+  WirePlumber remembers a volume per application name and restores it onto
+  every later stream of that name that does not set its own. Every badge's
+  channel player is `paplay`. A test run of `paplay --volume 1000` on PAN
+  stored 0.000004 (−108 dB) for `paplay`, and from then on every channel
+  carried audio perfectly (bytes both ways, gate opening on speech) to badges
+  that played it inaudibly. **Both channel players now pass an explicit
+  volume**, which beats the stored one (measured: 1040/65536 restored without
+  it, 65536 with). Worth knowing beyond this bug: any test that runs
+  `paplay` or `pw-play` with a volume can leave a value behind that governs
+  every later stream of that name.
+- **The default audio device was a badge.** On a host with no sound card of
+  its own, PipeWire elects the badges as default sink and source, so a
+  stream that loses its target falls back onto the **other** badge. See
+  README §4, bug 7, for the fix (a null sink as default) and for why
+  `node.dont-fallback` must not be used instead.
+
+The turn-taking numbers users meet in practice (0.5 s floor hold, 0.4 s
+release guard) are summarised for them in README §5, *Turn-taking in a live
+channel*; the tuning history is Phases 6–8 above.
+
 ## Resume Point (2026-07-17)
 
 **ALL PHASES (1–6) COMPLETE AND ON-BADGE VALIDATED.** The SDK
@@ -1310,3 +1382,9 @@ the misleading "no/unknown signal byte: None").
   (`channel_half_duplex_ms = 0`) for setups without acoustic coupling —
   the default just makes the same-room case sound right without
   requiring adaptive AEC.
+- **2026-09-26** — Phase 13: two badges on one host (one per adapter, one
+  listener each; `multiuser/PI.md` phase 1), verified on PAN. Hail
+  keepalives start at once and the answer window runs from the end of the
+  hail; a tap during a prewarmed hail answers it; the link is held after a
+  hail; "Channel closed." waits out the tapped badge's chirp; the channel
+  player's volume is explicit.
