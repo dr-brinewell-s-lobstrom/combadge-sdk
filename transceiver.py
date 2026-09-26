@@ -2,8 +2,9 @@
 """
 Minimal Combadge Transceiver / Connection Manager (TOS SDK).
 
-This script runs as ROOT and does one job: keep the combadge connected
-and keep listener.py running under the correct user account.
+This script runs as ROOT and supervises every combadge paired to this host:
+one badge per Bluetooth adapter, one listener.py per badge. With one adapter
+and one badge it is exactly the single-badge transceiver it always was.
 
 Why root?
   - `runuser` (drop to a normal user account) requires root.
@@ -12,17 +13,37 @@ Why root?
     already in `input`.  Running as the user directly would require adding
     them to the `input` group permanently, which is a larger system change.
 
-TWO loops, not one (see "Why two loops" below):
+-----------------------------------------------------------------------------
+THE SHAPE  (multiuser/PI.md, phase 1)
+-----------------------------------------------------------------------------
+  COORDINATOR (main thread, every SDK_DETECT_INTERVAL seconds)
+    1. Pre-flight survey of BlueZ, per adapter: power adapters on, `trust`
+       any paired badge that is not trusted.  Re-run when anything in BlueZ's
+       object tree changes (a pairing, a removal, an adapter plugged in), and
+       every SURVEY_INTERVAL regardless.
+    2. Observe which adapter each badge is connected on.
+    3. Assign badges to adapters, ONE BADGE PER ADAPTER, never shared.
+    4. Enforce: remove a second pairing of a badge on another adapter;
+       disconnect a badge that has come up on an adapter another badge owns.
+    5. Keep one supervisor thread per assigned badge.
 
-  DETECT (main thread, every SDK_DETECT_INTERVAL seconds)
-    1. Is the badge connected?  (one cheap bluetoothctl query)
-    2. If it just connected: bring up HFP, launch listener.py.
-    3. If it just disconnected: stop listener.py.
-    4. Restart listener.py if it exited unexpectedly.
+  SUPERVISOR (one thread per badge)
+    Bring up HFP on its badge's link, run listener.py for it with the badge's
+    MAC AND adapter, restart it if it dies, stop it when the badge goes.
 
-  PAGE (background thread, every SDK_PAGE_GAP seconds while disconnected)
-    5. `bluetoothctl connect <MAC>` — reach out to a badge that has not
-       reached out to us.
+  PAGE (one background thread)
+    `Device1.Connect` on each assigned badge that is absent, through ITS OWN
+    adapter only.
+
+Everything talks to BlueZ over D-Bus (`busctl`), addressed per adapter
+(/org/bluez/hciN/dev_...), not through `bluetoothctl`.  bluetoothctl works on
+ONE adapter at a time -- the default -- so on a two-adapter host it cannot
+even list the second adapter's badge.  Verified on PAN 2026-09-26: adapter B
+was the default, and the old transceiver would have seen only its badge.
+
+Adapters are identified by ADDRESS.  `hciN` numbering is not stable across
+boots with identical dongles; it is looked up fresh, and only used where a
+tool demands it (btmon -i).
 
 Usage:
     sudo SDK_USER=$USER python3 transceiver.py [/path/to/listener.py]
@@ -33,14 +54,13 @@ Environment variables:
     SDK_SERVER_HOST     — hostname/IP where computer.py is running (default: localhost)
     SDK_SERVER_PORT     — TCP port for computer.py (default: 1701)
     SDK_DETECT_INTERVAL — seconds between connectivity checks (default: 2)
-    SDK_PAGE_GAP        — seconds between connect attempts while the badge is
+    SDK_PAGE_GAP        — seconds between page sweeps while a badge is
                           absent (default: 5)
-    SDK_BADGE_MAC       — optional MAC (or comma-separated MACs) to accept.
-                          Unset = any paired TNG COMBADGE. Set this when more
-                          than one badge is paired to the host: all TNG badges
-                          share the same device NAME, so name matching alone
-                          cannot distinguish the badge you are carrying from the
-                          one in a drawer.
+
+~~SDK_BADGE_MAC~~ REMOVED 2026-09-26 (Captain, PI.md Ruling 10). It pinned one
+badge out of several paired ones, for a transceiver that ran one badge at a
+time. This one runs every badge paired to its adapters; the pairings ARE the
+set. To keep a badge out, unpair it from this host.
 
 -----------------------------------------------------------------------------
 WHY TWO LOOPS  (the single most important thing in this file)
@@ -49,11 +69,11 @@ The obvious design is one loop that checks, then connects, then sleeps. Do not
 write that. It is what this file used to be, and it is slow for a reason that
 is invisible until you measure it.
 
-`bluetoothctl connect` against a badge that is switched off or out of range
-does not fail fast. It blocks for the controller's **page timeout** — BlueZ's
-default is 0x2000 slots x 0.625 ms = **5.12 seconds** — before reporting
-failure. Meanwhile, checking whether a badge is connected is a D-Bus property
-read costing a few milliseconds.
+A connect against a badge that is switched off or out of range does not fail
+fast. It blocks for the controller's **page timeout** — BlueZ's default is
+0x2000 slots x 0.625 ms = **5.12 seconds** — before reporting failure.
+Meanwhile, checking whether a badge is connected is a D-Bus property read
+costing a few milliseconds.
 
 Put both in one loop and the cheap operation is held hostage by the expensive
 one. That matters more than it sounds, because a badge often connects
@@ -73,64 +93,47 @@ BATTERY: which battery, and what actually drains it
 A natural worry is that retrying faster will drain the badge. It will not, and
 it is worth understanding why before tuning anything.
 
-  * Paging costs the HOST, not the badge. `bluetoothctl connect` transmits page
-    trains from the host radio. The badge sits in page scan at a duty cycle
-    fixed by its own firmware; it cannot tell how often you page it.
+  * Paging costs the HOST, not the badge. A connect transmits page trains from
+    the host radio. The badge sits in page scan at a duty cycle fixed by its
+    own firmware; it cannot tell how often you page it.
   * What costs the BADGE is SCO: bringing the audio link up, playing through
     its speaker, tearing it down. That is the badge's highest-power activity by
     a wide margin. If you want to save badge battery, look at how often you
     play audio to it — not at how often you poll.
-  * What costs the HOST is SDK_DETECT_INTERVAL. Each pass forks a subprocess
-    and does a D-Bus round trip. At 2 s that is a rounding error; at 0 it is a
-    busy loop that keeps a core warm forever. On a battery-powered relay host
-    (a Raspberry Pi, a laptop) keep it at >= 0.5. If you need instant detection
-    without polling at all, the right answer is not a tighter loop — it is a
-    D-Bus signal subscription on org.bluez.Device1's `Connected` property.
+  * What costs the HOST is SDK_DETECT_INTERVAL. Each pass forks a few busctl
+    subprocesses (one per pairing). At 2 s that is a rounding error; at 0 it
+    is a busy loop that keeps a core warm forever. On a battery-powered relay
+    host (a Raspberry Pi, a laptop) keep it at >= 0.5. If you need instant
+    detection without polling at all, the right answer is not a tighter loop —
+    it is a D-Bus signal subscription on org.bluez.Device1's `Connected`
+    property.
 
-Stripped down from relay-linux/combadge.py: no per-host PID files, no IPC flags,
-no log file rotation, no authorized-badge filtering, no focus-shift handling.
-Single badge, single listener process, foreground.
+Stripped down from relay-linux/combadge.py: no per-host PID files, no IPC
+flags, no log file rotation, foreground.
 """
 import os
 import pwd
+import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 
-# How often the DETECT loop checks connectivity. This is the reconnect latency
+# How often the coordinator checks connectivity. This is the reconnect latency
 # you actually feel. See "Battery" above before setting it below 0.5.
 DETECT_INTERVAL = max(0.0, float(os.environ.get("SDK_DETECT_INTERVAL", "2")))
 
-# How long the PAGE loop waits between connect attempts while the badge is away.
-# Each attempt against an absent badge costs ~5 s of page timeout regardless of
-# this value, so the effective retry period is roughly 5 s + SDK_PAGE_GAP.
+# How long the PAGE loop waits between sweeps while a badge is away. Each
+# attempt against an absent badge costs ~5 s of page timeout regardless of
+# this value, so the effective retry period is roughly 5 s per absent badge +
+# SDK_PAGE_GAP.
 PAGE_GAP = max(0.0, float(os.environ.get("SDK_PAGE_GAP", "5")))
 
-# The paired-device list changes only when you pair or remove a badge, so it is
-# cached rather than re-queried on every detect pass (two bluetoothctl calls).
-PAIRED_CACHE_TTL = 60  # seconds
-
-# Optional badge allow-list. Every TNG COMBADGE shares the same device NAME, so
-# name matching alone cannot tell two badges apart — set SDK_BADGE_MAC to pin a
-# specific one (or several, comma-separated):
-#
-#     sudo SDK_BADGE_MAC=1B:B8:82:88:2F:60 python3 transceiver.py
-#
-# Leave it unset to accept any paired TNG COMBADGE, which is the right default
-# for a single-badge setup. With two badges paired and only one switched on,
-# pinning the live one skips a wasted ~5 s page of the absent one per sweep.
-WANTED_MACS = {m.strip().upper()
-               for m in os.environ.get("SDK_BADGE_MAC", "").split(",")
-               if m.strip()}
-
-# --- Shared state between the two loops ---------------------------------
-# The detect loop writes; the page loop reads it to decide whether to page at
-# all. A plain lock is sufficient — there are exactly two threads and one flag.
-_state_lock = threading.Lock()
-_badge_connected = False
-_audio_services_ready = False
-_sweep_start = 0        # rotates which badge the page sweep tries first
+# The pre-flight survey re-runs whenever BlueZ's object tree changes (cheap to
+# check every pass), and at least this often regardless, which is what catches
+# a badge being un-trusted or an adapter being powered off from outside.
+SURVEY_INTERVAL = 30  # seconds
 
 # How long to stand a badge down after it proves unusable. See quarantine().
 UNUSABLE_COOLDOWN = 60  # seconds
@@ -139,7 +142,7 @@ _cooldown_lock = threading.Lock()
 
 
 def quarantine(mac, seconds=UNUSABLE_COOLDOWN):
-    """Stand a badge down temporarily so the others get a turn.
+    """Stand a badge down temporarily.
 
     Needed because "connected" and "usable" are NOT the same thing. BlueZ will
     happily hold an ACL link open to a badge whose audio profile never came up
@@ -147,11 +150,10 @@ def quarantine(mac, seconds=UNUSABLE_COOLDOWN):
     relay-linux/RELAY.md). Such a badge reports `Connected: yes` forever while no
     `bluez_card.<MAC>` ever appears.
 
-    Without a quarantine that state is a LIVELOCK: the detect loop keeps
-    selecting the half-connected badge, waits out the 15 s card poll, fails,
-    and tries the same badge again — while the page loop, told a badge is
-    connected, stands down and never pages the badge you are actually holding.
-    Observed on PAN 2026-08-08 with two badges paired and only one switched on.
+    Without a quarantine that state is a LIVELOCK: the supervisor keeps
+    retrying the half-connected badge, waiting out the 15 s card poll each
+    time. Standing it down disconnects it and stops the page loop reaching for
+    it until the cooldown passes. Observed on PAN 2026-08-08.
     """
     with _cooldown_lock:
         _cooldown[mac.upper()] = time.time() + seconds
@@ -172,7 +174,8 @@ def is_quarantined(mac):
 # Logging — every line timestamped, host-tagged, and teed to a file
 # (module-level `print` shadow; listener.py does the same with the badge
 # MAC).  File: sdk/log/transceiver_<hostname>.log — on PAN that lands on the
-# shared mount, live-readable from CUBE.
+# shared mount, live-readable from CUBE.  Open/write/close per line: a handle
+# held open over sshfs locks the file against every CUBE reader.
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -184,27 +187,46 @@ try:
 except OSError:
     pass
 
-_print = print
+_print    = print
+_log_lock = threading.Lock()
 
 
 def print(*args, **kwargs):   # noqa: A001 — deliberate shadow, see above
     line    = " ".join(str(a) for a in args)
     stamped = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [{HOSTNAME}] {line}"
-    _print(stamped, **kwargs)
-    try:
-        with open(LOG_FILE, "a") as f:
-            f.write(stamped + "\n")
-    except OSError:
-        pass
+    with _log_lock:
+        _print(stamped, **kwargs)
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(stamped + "\n")
+        except OSError:
+            pass
+
+
+_said = {}   # key -> last message, so a standing condition is logged once
+
+
+def say_once(key, msg):
+    """Log `msg` unless it is what was last said under `key`. For conditions
+    that persist across passes: said when they start or change, not every 2 s."""
+    if _said.get(key) != msg:
+        _said[key] = msg
+        print(msg)
+
+
+def unsay(key):
+    """Forget `key`, so the condition is reported again if it comes back."""
+    _said.pop(key, None)
+
 
 # Full paths to system tools.  Adjust if your distro puts them elsewhere.
-BTCTL   = "/usr/bin/bluetoothctl"   # BlueZ command-line interface
+BUSCTL  = "/usr/bin/busctl"         # systemd's D-Bus client -- talks to BlueZ
 PACTL   = "/usr/bin/pactl"          # PipeWire/PulseAudio control tool
 RUNUSER = "/usr/sbin/runuser"       # Run a command as a different user (needs root)
 
 
-def run(cmd, **kw):
-    """Run a shell command and return the CompletedProcess, or None on failure.
+def run(cmd, timeout=15, **kw):
+    """Run a command and return the CompletedProcess, or None on failure.
 
     Swallows TimeoutExpired and FileNotFoundError so callers never need to
     handle the case where a system tool is missing or unresponsive.
@@ -212,10 +234,263 @@ def run(cmd, **kw):
     our console output.
     """
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=15, **kw)
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, **kw)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
 
+
+# ---------------------------------------------------------------------------
+# BlueZ over D-Bus
+#
+# Every object is addressed by its path, which names its adapter:
+#     /org/bluez/hci0                       adapter  (org.bluez.Adapter1)
+#     /org/bluez/hci0/dev_2C_F2_DF_45_EC_28 device, AS SEEN BY hci0 (Device1)
+# The same badge paired on two adapters is two objects. That is the whole
+# reason this is per-path and not per-MAC.
+# ---------------------------------------------------------------------------
+
+BLUEZ      = "org.bluez"
+ADAPTER_IF = "org.bluez.Adapter1"
+DEVICE_IF  = "org.bluez.Device1"
+_ADAPTER_RE = re.compile(r"^/org/bluez/(hci\d+)$")
+_DEVICE_RE  = re.compile(r"^/org/bluez/(hci\d+)/dev_((?:[0-9A-Fa-f]{2}_){5}[0-9A-Fa-f]{2})$")
+
+
+def _why(r):
+    """The last line busctl printed, which is where it puts the reason."""
+    if r is None:
+        return "busctl did not respond"
+    lines = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()
+    return lines[-1].strip() if lines else f"exit {r.returncode}"
+
+
+def bz_props(path, iface, *names):
+    """Read several properties in ONE busctl call. Returns a list of values
+    (bool for 'b', str for 's'), or None if the object or any property is
+    missing. busctl prints one line per property:  `b true`, `s "TNG COMBADGE"`."""
+    r = run([BUSCTL, "get-property", BLUEZ, path, iface, *names])
+    if not r or r.returncode != 0:
+        return None
+    vals = []
+    for line in r.stdout.splitlines():
+        kind, _, v = line.strip().partition(" ")
+        if kind == "b":
+            vals.append(v == "true")
+        elif kind == "s":
+            vals.append(v[1:-1] if len(v) >= 2 and v[0] == '"' else v)
+        else:
+            vals.append(v)
+    return vals if len(vals) == len(names) else None
+
+
+def bz_set_bool(path, iface, name, value):
+    """Set a boolean property. Returns (ok, reason)."""
+    r = run([BUSCTL, "set-property", BLUEZ, path, iface, name, "b",
+             "true" if value else "false"])
+    return (r is not None and r.returncode == 0), _why(r)
+
+
+def bz_call(path, iface, method, *args, timeout=15):
+    """Call a method. Returns (ok, reason). BlueZ reports failures as
+    `Call failed: <reason>`, e.g. br-connection-page-timeout."""
+    r = run([BUSCTL, f"--timeout={timeout}", "call", BLUEZ, path, iface,
+             method, *args], timeout=timeout + 5)
+    return (r is not None and r.returncode == 0), _why(r)
+
+
+def bluez_tree():
+    """Every object path BlueZ exports, as a tuple (comparable pass to pass),
+    or None if BlueZ is not answering."""
+    r = run([BUSCTL, "tree", "--list", BLUEZ])
+    if not r or r.returncode != 0:
+        return None
+    return tuple(ln.strip() for ln in r.stdout.splitlines() if ln.strip())
+
+
+# ---------------------------------------------------------------------------
+# Shared state. The coordinator writes it; supervisors and the page loop
+# read it. One lock, held only for copies -- never across a subprocess.
+# ---------------------------------------------------------------------------
+
+_state_lock = threading.Lock()
+ADAPTERS = {}   # adapter addr -> {"hci": "hci0", "path": "/org/bluez/hci0"}
+PAIRED   = {}   # badge MAC -> {adapter addr: device path}   (paired only)
+ASSIGNED = {}   # badge MAC -> adapter addr it is supervised on
+LIVE     = {}   # badge MAC -> adapter addr it is connected on, or None
+RUNNING  = set()  # badge MACs whose listener.py is currently up
+_sweep_start = 0  # rotates which badge the page sweep tries first
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight (PI.md -> "Pre-flight check", the phase-1 rows)
+# ---------------------------------------------------------------------------
+
+def survey(tree):
+    """Read BlueZ's actual state, per adapter, and put right what can be put
+    right without pairing anything. Assumes nothing about who set it up: the
+    user may have paired, trusted or connected by hand, correctly or not.
+
+    Returns (adapters, paired):
+        adapters  addr -> {"hci", "path"}          powered adapters only
+        paired    badge MAC -> {adapter addr: device path}
+
+    Repairs made here, each logged as one line:
+      * adapter powered off   -> power it on (failure = adapter fault)
+      * badge paired, not trusted -> trust it. Without trust BlueZ refuses a
+        badge that reconnects by itself, which is ~a quarter of reconnects.
+    """
+    adapters, hci_addr = {}, {}
+    for path in tree:
+        m = _ADAPTER_RE.match(path)
+        if not m:
+            continue
+        hci = m.group(1)
+        props = bz_props(path, ADAPTER_IF, "Address", "Powered")
+        if not props:
+            continue
+        addr, powered = props[0].upper(), props[1]
+        if not powered:
+            ok, why = bz_set_bool(path, ADAPTER_IF, "Powered", True)
+            if ok:
+                print(f"[transceiver] pre-flight: adapter {addr} ({hci}) was "
+                      "powered off -- powered on")
+                powered = True
+            else:
+                say_once(f"power:{addr}",
+                         f"[transceiver] ADAPTER FAULT: {addr} ({hci}) is powered "
+                         f"off and will not power on: {why}. Check `rfkill list`.")
+        if powered:
+            unsay(f"power:{addr}")
+            adapters[addr] = {"hci": hci, "path": path}
+            hci_addr[hci] = addr
+
+    paired, unpaired = {}, set()
+    for path in tree:
+        m = _DEVICE_RE.match(path)
+        if not m or m.group(1) not in hci_addr:
+            continue
+        addr = hci_addr[m.group(1)]
+        mac  = m.group(2).replace("_", ":").upper()
+        # Name first: a device with no Name is not a combadge we can recognise,
+        # and asking for a missing property fails the whole call.
+        props = bz_props(path, DEVICE_IF, "Name", "Paired", "Trusted")
+        if not props or "TNG COMBADGE" not in props[0].upper():
+            continue
+        if not props[1]:
+            unpaired.add(mac)   # seen in a scan; claiming it is phase 2
+            continue
+        if not props[2]:
+            ok, why = bz_set_bool(path, DEVICE_IF, "Trusted", True)
+            if ok:
+                print(f"[transceiver] pre-flight: {mac} on {addr} was paired but "
+                      "not trusted -- trusted")
+            else:
+                say_once(f"trust:{mac}:{addr}",
+                         f"[transceiver] pre-flight: could not trust {mac} on "
+                         f"{addr}: {why}. It will not be able to reconnect by itself.")
+        paired.setdefault(mac, {})[addr] = path
+
+    for mac in sorted(unpaired - set(paired)):
+        say_once(f"unpaired:{mac}",
+                 f"[transceiver] {mac} is visible but not paired to this host -- "
+                 "ignored. (Claiming new badges is phase 2; pair and trust it by "
+                 "hand for now.)")
+    return adapters, paired
+
+
+def observe(paired):
+    """Which adapter is each badge connected on? One busctl call per pairing;
+    all are D-Bus property reads, none touches the radio."""
+    live = {}
+    for mac, by_adapter in paired.items():
+        live[mac] = None
+        for addr, path in sorted(by_adapter.items()):
+            v = bz_props(path, DEVICE_IF, "Connected")
+            if v and v[0]:
+                live[mac] = addr
+                break
+    return live
+
+
+def assign(adapters, paired, live, previous, running):
+    """One badge per adapter. Never two on one (PI.md Ruling 11).
+
+    Returns (assigned, evict, orphans):
+        assigned  badge MAC -> adapter addr
+        evict     [(MAC, adapter addr)]: connected on an adapter another badge
+                  already owns -- must be disconnected
+        orphans   [MAC]: paired, but every adapter it is paired on is taken
+
+    Order matters, and it is chosen so nothing that works is disturbed:
+      1. Connected badges keep the adapter they are on. If two are connected
+         on ONE adapter, the one with a running listener keeps it (then the
+         lower MAC); the other is evicted.
+      2. The rest, most constrained first (fewest adapters it is paired on),
+         so a badge with a choice never takes the only adapter another badge
+         has. Each keeps its previous adapter if still free.
+    """
+    taken, assigned, evict, orphans = set(), {}, [], []
+    for mac in sorted((m for m in paired if live.get(m)),
+                      key=lambda m: (m not in running, m)):
+        addr = live[mac]
+        if addr in taken:
+            evict.append((mac, addr))
+            continue
+        taken.add(addr)
+        assigned[mac] = addr
+    for mac in sorted((m for m in paired if not live.get(m)),
+                      key=lambda m: (len(paired[m]), m)):
+        cands = [a for a in sorted(paired[mac]) if a in adapters]
+        prev  = previous.get(mac)
+        order = ([prev] if prev in cands else []) + [a for a in cands if a != prev]
+        addr  = next((a for a in order if a not in taken), None)
+        if addr is None:
+            orphans.append(mac)
+            continue
+        taken.add(addr)
+        assigned[mac] = addr
+    return assigned, evict, orphans
+
+
+def enforce(assigned, evict, paired, live):
+    """Act on assign()'s verdict. Returns True if BlueZ state was changed and
+    the survey should be re-run.
+
+      * Double pairing (Ruling 12): a badge connected on one adapter and also
+        paired on another has the other pairing REMOVED. Only once it is
+        connected: before that there is no telling which pairing is the extra.
+      * Eviction (Ruling 11): a badge up on an adapter another badge owns is
+        disconnected. It is paired there, so it may come back by itself; it
+        will be disconnected again each time, which is the point.
+    """
+    changed = False
+    for mac, addr in assigned.items():
+        if live.get(mac) != addr:
+            continue
+        for other, path in sorted(paired[mac].items()):
+            if other == addr:
+                continue
+            with _state_lock:
+                other_path = ADAPTERS.get(other, {}).get("path")
+            if not other_path:
+                continue
+            ok, why = bz_call(other_path, ADAPTER_IF, "RemoveDevice", "o", path)
+            print(f"[transceiver] pre-flight: {mac} was paired on two adapters; "
+                  f"connected on {addr}, removed its pairing on {other}"
+                  + ("" if ok else f" -- FAILED: {why}"))
+            changed = changed or ok
+    for mac, addr in evict:
+        ok, why = bz_call(paired[mac][addr], DEVICE_IF, "Disconnect")
+        print(f"[transceiver] {mac} came up on {addr}, which another badge owns. "
+              "Two badges never share an adapter -- disconnected"
+              + ("" if ok else f" -- FAILED: {why}"))
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# Audio session
+# ---------------------------------------------------------------------------
 
 def session_xdg(username):
     """The user's XDG_RUNTIME_DIR — where their PipeWire socket and D-Bus live."""
@@ -243,6 +518,9 @@ def run_as_user(username, cmd):
                env={"XDG_RUNTIME_DIR": session_xdg(username)})
 
 
+_audio_services_ready = False
+
+
 def ensure_audio_services(username, force=False):
     """Start the user's PipeWire stack. Startup only, and again on fault.
 
@@ -252,10 +530,10 @@ def ensure_audio_services(username, force=False):
     seat active — see the wireplumber seat-monitoring note in README §7 if the
     card still never appears after this.
 
-    Deliberately NOT called from the detect loop. `systemctl --user start` on an
-    already-running unit is a no-op, but it is the one call here with any route
-    to disturbing the audio stack, and at a 2 s cadence it would run 30 times a
-    minute. Once at startup, then only when something has actually gone wrong.
+    `start`, never `restart`: on a unit that is already running it is a no-op.
+    That matters twice over with several badges, because restarting PipeWire
+    under a connected badge takes it silent (TOS.md, Relay Host Hazards), and
+    with two badges one of them is always the OTHER badge.
     """
     global _audio_services_ready
     if _audio_services_ready and not force:
@@ -266,195 +544,51 @@ def ensure_audio_services(username, force=False):
     _audio_services_ready = True
 
 
-def find_paired_badges():
-    """Scan bluetoothctl's device lists for TNG COMBADGEs.
+NULL_SINK   = "sdk_no_badge"
+_null_lock  = threading.Lock()
 
-    Returns a list of MAC address strings (e.g. ["2C:F2:DF:45:EC:28"]), in the
-    order bluetoothctl reports them, filtered by WANTED_MACS if you set
-    SDK_BADGE_MAC.  Empty list if none are paired.
 
-    Tries `paired-devices` first (only shows fully paired devices, faster),
-    then falls back to `devices` which also lists devices seen in recent
-    scans.  The name match is case-insensitive.
+def ensure_no_badge_default(username):
+    """Never let a badge be the default sink or source.
 
-    Each bluetoothctl output line looks like:
-        Device 2C:F2:DF:45:EC:28 TNG COMBADGE
-    We take parts[1] (the MAC) when "TNG COMBADGE" appears anywhere in the line.
+    A stream whose target goes away is re-linked by PipeWire to the DEFAULT
+    device. With one badge that was harmless. With two, on a host with no sound
+    device of its own (PAN, a Pi), PipeWire elects the badges themselves as
+    the defaults -- found on PAN 2026-09-26: default sink :28's speaker, default
+    source :60's mic. One badge's answer would then play out of the other, and
+    one badge's recording would hear the other.
 
-    Why a LIST and not the first match?  Because this used to return the first
-    match and stop, which is wrong the moment you own two badges. Every TNG
-    COMBADGE has the same device NAME, so "the first one named TNG COMBADGE" is
-    whichever one bluetoothctl happens to print first — not the one that is
-    switched on. Pair two, carry one, and the transceiver will spend forever
-    paging the badge sitting in a drawer while the badge in your hand is
-    ignored. Collect them all; let the caller try each.
+    So whenever the default sink or source is a badge (a bluez_ node), point it
+    at a null sink / that sink's monitor instead, and a fallback lands nowhere.
+    A real device the user chose (laptop speakers, a USB mic) is left alone:
+    falling back to it is the long-standing single-badge behaviour and hurts
+    no badge.
+
+    Not node.dont-fallback on the streams, which forbids the fallback outright
+    and looks like the direct fix: it kills a stream whenever the HFP node is
+    briefly re-created, which it is as SCO comes up (see listener.py,
+    "Staying on this badge"). Measured with multiuser/xtalk_probe.py.
+
+    Called at startup and after every badge's audio comes up, since that is
+    when PipeWire may elect a new default. The null sink is a runtime module
+    and does not survive a PipeWire restart; it is re-created here if missing.
     """
-    found, truly_paired = [], set()
-    for sub in (["paired-devices"], ["devices"]):
-        r = run([BTCTL] + sub)
-        if not r:
-            continue
-        for line in r.stdout.splitlines():
-            if "TNG COMBADGE" in line.upper():
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                mac = parts[1]
-                if sub[0] == "paired-devices":
-                    truly_paired.add(mac.upper())
-                if mac not in found:
-                    if not WANTED_MACS or mac.upper() in WANTED_MACS:
-                        found.append(mac)  # the MAC address field
-
-    # `devices` lists everything BlueZ has seen, not just what is paired to this
-    # host. A badge paired to a DIFFERENT host (a phone, another relay box) shows
-    # up here and can be paged forever — every attempt failing with "Device not
-    # available" — while looking, in the log, exactly like a badge that is merely
-    # out of range. Say so once, plainly, instead of letting it masquerade.
-    for mac in found:
-        if mac.upper() not in truly_paired and mac.upper() not in _warned_unpaired:
-            _warned_unpaired.add(mac.upper())
-            print(f"[transceiver] NOTE: {mac} is visible but NOT PAIRED to this host "
-                  "— connects will fail until you pair it "
-                  f"(bluetoothctl pair {mac}; trust {mac}). "
-                  "If it is paired to another device (phone, second relay), "
-                  "disconnect it there first.")
-    return found
-
-
-_paired_cache    = []
-_paired_cache_ts = 0.0
-_warned_unpaired = set()   # MACs we have already warned about, so it is said once
-
-
-def find_paired_badges_cached():
-    """find_paired_badges() behind a PAIRED_CACHE_TTL cache.
-
-    The detect loop runs every couple of seconds and the uncached call is two
-    bluetoothctl invocations. An EMPTY result is deliberately never cached: a
-    host with no badge paired yet must notice the moment you pair one.
-    """
-    global _paired_cache, _paired_cache_ts
-    if not _paired_cache or (time.time() - _paired_cache_ts) > PAIRED_CACHE_TTL:
-        _paired_cache    = find_paired_badges()
-        _paired_cache_ts = time.time()
-    return list(_paired_cache)
-
-
-def live_badges():
-    """Paired badges that are not currently standing down (see quarantine())."""
-    return [m for m in find_paired_badges_cached() if not is_quarantined(m)]
-
-
-# `bluetoothctl devices Connected` needs BlueZ >= 5.65. We probe once and
-# remember the answer; older builds fall back to `info <MAC>`, which is what
-# this file used to do unconditionally. None = not yet probed.
-_devices_connected_supported = None
-
-
-def connected_badge(macs):
-    """Return the first MAC in `macs` that is currently connected, or None.
-
-    This is the DETECT pass and the only thing standing between a badge coming
-    back and the SDK noticing, so it is kept cheap — ONE query answers the
-    question for every badge at once on BlueZ >= 5.65. Both paths below are
-    property reads over D-Bus; neither transmits anything on the radio, which is
-    why calling this every 2 s is free and calling `bluetoothctl connect` every
-    2 s would not be.
-
-    Several badges may be PAIRED; the expected pattern is that one is switched
-    on at a time and you swap between them (see "Two badges, one at a time" in
-    README §4). First-connected therefore wins, and there is normally only one
-    candidate anyway.
-    """
-    global _devices_connected_supported
-    if not macs:
-        return None
-    by_upper = {m.upper(): m for m in macs}
-
-    if _devices_connected_supported is not False:
-        r = run([BTCTL, "devices", "Connected"])
-        if r and r.returncode == 0 and "Invalid" not in (r.stdout + r.stderr):
-            live = set()
-            for line in r.stdout.splitlines():
-                p = line.split()
-                if len(p) >= 2 and p[0] == "Device" and p[1].upper() in by_upper:
-                    live.add(p[1].upper())
-            hit = next((m for m in macs if m.upper() in live), None)
-            # Cross-validate ONCE, on the first positive answer. A returncode of
-            # 0 is not proof the filter was honoured: some bluetoothctl builds
-            # ignore an unrecognised `devices` argument and print the FULL device
-            # list instead of erroring, which would make every paired badge look
-            # permanently connected. One `info` call settles it; if the two
-            # disagree, the fast path is wrong and we never use it again.
-            if hit is not None and _devices_connected_supported is None:
-                v = run([BTCTL, "info", hit])
-                if v and "Connected: yes" in v.stdout:
-                    _devices_connected_supported = True      # trusted from now on
-                else:
-                    _devices_connected_supported = False
-                    print("[transceiver] `devices Connected` is not filtering "
-                          "(it listed a disconnected badge) — using `info` probe.")
-                    hit = None                               # fall through below
-            if _devices_connected_supported is not False:
-                return hit
-        else:
-            _devices_connected_supported = False
-            print("[transceiver] `devices Connected` unsupported; using `info` probe.")
-
-    for mac in macs:
-        r = run([BTCTL, "info", mac])
-        if r and "Connected: yes" in r.stdout:
-            return mac
-    return None
-
-
-def page_badge(mac):
-    """Reach out to a badge that has not reached out to us. PAGE loop only.
-
-    Returns True if bluetoothctl reports the link came up.
-
-    This is the expensive half of the split and the reason the split exists: if
-    the badge is off or out of range, this call blocks for the controller's page
-    timeout (~5 s) before failing. Nothing else may wait on it.
-
-    NOTE the return value is CHECKED by the caller. It did not used to be: this
-    function's predecessor issued the connect, ignored the result, and then
-    polled for an audio card for a further 15 seconds — a card that cannot
-    possibly appear when the connect just failed. That made every failed retry
-    cost ~20 s of dead time on top of the 5 s page timeout. If you take one
-    practical lesson from this file, take that one: never poll for a
-    side effect of an operation you did not confirm succeeded.
-    """
-    print(f"[transceiver] paging {mac}...")
-    r = run([BTCTL, "connect", mac])
-    if r is None:
-        print(f"[transceiver] {mac}: bluetoothctl did not respond (missing or hung)")
-        return False
-
-    out = (r.stdout or "") + (r.stderr or "")
-
-    # Do NOT trust the exit code. bluetoothctl exits 0 on plenty of failures,
-    # so a returncode check reports phantom successes — which looks exactly
-    # like a badge that connects and instantly vanishes. The success banner is
-    # the reliable signal.
-    if "Connection successful" in out:
-        return True
-
-    # Surface WHY. Silently swallowing this is what turned a five-second
-    # diagnosis into a long one on PAN, 2026-08-08: the log said "paging..."
-    # over and over and never once said what bluetoothctl replied. Common
-    # replies and what they mean:
-    #   br-connection-page-timeout      badge is off, asleep, or out of range
-    #   br-connection-profile-unavailable  HFP not registered (see README §7)
-    #   br-connection-busy              badge is mid-reconnect; harmless, retries
-    #   Device <MAC> not available      NOT PAIRED to this host, or unknown
-    #   AuthenticationFailed / canceled pairing is stale — remove and re-pair
-    reason = next((ln.strip() for ln in out.splitlines()
-                   if any(k in ln for k in ("Failed", "failed", "Error", "not available"))),
-                  "no reason reported")
-    print(f"[transceiver] {mac}: connect did not complete — {reason}")
-    return False
+    with _null_lock:
+        r = run_as_user(username, [PACTL, "list", "sinks", "short"])
+        if r is None or r.returncode != 0:
+            return
+        if NULL_SINK not in r.stdout.split():
+            run_as_user(username, [PACTL, "load-module", "module-null-sink",
+                                   f"sink_name={NULL_SINK}",
+                                   "sink_properties=device.description=SDK-no-badge"])
+        for kind, target in (("sink", NULL_SINK), ("source", f"{NULL_SINK}.monitor")):
+            r = run_as_user(username, [PACTL, f"get-default-{kind}"])
+            current = (r.stdout.strip() if r else "")
+            if current.startswith("bluez_"):
+                run_as_user(username, [PACTL, f"set-default-{kind}", target])
+                print(f"[transceiver] default {kind} was a badge ({current}) -- "
+                      f"moved to {target}, so no badge's audio can fall back "
+                      "onto another badge")
 
 
 def ensure_audio_ready(mac, username):
@@ -471,17 +605,14 @@ def ensure_audio_ready(mac, username):
          bidirectional 16 kHz SCO audio channel used for voice capture and
          badge speaker playback.
       3. Wait for the HFP audio sink (bluez_output.<MAC>.1) to appear in
-         PipeWire.  Audio played before this point falls back to the default
-         output (laptop speakers) rather than the badge.
+         PipeWire.  Audio played before this point has nowhere to go.
 
-    Why is this separate from page_badge()?  Because a badge that connects
-    ITSELF never goes through page_badge() at all, and this setup still has to
-    happen. Folding these two together — as this file used to — means roughly a
-    quarter of all links (see "Why two loops") skip the profile switch entirely
-    and land on A2DP, where the badge microphone does not exist. listener.py's
-    own ensure_hfp_profile() papers over it at the first tap, but the badge is
-    silently in the wrong state until then. Run this for EVERY link, however it
-    was established.
+    Why is this separate from paging?  Because a badge that connects ITSELF
+    never goes through page_badge() at all, and this setup still has to
+    happen. Folding these two together — as this file once did — means roughly
+    a quarter of all links (see "Why two loops") skip the profile switch
+    entirely and land on A2DP, where the badge microphone does not exist. Run
+    this for EVERY link, however it was established.
 
     Why run pactl as the user?  PipeWire is a per-user service.  The root
     process can't reach the user's PipeWire session directly — it must use
@@ -503,7 +634,7 @@ def ensure_audio_ready(mac, username):
             break
         time.sleep(1)
     else:
-        print(f"[transceiver] timed out waiting for {card}")
+        print(f"[transceiver] {mac}: timed out waiting for {card}")
         if not saw_any_card:
             # pactl reported NOTHING at all — not even the built-in sound card.
             # That is a session problem, not a badge problem, and saying so
@@ -514,7 +645,7 @@ def ensure_audio_ready(mac, username):
                   f"and `systemctl --user status pipewire wireplumber` as {username}.")
         return False
 
-    print(f"[transceiver] setting {card} to headset-head-unit")
+    print(f"[transceiver] {mac}: setting {card} to headset-head-unit")
     r = run_as_user(username, [PACTL, "set-card-profile", card, "headset-head-unit"])
     if r is None or r.returncode != 0:
         return False
@@ -527,72 +658,100 @@ def ensure_audio_ready(mac, username):
     # Sink naming: underscores in MAC + ".1" suffix.
     # Example: MAC 2C:F2:DF:45:EC:28 → bluez_output.2C_F2_DF_45_EC_28.1
     sink = f"bluez_output.{mac.replace(':', '_')}.1"
-    print(f"[transceiver] waiting for HFP sink...")
     for _ in range(15):
         r = run_as_user(username, [PACTL, "list", "sinks", "short"])
         if r and sink in r.stdout:
-            print(f"[transceiver] HFP sink ready.")
+            print(f"[transceiver] {mac}: HFP sink ready.")
             return True
         time.sleep(1)
-    print(f"[transceiver] timed out waiting for HFP sink {sink}")
+    print(f"[transceiver] {mac}: timed out waiting for HFP sink {sink}")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# PAGE loop
+# ---------------------------------------------------------------------------
+
+def page_badge(mac, addr, path):
+    """Reach out to a badge that has not reached out to us, through ITS OWN
+    adapter. PAGE loop only. Returns True if BlueZ reports the link came up.
+
+    This is the expensive half of the split and the reason the split exists: if
+    the badge is off or out of range, this call blocks for the controller's page
+    timeout (~5 s) before failing. Nothing else may wait on it.
+
+    Only ever the adapter the badge is assigned to, which is one it is paired
+    on. Paging from any other adapter would at best fail, and at worst -- with
+    a pairing agent registered, as phase 2 will have -- pair it there too.
+
+    The return value is CHECKED by the caller. This function's predecessor
+    issued the connect, ignored the result, and then polled for an audio card
+    for a further 15 seconds — a card that cannot possibly appear when the
+    connect just failed. Never poll for a side effect of an operation you did
+    not confirm succeeded.
+    """
+    print(f"[transceiver] paging {mac} via {addr}...")
+    ok, why = bz_call(path, DEVICE_IF, "Connect")
+    if ok:
+        return True
+    # Surface WHY. Silently swallowing this is what turned a five-second
+    # diagnosis into a long one on PAN, 2026-08-08. Common replies:
+    #   br-connection-page-timeout         badge is off, asleep, or out of range
+    #   br-connection-profile-unavailable  HFP not registered (see README §7)
+    #   br-connection-busy / In Progress   badge is mid-reconnect; harmless
+    #   AuthenticationFailed / canceled    pairing is stale — remove and re-pair
+    print(f"[transceiver] {mac}: connect did not complete — {why}")
     return False
 
 
 def page_loop():
-    """PAGE loop (background thread): page the badge while it is absent.
+    """PAGE loop (background thread): page each absent badge, in turn.
 
     Deliberately dumb. It pages, it waits, it pages again. All the intelligence
-    — is a badge here, does it need setting up, does listener.py need starting —
-    lives in the detect loop, which is free to run fast precisely because this
+    lives in the coordinator, which is free to run fast precisely because this
     thread absorbs all the slow work.
 
-    The initial sleep is not padding: at startup the detect loop has not yet
+    ONE thread, sequential, even with several adapters: each absent badge
+    costs ~5 s, and paging on one adapter while another badge's audio is live
+    on the next is radio contention nobody has measured yet (PI.md Ruling 5).
+    Revisit with measurements, not before.
+
+    The initial sleep is not padding: at startup the coordinator has not yet
     published its first observation, so without it a badge that is ALREADY
     connected gets pointlessly paged once on every launch.
     """
-    time.sleep(2)
+    global _sweep_start
+    time.sleep(max(2.0, DETECT_INTERVAL + 1))
     while True:
         try:
             with _state_lock:
-                connected = _badge_connected
-            if connected:
+                absent = sorted((m, a, PAIRED[m][a]) for m, a in ASSIGNED.items()
+                                if LIVE.get(m) is None and a in PAIRED.get(m, {}))
+            absent = [t for t in absent if not is_quarantined(t[0])]
+            if not absent:
                 time.sleep(max(PAGE_GAP, 1.0))
                 continue
 
-            macs = live_badges()
-            if not macs:
-                time.sleep(max(PAGE_GAP, 5.0))
-                continue
-
-            # Page each paired badge in turn. Only one is expected to be switched
-            # on; the others cost ~5 s of page timeout each, which is exactly
-            # why this runs here and not on the detect path. Re-check between
-            # badges so a link that comes up mid-sweep is not made to wait out
-            # the remaining pages.
-            #
-            # ROTATE the starting point each sweep. Without this the list order
-            # is fixed, so the badge you just switched OFF is always paged first
-            # and always burns its full ~5 s page timeout before the badge you
-            # just switched ON is even tried — the exact swap you perform most
-            # often, made as slow as possible. Rotating shares first position out
-            # evenly and roughly halves the average swap time.
-            global _sweep_start
-            macs = macs[_sweep_start % len(macs):] + macs[:_sweep_start % len(macs)]
+            # ROTATE the starting point each sweep, so the badge in a drawer
+            # does not always burn its ~5 s before the badge in your hand.
+            k = _sweep_start % len(absent)
             _sweep_start += 1
-
-            for mac in macs:
+            for mac, addr, path in absent[k:] + absent[:k]:
                 with _state_lock:
-                    if _badge_connected:
-                        break
-                if page_badge(mac):
-                    break   # detect loop takes it from here. One owner per job.
+                    still = LIVE.get(mac) is None and ASSIGNED.get(mac) == addr
+                if still:
+                    page_badge(mac, addr, path)   # coordinator takes it from here
             time.sleep(PAGE_GAP)
         except Exception as e:                      # keep the thread alive
             print(f"[transceiver] page loop error: {e}")
             time.sleep(5)
 
 
-def build_session_env(mac, username):
+# ---------------------------------------------------------------------------
+# Per-badge supervisor
+# ---------------------------------------------------------------------------
+
+def build_session_env(mac, adapter, hci, username):
     """Build the environment dictionary that listener.py needs to run correctly.
 
     When `runuser` and `sg` launch a subprocess, they strip the parent's
@@ -601,6 +760,11 @@ def build_session_env(mac, username):
     required set explicitly:
 
       BADGE_MAC                — which badge this listener instance manages
+      BADGE_ADAPTER            — the adapter its link is on, taken from the
+                                 LIVE link at launch, not from any record of
+                                 where it was paired. Scopes the tap node.
+      BADGE_HCI                — that adapter's hciN, looked up now (it can
+                                 renumber across boots). Scopes btmon.
       HOME / USER / LOGNAME    — basic identity expected by many Unix tools
       PATH                     — so listener.py can find ffmpeg, pw-play, pactl
       XDG_RUNTIME_DIR          — directory containing the user's PipeWire socket,
@@ -614,6 +778,8 @@ def build_session_env(mac, username):
     xdg = f"/run/user/{pw.pw_uid}"
     return {
         "BADGE_MAC":               mac,
+        "BADGE_ADAPTER":           adapter,
+        "BADGE_HCI":               hci,
         "HOME":                    pw.pw_dir,
         "USER":                    username,
         "LOGNAME":                 username,
@@ -638,10 +804,118 @@ def launch_listener(mac, username, listener_path, env):
     We pass `env=` explicitly because runuser/sg strip the environment and
     the child needs the session variables assembled by build_session_env().
     """
+    # -u: unbuffered, so the listener's lines reach the console as they
+    # happen. Block-buffered, a killed listener takes its last few KB of
+    # output with it -- which is exactly the part that explains the kill.
     cmd = [RUNUSER, "-u", username, "--", "sg", "input", "-c",
-           f"{sys.executable} {listener_path}"]
-    print(f"[transceiver] launching listener.py for {mac} as {username}")
+           f"{sys.executable} -u {listener_path}"]
+    print(f"[transceiver] launching listener.py for {mac} on "
+          f"{env['BADGE_ADAPTER']} ({env['BADGE_HCI']}) as {username}")
     return subprocess.Popen(cmd, env=env)
+
+
+def _stop(proc):
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+class BadgeSupervisor(threading.Thread):
+    """One badge's listener.py, for as long as the badge is assigned.
+
+    The single-badge transceiver's detect loop, per badge: bring up HFP on a
+    new link, launch the listener, restart it if it dies, stop it when the link
+    goes. Its own thread so one badge's slow path (a 30 s card timeout) never
+    holds up another's.
+
+    It acts only when the badge is connected on the adapter it is ASSIGNED to.
+    Connected anywhere else means the coordinator is about to evict it or
+    remove a pairing; the listener waits for that to settle.
+    """
+
+    def __init__(self, mac, username, listener_path):
+        super().__init__(daemon=True, name=f"sup-{mac}")
+        self.mac, self.username, self.listener_path = mac, username, listener_path
+        self.stop_evt = threading.Event()
+        self.proc     = None
+        self.adapter  = None   # adapter the running listener was scoped to
+
+    def _launch(self, adapter):
+        with _state_lock:
+            hci = ADAPTERS.get(adapter, {}).get("hci", "")
+        env = build_session_env(self.mac, adapter, hci, self.username)
+        self.proc    = launch_listener(self.mac, self.username, self.listener_path, env)
+        self.adapter = adapter
+        with _state_lock:
+            RUNNING.add(self.mac)
+
+    def _halt(self, why=None):
+        if self.proc and self.proc.poll() is None and why:
+            print(f"[transceiver] {self.mac}: {why}, stopping listener.py")
+        _stop(self.proc)
+        self.proc, self.adapter = None, None
+        with _state_lock:
+            RUNNING.discard(self.mac)
+
+    def run(self):
+        mac = self.mac
+        try:
+            while not self.stop_evt.is_set():
+                with _state_lock:
+                    live, mine = LIVE.get(mac), ASSIGNED.get(mac)
+                adapter = live if live and live == mine else None
+
+                if adapter is None:
+                    self._halt("disconnected" if not live else f"moved to {live}")
+                elif adapter != self.adapter:
+                    # New link — paged by us, or the badge powered on and
+                    # paged us. Both arrive here, which is the point.
+                    self._halt(f"link moved {self.adapter} -> {adapter}")
+                    print(f"[transceiver] badge online: {mac} on {adapter}")
+                    ok = ensure_audio_ready(mac, self.username)
+                    if not ok:
+                        # A dead PipeWire session looks exactly like a dead
+                        # badge from here; start (never restart) it and retry
+                        # once before writing the badge off.
+                        print(f"[transceiver] {mac}: retrying after ensuring the "
+                              "audio stack is up...")
+                        ensure_audio_services(self.username, force=True)
+                        ok = ensure_audio_ready(mac, self.username)
+                    if not ok:
+                        print(f"[transceiver] {mac} is connected but exposes no "
+                              f"audio card — disconnecting and standing it down "
+                              f"for {UNUSABLE_COOLDOWN}s.")
+                        with _state_lock:
+                            path = PAIRED.get(mac, {}).get(adapter)
+                        if path:
+                            bz_call(path, DEVICE_IF, "Disconnect")
+                        quarantine(mac)
+                    else:
+                        ensure_no_badge_default(self.username)
+                        self._launch(adapter)
+                elif self.proc and self.proc.poll() is not None:
+                    print(f"[transceiver] {mac}: listener.py exited "
+                          f"({self.proc.returncode}); restarting")
+                    self._launch(adapter)
+                self.stop_evt.wait(DETECT_INTERVAL)
+        except Exception as e:
+            print(f"[transceiver] {mac}: supervisor error: {e}")
+        finally:
+            self._halt()
+
+
+# ---------------------------------------------------------------------------
+# Coordinator
+# ---------------------------------------------------------------------------
+
+def _fmt_assignment(assigned, adapters):
+    if not assigned:
+        return "(none)"
+    return ", ".join(f"{m} -> {a} ({adapters.get(a, {}).get('hci', '?')})"
+                     for m, a in sorted(assigned.items()))
 
 
 def main():
@@ -660,117 +934,94 @@ def main():
     if not os.path.isfile(listener_path):
         sys.exit(f"listener.py not found at {listener_path}")
 
-    global _badge_connected
+    if os.environ.get("SDK_BADGE_MAC"):
+        print("[transceiver] NOTE: SDK_BADGE_MAC is no longer used and is "
+              "ignored. Every badge paired to this host is supervised; unpair "
+              "a badge to keep it out.")
 
-    listener_proc = None
-    current_mac   = None
-    last_idle_msg = 0.0
+    # SIGTERM (systemd, pkill) must stop the listeners too, not orphan them.
+    def _term(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _term)
 
     # A headless/SSH-only relay host may have no PipeWire session running yet.
     # Once, at startup — see ensure_audio_services() for why not per-pass.
     ensure_audio_services(username)
+    ensure_no_badge_default(username)
 
-    # Start the PAGE loop. Daemon, so Ctrl-C kills it with the process.
-    threading.Thread(target=page_loop, daemon=True).start()
+    threading.Thread(target=page_loop, daemon=True, name="page").start()
 
     print(f"[transceiver] detect every {DETECT_INTERVAL}s, page every "
-          f"~{PAGE_GAP}s + page timeout while absent")
-    print("[transceiver] badge filter: " +
-          (", ".join(sorted(WANTED_MACS)) if WANTED_MACS
-           else "any paired TNG COMBADGE (set SDK_BADGE_MAC to pin one)"))
+          f"~{PAGE_GAP}s + page timeout per absent badge; one badge per adapter")
 
-    # DETECT loop. Note what is NOT here: no bluetoothctl connect. This loop
-    # only ever observes and reacts, which is what keeps it fast.
+    supervisors = {}
+    last_tree, last_survey = None, 0.0
+    adapters, paired = {}, {}
+
     try:
         while True:
-            macs = live_badges()
-            if not macs:
-                # Throttled: at a 2 s cadence an unconditional print would
-                # scroll the console into uselessness.
-                if time.time() - last_idle_msg > 30:
-                    if find_paired_badges_cached():
-                        print("[transceiver] all paired badges are standing down "
-                              "(connected but no audio card) — waiting for cooldown.")
-                    elif WANTED_MACS:
-                        print("[transceiver] none of SDK_BADGE_MAC "
-                              f"({', '.join(sorted(WANTED_MACS))}) is paired — "
-                              "pair it with bluetoothctl, or unset SDK_BADGE_MAC.")
-                    else:
-                        print("[transceiver] no paired TNG COMBADGE — pair one with bluetoothctl.")
-                    last_idle_msg = time.time()
+            tree = bluez_tree()
+            if tree is None:
+                say_once("bluez", "[transceiver] BlueZ is not answering on D-Bus "
+                                  "(is bluetoothd running?)")
                 time.sleep(max(DETECT_INTERVAL, 1.0))
                 continue
+            unsay("bluez")
 
-            mac = connected_badge(macs)
+            # Pre-flight: on any change to BlueZ's objects, and periodically.
+            if tree != last_tree or time.time() - last_survey > SURVEY_INTERVAL:
+                adapters, paired = survey(tree)
+                last_tree, last_survey = tree, time.time()
+                say_once("adapters", "[transceiver] adapters: " + (
+                    ", ".join(f"{a} ({v['hci']})" for a, v in sorted(adapters.items()))
+                    or "NONE"))
+
+            live = observe(paired)
             with _state_lock:
-                _badge_connected = mac is not None   # tells the page loop to stand down
+                previous, running = dict(ASSIGNED), set(RUNNING)
+            assigned, evict, orphans = assign(adapters, paired, live, previous, running)
+            with _state_lock:
+                ADAPTERS.clear(); ADAPTERS.update(adapters)
+                PAIRED.clear();   PAIRED.update(paired)
+                ASSIGNED.clear(); ASSIGNED.update(assigned)
+                LIVE.clear();     LIVE.update(live)
 
-            if not mac:
-                # Badge gone. Stop listener.py and let the page loop do its work.
-                if listener_proc and listener_proc.poll() is None:
-                    print(f"[transceiver] {current_mac} disconnected, stopping listener.py")
-                    listener_proc.terminate()
-                    listener_proc.wait(timeout=5)
-                listener_proc = None
-                current_mac   = None
-                time.sleep(DETECT_INTERVAL)
-                continue
+            say_once("assign", "[transceiver] assignment: "
+                     + _fmt_assignment(assigned, adapters))
+            if orphans:
+                say_once("orphans", f"[transceiver] no adapter of its own for "
+                         f"{', '.join(orphans)} ({len(paired)} badges paired, "
+                         f"{len(adapters)} adapters) -- left unconnected. Two "
+                         "badges never share an adapter.")
+            else:
+                unsay("orphans")
+            if not adapters:
+                say_once("idle", "[transceiver] no Bluetooth adapter is available.")
+            elif not paired:
+                say_once("idle", "[transceiver] no TNG COMBADGE is paired to any "
+                                 "adapter on this host.")
+            else:
+                unsay("idle")
 
-            # New link — however it was established: paged by us, or the badge
-            # powered on and paged us. Both arrive here, which is the point.
-            # This is also the badge-SWAP path: switch one badge off and another
-            # on, and the handover happens here with no restart.
-            if mac != current_mac:
-                if current_mac:
-                    print(f"[transceiver] badge changed: {current_mac} -> {mac}")
-                else:
-                    print(f"[transceiver] badge online: {mac}")
-                if listener_proc and listener_proc.poll() is None:
-                    listener_proc.terminate()
-                    listener_proc.wait(timeout=5)
-                ok = ensure_audio_ready(mac, username)
-                if not ok:
-                    # Before writing the badge off, restart the user's audio
-                    # stack once and try again. A dead PipeWire session looks
-                    # exactly like a dead badge from here, and the badge is the
-                    # more expensive thing to wrongly discard.
-                    print("[transceiver] retrying after restarting the audio stack...")
-                    ensure_audio_services(username, force=True)
-                    ok = ensure_audio_ready(mac, username)
-                if not ok:
-                    # Connected but NOT usable — no audio card ever appeared.
-                    # Disconnect to clear the half-open link, stand this badge
-                    # down, and release the page loop so the OTHER badge gets
-                    # paged. Retrying the same badge here instead (which this
-                    # code originally did) is a livelock: the page loop stays
-                    # parked because a badge is "connected", and the badge you
-                    # are actually holding is never reached.
-                    print(f"[transceiver] {mac} is connected but exposes no audio "
-                          f"card — disconnecting and standing it down for "
-                          f"{UNUSABLE_COOLDOWN}s so other badges get a turn.")
-                    run([BTCTL, "disconnect", mac])
-                    quarantine(mac)
-                    with _state_lock:
-                        _badge_connected = False
-                    current_mac = None
-                    time.sleep(DETECT_INTERVAL)
-                    continue
-                env           = build_session_env(mac, username)
-                listener_proc = launch_listener(mac, username, listener_path, env)
-                current_mac   = mac
+            if enforce(assigned, evict, paired, live):
+                last_tree = None    # BlueZ changed under us: survey next pass
 
-            # listener.py crashed or exited cleanly — restart it.
-            if listener_proc and listener_proc.poll() is not None:
-                print(f"[transceiver] listener.py exited ({listener_proc.returncode}); restarting")
-                env           = build_session_env(mac, username)
-                listener_proc = launch_listener(mac, username, listener_path, env)
+            # One supervisor per assigned badge; retire the rest.
+            for mac in assigned:
+                if mac not in supervisors or not supervisors[mac].is_alive():
+                    supervisors[mac] = BadgeSupervisor(mac, username, listener_path)
+                    supervisors[mac].start()
+            for mac in [m for m in supervisors if m not in assigned]:
+                supervisors.pop(mac).stop_evt.set()
 
             time.sleep(DETECT_INTERVAL)
 
     except KeyboardInterrupt:
-        print("\n[transceiver] shutting down")
-        if listener_proc and listener_proc.poll() is None:
-            listener_proc.terminate()
+        print("[transceiver] shutting down")
+        for sup in supervisors.values():
+            sup.stop_evt.set()
+        for sup in supervisors.values():
+            sup.join(timeout=8)
 
 
 if __name__ == "__main__":

@@ -25,12 +25,18 @@ Background — the HFP/SCO audio link:
   HID tap channel and from A2DP stereo streaming.
 
   The SCO link must be explicitly opened (by starting capture from the badge
-  microphone) and torn down (by setting the card profile to "off").  When it
-  isn't active, pw-play targeting the badge sink falls back to default output
-  (usually laptop speakers), which is the most common source of confusion.
+  microphone) and torn down (by setting the card profile to "off").
+
+One listener per badge (PI.md phase 1).  Several of these run side by side on
+a multi-adapter host, one per badge, each badge on its own Bluetooth adapter.
+Nothing here may reach a device that is not this badge's, so every detector
+and every audio path is pinned to it -- see "Staying on this badge" below.
 
 Required environment (set by transceiver.py — do not run this script directly):
     BADGE_MAC                — e.g. 2C:F2:DF:45:EC:28
+    BADGE_ADAPTER            — address of the adapter holding this badge's link,
+                               e.g. CC:BA:BD:CA:FD:2B (scopes the tap node)
+    BADGE_HCI                — that adapter's index name, e.g. hci0 (scopes btmon)
     SDK_SERVER_HOST          — hostname/IP of the machine running computer.py
     SDK_SERVER_PORT          — TCP port for computer.py (default 1701)
     XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, HOME, USER  — for pw-play/pactl
@@ -70,6 +76,43 @@ if len(BADGE_MAC) != 17:
 
 SERVER_HOST = os.environ.get("SDK_SERVER_HOST", "127.0.0.1")
 SERVER_PORT = int(os.environ.get("SDK_SERVER_PORT", "1701"))
+
+# The adapter this badge's link is on.  Empty only if the listener is started
+# by hand without them, in which case it behaves as it did single-badge: first
+# combadge input node, unfiltered btmon.  Safe with one badge, wrong with two.
+BADGE_ADAPTER = os.environ.get("BADGE_ADAPTER", "").strip().lower()
+BADGE_HCI     = os.environ.get("BADGE_HCI", "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Staying on this badge
+#
+# With one badge per host, "the combadge" and "the default audio device" were
+# never wrong.  With several, each of these would quietly reach the OTHER one:
+#
+#   tap node   every badge's input node has the same name, and `uniq` (where
+#              the badge MAC would go) is empty.  `phys` is the ADAPTER
+#              address, which is the one thing that differs.  find_badge_input()
+#   btmon      bare btmon sees every adapter; one badge's hang-up tap would end
+#              the other's recording.  `btmon -i <hci>`.  _start_btmon()
+#   playback   a stream whose sink goes away is re-linked by PipeWire to the
+#   capture    DEFAULT sink (or source).  On a host with no sound device of its
+#              own -- PAN, a Pi -- PipeWire makes the BADGES the defaults, so
+#              one badge's answer plays out of the other, and one badge's
+#              recording hears the other's mic.  transceiver.py therefore points
+#              the defaults at a null sink whenever a badge holds them
+#              (ensure_no_badge_default()), so a fallback lands nowhere.
+#
+# ~~node.dont-fallback~~ REMOVED 2026-09-26, the same day it went in -- do not
+# re-add.  It forbade the fallback outright, which looked like the direct fix,
+# and it truncated the startup greeting of whichever badge started first, both
+# times, on the first two-badge runs.  The HFP sink node is briefly re-created
+# as SCO comes up; without the flag PipeWire re-links the stream to the new
+# node and nobody notices, with it the stream dies ("stream node unconnected").
+# Measured on PAN (multiuser/xtalk_probe.py): a 4 s tone played in full 1 time
+# in 6 with the flag, 6 in 6 without, and 24 in 24 without it across every
+# cross-badge disturbance once the defaults were a null sink.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +174,7 @@ ANNOUNCE_TAIL_S         = 0.35
 # delivered a hail to this badge and is holding its answer window -- and b'E',
 # any tap, or a downlink reconnect clears it.  The cap is a backstop only, in
 # case b'E' never arrives; the server's own window is SDK_HAIL_ANSWER_S (30).
-HAIL_PENDING_MAX_S      = 45
+HAIL_PENDING_MAX_S      = 60   # > 20 s hail + 30 s window (Phase 13)
 hail_pending            = {"until": 0.0}
 NACK_WAV                = os.path.join(ASSET_DIR, "commandfailure.wav")
 # Spoken "Cancelled." -- a tap ended the recording and nothing came of it.
@@ -427,10 +470,11 @@ def play_wav(path, prime=True, volume=0.5):
     if prime:
         play_silence(PRIME_MS)
     t0 = time.monotonic()
-    subprocess.run(["pw-play", "--target", SINK, "--media-role=communication",
-                    "--volume", str(volume), path],
-                   check=False, capture_output=True, timeout=15)
-    check_playback(path, time.monotonic() - t0)
+    r = subprocess.run(["pw-play", "--target", SINK,
+                        "--media-role=communication",
+                        "--volume", str(volume), path],
+                       check=False, capture_output=True, timeout=15)
+    check_playback(path, time.monotonic() - t0, r)
 
 
 def wav_duration_s(path):
@@ -447,7 +491,7 @@ def wav_duration_s(path):
         return 0.0
 
 
-def check_playback(path, elapsed):
+def check_playback(path, elapsed, result=None):
     """Warn if pw-play returned far sooner than the audio's real length.
 
     WHY this exists:
@@ -473,8 +517,17 @@ def check_playback(path, elapsed):
     """
     expected = wav_duration_s(path)
     if expected and elapsed < expected * 0.75:
+        # pw-play's own words, when it said any. "stream node unconnected"
+        # (the stream lost its sink) reads very differently from a clean exit
+        # that simply came early. Added 2026-09-26, when a two-badge startup
+        # truncated one badge's greeting and the log could not say why.
+        said = ""
+        if result is not None:
+            err = (result.stderr or b"").decode("utf-8", "replace").strip()
+            said = (f" rc={result.returncode}"
+                    + (f", pw-play: {err.splitlines()[-1]}" if err else ""))
         print(f"[listener] PLAYBACK TRUNCATED — {os.path.basename(path)}: "
-              f"expected {expected:.2f}s, pw-play ran {elapsed:.2f}s. "
+              f"expected {expected:.2f}s, pw-play ran {elapsed:.2f}s.{said} "
               f"The sink stopped early or never started; the badge did not "
               f"get the whole sound.", file=sys.stderr)
 
@@ -558,6 +611,10 @@ def start_sco_capture(timeout_s=10):
             terminate_ffmpeg(ffmpeg)
             return None
         header += chunk
+    # Kept on the process: a prewarmed hail hands this capture to the SCO hold,
+    # and the next cycle sends the header ahead of its PCM as if it had just
+    # opened the source (the server discards the first 44 bytes either way).
+    ffmpeg.sdk_header = header
     return ffmpeg
 
 
@@ -757,6 +814,27 @@ class _ScoHold:
 _sco_hold = _ScoHold()
 atexit.register(_sco_hold.drop, "shutdown")
 
+# A tap DURING a prewarmed hail answers it (INTERCOM.md Phase 13).  The
+# downlink thread is the one playing the hail, so it is the one that sees the
+# tap (on btmon -- SCO is up, so a tap is AT+CHUP, not a key event); but taps
+# are acted on by main().  One byte down this pipe wakes main()'s select, and
+# main() runs the cycle on the live link the downlink left in the hold.
+_answer_r, _answer_w = os.pipe()
+os.set_blocking(_answer_r, False)
+
+
+def _discard_backlog(proc):
+    """Throw away whatever an unread capture has queued.  A prewarmed capture
+    is not read while the hail plays, and handed to an answering cycle as-is
+    its backlog -- the room during the hail -- would open the channel."""
+    fd = proc.stdout.fileno()
+    try:
+        while select.select([fd], [], [], 0)[0]:
+            if not os.read(fd, 65536):
+                break
+    except OSError:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # HFP profile management (SCO link lifecycle)
@@ -829,6 +907,11 @@ def find_badge_input():
       2. Fallback: the device reports KEY_PAUSECD (keycode 201) or keycode 200
          in its EV_KEY capability set — the badge single-tap fires one of these
          depending on firmware version.
+    and, when BADGE_ADAPTER is set, ONLY among nodes whose `phys` is that
+    adapter's address.  Every badge's node has the same name and an empty
+    `uniq`, so on a two-badge host both tests above match both badges; the
+    adapter is the only thing that tells them apart (see "Staying on this
+    badge").  One badge per adapter is what makes that sufficient.
 
     The /dev/input/eventX path can change across Bluetooth reconnections, so
     this is called in a loop rather than cached at startup.
@@ -841,6 +924,8 @@ def find_badge_input():
             dev = evdev.InputDevice(path)
         except OSError:
             continue   # device vanished or we lack permission; skip it
+        if BADGE_ADAPTER and (dev.phys or "").strip().lower() != BADGE_ADAPTER:
+            continue   # another adapter's device -- possibly the other badge
         if "TNG COMBADGE" in dev.name.upper():
             return path
         # Fallback: identify by the key codes the badge emits on single-tap.
@@ -903,9 +988,12 @@ def _discard_btmon(watch):
             watch["dead"] = True
 
 
-def _play_cuttable(path, watch):
+def _play_cuttable(path, watch, volume=0.5, max_s=15):
     """Play a spoken answer that a tap can cut off.  Returns the time.time()
     of the cutting tap, or 0.0 if the answer played to the end.
+
+    Also plays a prewarmed HAIL (volume=PUSH_VOLUME, a longer cap -- a hail
+    can run to the server's 20 s capture limit), where a tap means "answer".
 
     A tap during the answer means "I no longer care about this response"
     (Captain, 2026-09-13): the answer stops and the cycle ends as a cancel.
@@ -932,13 +1020,14 @@ def _play_cuttable(path, watch):
         print("[listener] tap — answer cut off before it began")
         return time.time()
     t0 = time.monotonic()
-    proc = subprocess.Popen(["pw-play", "--target", SINK, "--media-role=communication",
-                             "--volume", "0.5", path],
+    proc = subprocess.Popen(["pw-play", "--target", SINK,
+                             "--media-role=communication",
+                             "--volume", str(volume), path],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     while proc.poll() is None:
         if fd is None or watch.get("dead"):
             try:
-                proc.wait(timeout=15)
+                proc.wait(timeout=max_s)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
@@ -948,7 +1037,7 @@ def _play_cuttable(path, watch):
             terminate_ffmpeg(proc)   # SIGTERM, escalated to SIGKILL -- any process
             print(f"[listener] tap — answer cut off after {time.monotonic() - t0:.2f}s")
             return cut_at
-        if time.monotonic() - t0 > 15:
+        if time.monotonic() - t0 > max_s:
             proc.kill()
             proc.wait()
             break
@@ -1132,9 +1221,34 @@ def downlink_loop():
                         try:
                             if warm:
                                 # Hot path: SCO already live from prewarm.
-                                print("[listener] pushed voice received — playing (prewarmed)")
-                                play_wav(path, prime=False, volume=PUSH_VOLUME)
-                                release_warm()
+                                # INTERCOM.md Phase 13: a tap DURING the hail
+                                # answers it, cutting the rest off; and the
+                                # live link is not torn down afterwards but
+                                # left in the SCO hold, so a tap just after
+                                # the hail reuses it -- no bring-up, and no
+                                # teardown chirp to wait through first.
+                                print("[listener] pushed voice received — playing "
+                                      "(prewarmed); a tap now answers it")
+                                bpid, bfd = _start_btmon()
+                                watch = {"fd": bfd, "buf": ""}
+                                cut_at = _play_cuttable(path, watch,
+                                                        volume=PUSH_VOLUME, max_s=30)
+                                if watch.get("dead"):
+                                    _stop_btmon(bpid, bfd)
+                                    bpid = bfd = None
+                                proc, warm = warm, None
+                                if proc.poll() is None:
+                                    _discard_backlog(proc)
+                                    _sco_hold.begin(proc, getattr(proc, "sdk_header", b""),
+                                                    (bpid, bfd), watch["buf"])
+                                else:
+                                    _stop_btmon(bpid, bfd)
+                                    force_sco_teardown()
+                                audio_lock.release()
+                                if cut_at:
+                                    print("[listener] tap during the hail — answering")
+                                    _tap_clock["last"] = cut_at
+                                    os.write(_answer_w, b"a")
                             else:
                                 print("[listener] pushed voice received — playing")
                                 play_pushed_voice(path)
@@ -1200,8 +1314,11 @@ def _start_btmon():
     except OSError:
         return None, None
     if pid == 0:   # child
+        # -i: this badge's adapter only.  Bare btmon sees every adapter, and a
+        # hang-up tap on the other badge would end this badge's recording.
+        scope = ["-i", BADGE_HCI] if BADGE_HCI else []
         try:
-            os.execvp("stdbuf", ["stdbuf", "-oL", "btmon"])
+            os.execvp("stdbuf", ["stdbuf", "-oL", "btmon", *scope])
         except Exception:
             os._exit(127)
     return pid, fd
@@ -1287,13 +1404,27 @@ def run_channel(sock, ffmpeg, btmon=(None, None)):
     #             NOT accept raw stdin ('-') — it hands it to sndfile,
     #             which fails with "Format not recognised" (rc=1, seen in
     #             pwcat.log).  Kept in case a future pipewire fixes that.
+    #
+    # EXPLICIT VOLUME, both players.  WirePlumber remembers a volume per
+    # APPLICATION NAME and restores it onto every later stream of that name
+    # that does not set its own -- and every badge's channel player is named
+    # "paplay", so one stored value governs them all.  On 2026-09-26 a test
+    # run of `paplay --volume 1000` stored 0.000004 (-108 dB) for "paplay",
+    # and every intercom channel after it carried audio perfectly -- bytes
+    # up, bytes down, gate open -- to a badge playing it inaudibly.  An
+    # explicit volume beats the stored one (measured: 1040/65536 restored
+    # without, 65536 with).
     player_cmds = [
         ["paplay", "--raw", "--rate=16000", "--channels=1",
-         "--format=s16le", f"--device={SINK}"],
-        ["pw-cat", "-p", "--target", SINK, "--media-role=communication",
+         "--format=s16le", "--volume=65536", f"--device={SINK}"],
+        ["pw-cat", "-p", "--target", SINK,
+         "--media-role=communication", "--volume", "1.0",
          "--rate", "16000", "--channels", "1", "--format", "s16", "-"],
     ]
-    pwcat_log_path = os.path.join(LOG_DIR, "pwcat.log")
+    # Per badge: with two listeners the lines would otherwise interleave in one
+    # file with nothing saying which badge's player wrote them.
+    pwcat_log_path = os.path.join(
+        LOG_DIR, f"pwcat_{BADGE_MAC.replace(':', '_')}.log")
 
     def _pump_player_output(pipe):
         # Drain player output to pwcat.log via transient opens — handing the
@@ -1363,6 +1494,7 @@ def run_channel(sock, ffmpeg, btmon=(None, None)):
     threading.Thread(target=_announce, daemon=True).start()
     opened  = time.time()
     closing = False
+    close_tap_at = 0.0   # set when a TAP here closes the channel
     buf     = b""
     up_b = down_b = dropped_b = 0
     player_dead = False
@@ -1430,6 +1562,7 @@ def run_channel(sock, ffmpeg, btmon=(None, None)):
                         and time.time() - opened > CHANNEL_TAP_GRACE_S):
                     print("[listener] channel close requested (tap)")
                     closing = True
+                    close_tap_at = time.time()
                     try:
                         sock.shutdown(socket.SHUT_WR)
                     except OSError:
@@ -1449,6 +1582,7 @@ def run_channel(sock, ffmpeg, btmon=(None, None)):
                             and not closing):
                         print("[listener] channel close requested (tap)")
                         closing = True
+                        close_tap_at = time.time()
                         try:
                             sock.shutdown(socket.SHUT_WR)
                         except OSError:
@@ -1554,7 +1688,17 @@ def run_channel(sock, ffmpeg, btmon=(None, None)):
         terminate_ffmpeg(player)
     print(f"[listener] CHANNEL CLOSED (up {up_b//1024}KB down {down_b//1024}KB "
           f"dropped {dropped_b//1024}KB)")
-    play_wav(CHANNEL_CLOSED_WAV, prime=False)   # "Channel closed." (Phase 9); SCO still hot
+    # "Channel closed." (Phase 9); SCO still hot.  On the badge whose TAP
+    # closed the channel, the badge's own hang-up chirp sounds ~0.5 s after the
+    # tap and holds the speaker past it -- played at once, the cue was masked
+    # there and heard only on the OTHER badge (Captain, PAN, 2026-09-26).  So
+    # the tapped side waits the chirp out exactly as a tap-ended command
+    # cycle does (_play_after_tap_chirp).  The far side, closed by b'X', has
+    # no chirp in the way and plays at once, as before.
+    if close_tap_at:
+        _play_after_tap_chirp(CHANNEL_CLOSED_WAV, close_tap_at, "Channel closed.")
+    else:
+        play_wav(CHANNEL_CLOSED_WAV, prime=False)
 
 
 # ---------------------------------------------------------------------------
@@ -2021,6 +2165,11 @@ def main():
     print(f"[listener] badge={BADGE_MAC}  server={SERVER_HOST}:{SERVER_PORT}")
     print(f"[listener] source={SOURCE}")
     print(f"[listener] sink={SINK}")
+    if BADGE_ADAPTER:
+        print(f"[listener] adapter={BADGE_ADAPTER} ({BADGE_HCI or 'hci unknown'})")
+    else:
+        print("[listener] WARNING: no BADGE_ADAPTER -- tap node and btmon are "
+              "unscoped. Fine with one badge on this host, wrong with two.")
 
     # Play the badge-online sound (cold SCO start via play_wav_cold).
     # This confirms audio is routing to the badge before we wait for the server.
@@ -2071,10 +2220,24 @@ def main():
                 # hold's btmon and no key event at all, so that fd is watched
                 # here too, on this same thread.
                 hold_fd = _sco_hold.watch_fd()
-                fds = [dev.fd] + ([hold_fd] if hold_fd is not None else [])
+                fds = [dev.fd, _answer_r] + ([hold_fd] if hold_fd is not None else [])
                 r, _, _ = select.select(fds, [], [], 0.5)
                 if not r:
                     continue   # no events in 0.5 s — loop back to select
+
+                if _answer_r in r:
+                    # The downlink saw a tap during a prewarmed hail (Phase
+                    # 13) and left the live link in the hold.  Answer on it.
+                    try:
+                        while os.read(_answer_r, 64):
+                            pass
+                    except BlockingIOError:
+                        pass
+                    reuse = _sco_hold.claim()
+                    print("[listener] answering the hail"
+                          + (" on the live link" if reuse else " (link gone, full path)"))
+                    stream_and_handle_response(reuse)
+                    break      # close and reopen the device, as after any cycle
 
                 if hold_fd is not None and hold_fd in r:
                     tapped, alive = _sco_hold.poll_taps()

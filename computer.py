@@ -2197,7 +2197,13 @@ def handle_hail(conn, caller_mac, target_mac, phrase, rec, pcm, mac_to_aliases):
     capture_start  = time.time()
     last_text      = ""
     last_progress  = time.time()
-    last_keepalive = time.time()
+    # 0.0, not now: the FIRST keepalive goes out on the first beat.  The
+    # caller's listener gives up RECORD_MAX_S (13 s) after it started
+    # transmitting unless a b'k' slides that deadline, and a hail phrase can
+    # match late in a long utterance -- waiting 4 s more for the first
+    # keepalive let a 10 s hail run the caller out of time, which withdrew
+    # the hail before it could be answered (PAN, 2026-09-26).
+    last_keepalive = 0.0
     while True:
         if time.time() - last_progress >= HAIL_SILENCE_S:
             break                                    # end of speech
@@ -2265,10 +2271,15 @@ def handle_hail(conn, caller_mac, target_mac, phrase, rec, pcm, mac_to_aliases):
                 "floor": {"holder": None, "guard_until": 0.0, "held_since": 0.0}}
     with pending_hails_lock:
         pending_hails[target_mac] = entry
+    # The window is HAIL_ANSWER_S from when the hail FINISHES playing, not from
+    # when it was sent: a 15 s hail used to leave 15 s to answer.  The target
+    # can also answer DURING playback (a tap cuts the hail off, INTERCOM.md
+    # Phase 13), so starting the clock late costs nothing.
+    hail_s   = len(hail_wav) / 32000.0
     print(f"[computer] [{caller_mac}] awaiting answer from {target_mac} "
-          f"({int(HAIL_ANSWER_S)}s window)")
-    deadline       = time.time() + HAIL_ANSWER_S
-    last_keepalive = time.time()
+          f"({int(HAIL_ANSWER_S)}s window after {hail_s:.0f}s of hail)")
+    deadline       = time.time() + hail_s + HAIL_ANSWER_S
+    last_keepalive = 0.0     # immediately: see the capture loop above
     try:
         while time.time() < deadline and not answered.is_set():
             if time.time() - last_keepalive >= 4:
