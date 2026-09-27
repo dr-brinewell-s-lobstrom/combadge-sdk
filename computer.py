@@ -346,8 +346,8 @@ class NeedsMac:
         self.fn = fn
 
 
-def _set_discovery(mac, enabled):
-    """Turn new badge discovery on or off on the speaking badge's transceiver
+def _set_onboarding(mac, enabled):
+    """Turn onboarding on or off on the speaking badge's transceiver
     host (multiuser/PI.md phase 2, Ruling 1). The setting lives THERE, as a file
     its listener writes on b'D' (disabled) and removes on b'Y' (enabled), so it
     survives a power cut and the transceiver reads it without a socket of its
@@ -355,10 +355,10 @@ def _set_discovery(mac, enabled):
     looked for."""
     if not _downlink_signal(mac, b"Y" if enabled else b"D"):
         return "Unable to reach this badge's transceiver."
-    print(f"[computer] [{mac}] new badge discovery {'ENABLED' if enabled else 'DISABLED'} "
+    print(f"[computer] [{mac}] onboarding {'ENABLED' if enabled else 'DISABLED'} "
           f"sent to its transceiver")
-    return ("New badge discovery enabled." if enabled
-            else "New badge discovery disabled.")
+    return ("Onboarding enabled." if enabled
+            else "Onboarding disabled.")
 
 
 COMMANDS = {
@@ -366,12 +366,12 @@ COMMANDS = {
     "computer status":  "All systems nominal.",
     "computer time":    _time_phrase,   # e.g. "sixteen eleven hours."
     "computer goodbye": "Acknowledged.",
-    # New badge discovery (multiuser/PI.md phase 2): stop / resume claiming new badges on
+    # Onboarding on / off (multiuser/PI.md phase 2): stop / resume claiming new badges on
     # the speaker's transceiver. Phrases chosen by the Captain, 2026-09-26.
     # Neither is a substring of the other ("computer enable" does not occur in
     # "computer disable"), so the match loop cannot confuse them.
-    "computer disable new badge discovery": NeedsMac(lambda mac: _set_discovery(mac, False)),
-    "computer enable new badge discovery":  NeedsMac(lambda mac: _set_discovery(mac, True)),
+    "computer disable onboarding": NeedsMac(lambda mac: _set_onboarding(mac, False)),
+    "computer enable onboarding":  NeedsMac(lambda mac: _set_onboarding(mac, True)),
 }
 
 
@@ -2709,18 +2709,18 @@ def console_loop():
                 print(f"[console] channel closed ({chan['from']} <-> "
                       f"{chan.get('answer_mac')})")
 
-        elif cmd == "discovery":
-            # New badge discovery on / off on EVERY connected transceiver host
+        elif cmd == "onboarding":
+            # Onboarding on / off on EVERY connected transceiver host
             # (each listener that hears b'Y'/b'D' updates its host's
-            # discovery_disabled.flag).
+            # onboarding_disabled.flag).
             if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
-                print("[console] usage: discovery on|off")
+                print("[console] usage: onboarding on|off")
                 continue
             with downlinks_lock:
                 macs = list(downlinks)
             byte = b"Y" if parts[1].lower() == "on" else b"D"
             sent = [m for m in macs if _downlink_signal(m, byte)]
-            print(f"[console] new badge discovery {parts[1].lower()} sent to "
+            print(f"[console] onboarding {parts[1].lower()} sent to "
                   f"{', '.join(sent) or 'no connected badge'}")
 
         elif cmd == "game":
@@ -2741,7 +2741,7 @@ def console_loop():
 
         else:
             print("[console] commands: badges | hail <mac> [text] | close | "
-                  "discovery on|off | game [on|off]")
+                  "onboarding on|off | game [on|off]")
 
 
 # ---------------------------------------------------------------------------

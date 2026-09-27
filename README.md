@@ -285,7 +285,7 @@ Runs before any paging, and assumes nothing about who set things up - the user m
 | badge paired on **two adapters** | once it connects, remove its pairing on the other adapter. Not before: until then there is no telling which one is the extra |
 | **two badges paired on one adapter** (the likeliest mistake when pairing by hand - `bluetoothctl` pairs on the default adapter) | the connected one keeps it, otherwise the lower MAC; the other is left unconnected and logged |
 | more paired badges than adapters | one per adapter; the rest are left unconnected and logged |
-| a combadge seen but not paired | claimed, if an adapter is free and discovery is enabled - see *Claiming* below |
+| a combadge seen but not paired | claimed, if an adapter is free and onboarding is enabled - see *Claiming* below |
 
 **Two badges never share an adapter.** It is not a preference: two badges on one adapter produced audio chaos and Bluetooth stack crashes (TOS, 2026-09-13). A badge that comes up on an adapter another badge owns - it is paired there, so it may connect by itself - is disconnected, every time.
 
@@ -299,14 +299,14 @@ To keep a badge out, unpair it from this host. The pairings *are* the set; there
 - **Measured** (PAN, 2026-09-26): pair 5.4 s, trust 0.2 s, connect 0.5 s, no prompt; both badges claimed from a full wipe, one per adapter. A badge its host has unpaired goes **straight back to discoverable** - no button, no power cycle. A pairing can fail on the first try (it did once); the next window tries again, and the log gives `bluetoothctl`'s own reason.
 - **Only while an adapter is free.** With every adapter holding its badge, nothing is scanned.
 
-### Disabling new badge discovery
+### Disabling onboarding
 
 Every badge found is claimed by default. To stop that - taking the transceiver somewhere other people's badges are about - say:
 
-- *"computer, disable new badge discovery"* → *"New badge discovery disabled."*
-- *"computer, enable new badge discovery"* → *"New badge discovery enabled."*
+- *"computer, disable onboarding"* → *"Onboarding disabled."*
+- *"computer, enable onboarding"* → *"Onboarding enabled."*
 
-The badges already claimed are unaffected. The setting is a file, `discovery_disabled.flag` beside `transceiver.py`, so it **survives a power cut**: a transceiver that reboots mid-convention does not start claiming again. The server sends `b'D'` / `b'Y'` (discovery disabled / enabled) down the speaking badge's downlink; that badge's listener writes or removes the file; the transceiver checks it before every scan. The server console has `discovery on|off` too (every connected transceiver). It is not a security control - it only decides whether new badges are looked for. Verified 2026-09-26: with discovery disabled, a free adapter and a discoverable badge were left alone for 75 s; enabled, it was claimed in the next window.
+The badges already claimed are unaffected. The setting is a file, `onboarding_disabled.flag` beside `transceiver.py`, so it **survives a power cut**: a transceiver that reboots mid-convention does not start claiming again. The server sends `b'D'` / `b'Y'` (onboarding disabled / enabled) down the speaking badge's downlink; that badge's listener writes or removes the file; the transceiver checks it before every scan. The server console has `onboarding on|off` too (every connected transceiver). It is not a security control - it only decides whether new badges are looked for. Verified 2026-09-26: with onboarding disabled, a free adapter and a discoverable badge were left alone for 75 s; enabled, it was claimed in the next window.
 
 ### Health: a failing adapter is announced on the badges that work
 
@@ -410,7 +410,7 @@ ffmpeg is not a stylistic choice - `parec`, `parecord --file-format=raw`, and `p
 | `b'W'` | prewarm (downlink)   | bring SCO up now and hold it - a hail is about to arrive     |
 | `b'H'` | hail pending (downlink) | the next tap answers a hail - skip the `listening.wav` chirp for it |
 | `b'E'` | hail ended (downlink) | the answer window closed unanswered - taps are commands again |
-| `b'D'` / `b'Y'` | new badge discovery disabled / enabled (downlink) | write / remove `discovery_disabled.flag` for the transceiver (§4) |
+| `b'D'` / `b'Y'` | onboarding disabled / enabled (downlink) | write / remove `onboarding_disabled.flag` for the transceiver (§4) |
 | `b'O'` | channel open         | this tap socket is now a live intercom (see `INTERCOM.md`); play `channelopen.wav` |
 | `b'A'`+len+PCM | channel audio | peer audio frame (2-byte BE len); pipe into the stdin player |
 | `b'X'` | channel closed       | play `channelclosed.wav`, tear down                          |

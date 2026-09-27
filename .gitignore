@@ -12,9 +12,9 @@ log/
 # rather it never land here at all.
 captainslog.txt
 
-# New badge discovery setting (multiuser/PI.md phase 2): per installation, written by the
+# Onboarding setting (multiuser/PI.md phase 2): per installation, written by the
 # listener when "computer, secure transceiver" is heard. Never committed.
-discovery_disabled.flag
+onboarding_disabled.flag
 # Transceiver health sentence (phase 2): runtime state, never committed.
 health.txt
 health.txt.tmp

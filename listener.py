@@ -198,10 +198,10 @@ MAINCOMPUTER_OFFLINE_WAV = os.path.join(ASSET_DIR, "maincomputeroffline.wav")
 # diagnosis; on BOX (severed) it stays local.
 
 LOG_DIR  = os.path.join(SCRIPT_DIR, "log")
-# New badge discovery setting, shared with transceiver.py (which checks it
-# before claiming a new badge). Present = discovery disabled. See the
+# Onboarding setting, shared with transceiver.py (which checks it
+# before claiming a new badge). Present = onboarding disabled. See the
 # b'D'/b'Y' downlink handler.
-DISCOVERY_OFF_FILE = os.path.join(SCRIPT_DIR, "discovery_disabled.flag")
+ONBOARDING_OFF_FILE = os.path.join(SCRIPT_DIR, "onboarding_disabled.flag")
 # Health sentence written by transceiver.py (PI.md Ruling 6); see health_watch().
 HEALTH_FILE   = os.path.join(SCRIPT_DIR, "health.txt")
 HEALTH_POLL_S = 3
@@ -1236,8 +1236,8 @@ def downlink_loop():
                         audio_lock.release()
                     continue
                 if sig in (b"D", b"Y"):
-                    # New badge discovery off / on (multiuser/PI.md phase 2): the server
-                    # heard "computer, disable/enable new badge discovery" from this
+                    # Onboarding off / on (multiuser/PI.md phase 2): the server
+                    # heard "computer, disable/enable onboarding" from this
                     # badge. The transceiver on this host decides whether to
                     # claim new badges by the presence of this file, so it
                     # outlives a power cut (Ruling 1). Written here because this
@@ -1245,17 +1245,17 @@ def downlink_loop():
                     # (root) only reads it. Payload-free, non-terminal.
                     try:
                         if sig == b"D":
-                            with open(DISCOVERY_OFF_FILE, "w", encoding="utf-8", newline="\n") as f:
-                                f.write(f"discovery disabled {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                            with open(ONBOARDING_OFF_FILE, "w", encoding="utf-8", newline="\n") as f:
+                                f.write(f"onboarding disabled {time.strftime('%Y-%m-%d %H:%M:%S')} "
                                         f"by {BADGE_MAC}\n")
-                            print("[listener] new badge discovery DISABLED -- the transceiver will claim "
+                            print("[listener] onboarding DISABLED -- the transceiver will claim "
                                   "no new badges")
                         else:
-                            if os.path.exists(DISCOVERY_OFF_FILE):
-                                os.remove(DISCOVERY_OFF_FILE)
-                            print("[listener] new badge discovery ENABLED -- new badges will be claimed")
+                            if os.path.exists(ONBOARDING_OFF_FILE):
+                                os.remove(ONBOARDING_OFF_FILE)
+                            print("[listener] onboarding ENABLED -- new badges will be claimed")
                     except OSError as e:
-                        print(f"[listener] discovery setting could not be changed: {e}")
+                        print(f"[listener] onboarding setting could not be changed: {e}")
                     continue
                 if sig in (b"H", b"E"):
                     # Hail pending / ended (INTERCOM.md Phase 9). b'H' arrives
