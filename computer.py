@@ -542,6 +542,65 @@ if clicker is not None:
 # Text-to-speech synthesis
 # ---------------------------------------------------------------------------
 
+# PIPER (neural TTS) is used wherever it is installed and a voice model is
+# found; otherwise SAPI (Windows) or espeak-ng (Linux / macOS). The voice is
+# Piper's standard US English female voice, Lessac (Captain, 2026-09-27: the
+# espeak-ng voices are robotic next to Windows' Zira). Not shipped with the
+# SDK -- like the Vosk models, fetch it yourself (README, "TTS").
+#   pip install piper-tts
+#   en_US-lessac-low.onnx + .onnx.json from huggingface.co/rhasspy/piper-voices
+# placed in ../.piper/ (beside ../.vosk/) or ~/.piper/, or named outright by
+# SDK_PIPER_MODEL. The model loads once, at startup.
+#
+# COST, measured on PAN (Core 2 Duo P8400, 2008), seconds to render
+# "Captain, online." / a 6 s answer: lessac-low 0.47 / 1.8, lessac-medium
+# 0.52 / 2.3, lessac-high 4.3 / 17.5. High is far too slow for a small host.
+# Low and medium sound the same on a badge (Captain, 2026-09-27: its audio is
+# 16 kHz, which is low's native rate), so low is the default, for speed. The
+# cache means a repeated sentence (greetings, "Channel open.", fixed replies)
+# is synthesized once.
+PIPER_DEFAULT_VOICE = "en_US-lessac-low.onnx"
+PIPER_MODEL = os.environ.get("SDK_PIPER_MODEL", "")
+if not PIPER_MODEL:
+    # The default voice by name first, in either place; then any voice at all.
+    import glob
+    _dirs = (os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".piper"),
+             os.path.expanduser("~/.piper"))
+    _found = ([os.path.join(d, PIPER_DEFAULT_VOICE) for d in _dirs
+               if os.path.exists(os.path.join(d, PIPER_DEFAULT_VOICE))]
+              or [f for d in _dirs for f in sorted(glob.glob(os.path.join(d, "*.onnx")))])
+    if _found:
+        PIPER_MODEL = os.path.normpath(_found[0])
+TTS_CACHE_MAX = 64                # sentences kept, as WAV bytes
+_piper = {"voice": None}
+_piper_lock = threading.Lock()    # one synthesis at a time: two cores, and
+                                  # Vosk shares them
+_tts_cache = {}                   # text -> WAV bytes, insertion-ordered
+_tts_cache_lock = threading.Lock()
+
+
+def load_piper():
+    """Load the Piper voice once, at startup. Returns a status line."""
+    if not PIPER_MODEL:
+        return "no Piper voice model found -- using the platform voice"
+    try:
+        from piper import PiperVoice
+    except ImportError:
+        return (f"Piper voice {PIPER_MODEL} found but piper-tts is not installed "
+                "(pip install piper-tts) -- using the platform voice")
+    t = time.time()
+    try:
+        _piper["voice"] = PiperVoice.load(PIPER_MODEL)
+    except Exception as e:
+        return f"Piper voice {PIPER_MODEL} failed to load ({e}) -- using the platform voice"
+    return f"TTS: Piper, {os.path.basename(PIPER_MODEL)} (loaded in {time.time() - t:.1f}s)"
+
+
+def _synth_piper(text, path):
+    with _piper_lock, wave.open(path, "wb") as w:
+        _piper["voice"].synthesize_wav(text, w)
+
+
 def _synth_sapi(text, path):
     """Synthesize `text` to a WAV file at `path` using Windows SAPI via PowerShell.
 
@@ -577,28 +636,49 @@ def synth_wav(text):
     Returns the path to a temporary WAV file, or None if synthesis fails.
     The caller is responsible for deleting the file after use.
 
-    Platform dispatch:
+    Engine, first that is available (see PIPER_MODEL above):
+      Piper    → _synth_piper() (Lessac low, loaded once; cached per sentence)
       Windows  → _synth_sapi()  (PowerShell System.Speech, no install needed)
       Linux    → espeak-ng      (sudo apt install espeak-ng)
       macOS    → espeak-ng      (brew install espeak-ng, or adapt to use `say`)
 
     espeak-ng flags used:
-      -v en-us   US English voice
+      -v en-us+f3  US English, female variant 3 -- the Linux counterpart of the
+                   female SAPI voice asked for on Windows. Plain en-us is male,
+                   which went unnoticed until the server first ran on Linux
+                   (PAN, 2026-09-27, multiuser/PI.md phase 4).
       -s 165     speech rate in words per minute (default ~160; 165 is natural)
       -w path    write output to WAV file (instead of playing through speakers)
     """
     fd, path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
+    with _tts_cache_lock:
+        cached = _tts_cache.get(text)
+    if cached:
+        with open(path, "wb") as f:
+            f.write(cached)
+        return path
     try:
-        if sys.platform == "win32":
+        if _piper["voice"] is not None:
+            t = time.time()
+            _synth_piper(text, path)
+            print(f"[computer] TTS {time.time() - t:.1f}s: {text!r}")
+            with open(path, "rb") as f:
+                data = f.read()
+            with _tts_cache_lock:
+                _tts_cache[text] = data
+                while len(_tts_cache) > TTS_CACHE_MAX:
+                    del _tts_cache[next(iter(_tts_cache))]
+        elif sys.platform == "win32":
             _synth_sapi(text, path)
         else:
             subprocess.run(
-                ["espeak-ng", "-v", "en-us", "-s", "165", "-w", path, text],
+                ["espeak-ng", "-v", "en-us+f3", "-s", "165", "-w", path, text],
                 check=True, capture_output=True, timeout=10,
             )
         return path
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+    except Exception as e:
+        # Any engine, any failure: the caller sends b'f' (failure chirp).
         print(f"[computer] TTS failed: {e}", file=sys.stderr)
         try:
             os.unlink(path)
@@ -1805,9 +1885,26 @@ def run_downlink(conn, addr, mac):
         except OSError:
             pass
     print(f"[computer] [{mac}] downlink registered from {addr[0]}:{addr[1]}")
-    # A badge with no aliases.conf entry is new: name it by voice (PI.md
-    # phase 3). Every (re)connect of an unnamed badge starts the dialogue over.
-    if mac not in load_aliases()[1]:
+    names = load_aliases()[1].get(mac)
+    if names:
+        # A NAMED badge is greeted by its first name: "Captain, online." --
+        # brief, no technicals (Captain, 2026-09-27; TOS parity, where the
+        # maincomputer does the same for an identified badge). b'G' goes
+        # first and tells the listener to skip "Main computer online." and
+        # play the b'v' that follows at announcement level. It is sent before
+        # anything else on this socket (the listener waits briefly for it
+        # right after the handshake); a listener that predates it logs one
+        # unknown byte and chirps as before.
+        try:
+            with entry["lock"]:
+                conn.sendall(b"G")
+        except OSError:
+            pass
+        threading.Thread(target=push_voice, args=(mac, f"{names[0]}, online."),
+                         daemon=True).start()
+    else:
+        # A badge with no aliases.conf entry is new: name it by voice (PI.md
+        # phase 3). Every (re)connect of an unnamed badge starts the dialogue over.
         threading.Thread(target=begin_onboarding, args=(mac,), daemon=True).start()
 
     try:
@@ -2795,6 +2892,7 @@ def main():
         # recording half keeps the log commands appearing and disappearing
         # together.
         COMMANDS[REPLAY_LOG_PHRASE] = replay_last_log
+    print(f"[computer] {load_piper()}")
     print(f"[computer] listening on 0.0.0.0:{PORT}")
     print(f"[computer] commands: {' | '.join(COMMANDS)}")
     print(f"[computer] tap badge → speak one of the above → voice response plays through badge")

@@ -186,14 +186,35 @@ pip install vosk
 
 **Vosk model:** download `vosk-model-small-en-us-0.15` (~40 MB) from https://alphacephei.com/vosk/models and unpack it anywhere and pass the path on the command line to `computer.py`.
 
-**TTS for responses:** `computer.py` handles TTS automatically - no configuration needed. On Linux/macOS it uses `espeak-ng`; on Windows it uses the built-in PowerShell `System.Speech` synthesizer (no install required). Install `espeak-ng` on the server if you're running it on Linux:
+**TTS for responses:** `computer.py` speaks with **Piper**, Piper's standard US English female voice **Lessac, low quality**, wherever Piper and that voice are installed; otherwise it falls back to the built-in PowerShell `System.Speech` synthesizer on Windows (a female voice, Zira on stock Windows; no install required) or `espeak-ng` on Linux/macOS. The server log's startup line says which it is using.
+
+To use Piper (recommended, on any OS):
+```bash
+pip install piper-tts
+mkdir -p ../.piper        # beside ../.vosk/; ~/.piper/ also works
+curl -L -o ../.piper/en_US-lessac-low.onnx      https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/low/en_US-lessac-low.onnx
+curl -L -o ../.piper/en_US-lessac-low.onnx.json https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/low/en_US-lessac-low.onnx.json
+```
+`SDK_PIPER_MODEL=/path/to/voice.onnx` names a different voice outright. The model loads once at startup and each sentence is cached, so a repeated one (greetings, *"Channel open."*) is synthesized once.
+
+Why **low**: a badge's audio is 16 kHz, low's native rate, so low and medium sound the same on a badge (Captain, 2026-09-27), and low is the fastest. Seconds to render *"Captain, online."* / a 6 s answer:
+
+| host | lessac-low | lessac-medium | lessac-high |
+|---|---|---|---|
+| PAN (Core 2 Duo P8400, 2008) | 0.47 / 1.8 | 0.52 / 2.3 | 4.3 / 17.5 |
+| CUBE (Windows desktop) | 0.10 / 0.13 | - | - |
+
+The Lessac dataset's licence is CSTR's Blizzard 2013 licence (see the voice's `MODEL_CARD`); the SDK does not ship the voice.
+
+For the fallback on Linux, install `espeak-ng`:
 ```bash
 sudo apt install espeak-ng
 ```
 You can verify it works independently:
 ```bash
-espeak-ng -v en-us -w /tmp/test.wav "Acknowledged."
+espeak-ng -v en-us+f3 -w /tmp/test.wav "Acknowledged."
 ```
+The SDK asks for a female voice on both platforms: `en-us+f3` on espeak-ng, and a female SAPI voice (Zira on stock Windows).
 
 ## <a name="pairing-and-connecting"></a>3. Pairing and Connecting the Badge
 
@@ -410,6 +431,7 @@ ffmpeg is not a stylistic choice - `parec`, `parecord --file-format=raw`, and `p
 | `b'V'` | voice, keep listening | as `b'v'`, but NOT terminal: play it, discard the mic while it plays (and 0.35 s after), then keep streaming - see §13 |
 | `b'k'` | keepalive            | reset the recv timeout (and slide the recording deadline), keep waiting |
 | `b'W'` | prewarm (downlink)   | bring SCO up now and hold it - a hail is about to arrive     |
+| `b'G'` | named-badge greeting (downlink, first byte after the handshake) | skip `maincomputeronline.wav`; the `b'v'` that follows is *"&lt;first name&gt;, online."*, played at announcement level |
 | `b'H'` | hail pending (downlink) | the next tap answers a hail - skip the `listening.wav` chirp for it |
 | `b'E'` | hail ended (downlink) | the answer window closed unanswered - taps are commands again |
 | `b'D'` / `b'Y'` | onboarding disabled / enabled (downlink) | write / remove `onboarding_disabled.flag` for the transceiver (§4) |
@@ -512,7 +534,7 @@ def _synth_sapi(text, path):
                    check=True, capture_output=True, timeout=15)
 ```
 
-On Linux/macOS it falls back to `espeak-ng`. Neither path requires Piper or network TTS.
+On Linux/macOS it falls back to `espeak-ng`. Piper, when installed (§2, *TTS for responses*), takes precedence on every OS; no path needs network TTS.
 
 **Windows Ctrl-C.** Winsock's `accept()` is not interruptible by Python's signal handler on Windows - Ctrl-C has no effect while the server is blocked in accept. Fix: set a 1 s timeout on the listening socket and catch `socket.timeout` in the accept loop:
 

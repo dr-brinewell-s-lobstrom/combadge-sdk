@@ -386,6 +386,9 @@ game_mode = threading.Event()
 # Downlink (persistent server connection) tuning.
 DOWNLINK_RETRY_S = 5    # seconds between reconnect attempts while down
 DOWNLINK_TIMEOUT = 15   # recv timeout: 3 missed 5 s keepalives = server presumed dead
+GREETING_MARK_WAIT_S = 1.0  # after the handshake, how long to wait for b'G' (named
+                            # badge: the server greets it by name) before playing
+                            # maincomputeronline.wav. The server sends it at once.
 PREWARM_MAX_S    = 25   # max seconds to hold a prewarmed SCO awaiting the b'v'
                         # (covers the server's 20 s hail-capture hard cap)
 
@@ -1186,7 +1189,32 @@ def downlink_loop():
         # Announce on every (re)connect — audible "the server is (back) up."
         # Standard chirp level, NOT hail level — matches the badge-online
         # announce that precedes it.
-        play_pushed_voice(MAINCOMPUTER_ONLINE_WAV, volume=0.5)
+        #
+        # EXCEPT for a named badge (Captain, 2026-09-27; TOS parity): the
+        # server sends b'G' as its very first byte and follows it with a
+        # b'v' "<name>, online.", which says the same thing more briefly.
+        # So wait a moment for that first byte before choosing. A server
+        # sends b'G' the instant the handshake lands; GREETING_MARK_WAIT_S
+        # only ever delays the chirp for an unnamed badge.
+        first = None
+        terse_greeting = False
+        try:
+            sock.settimeout(GREETING_MARK_WAIT_S)
+            first = sock.recv(1)
+        except OSError:
+            first = None     # timeout, or a dead socket: the service loop's
+                             # own recv below meets it and reconnects as usual
+        finally:
+            try:
+                sock.settimeout(DOWNLINK_TIMEOUT)
+            except OSError:
+                pass
+        if first == b"G":
+            first = None
+            terse_greeting = True
+            print("[listener] named badge — the server greets it by name")
+        else:
+            play_pushed_voice(MAINCOMPUTER_ONLINE_WAV, volume=0.5)
 
         # Prewarm state: on b'W' the server says "audio is coming for this
         # badge in a few seconds" (a hail is being captured).  We bring SCO
@@ -1214,7 +1242,10 @@ def downlink_loop():
                 if warm and time.time() > warm_expires:
                     print("[listener] prewarm expired — releasing badge")
                     release_warm()
-                sig = sock.recv(1)
+                if first:
+                    sig, first = first, None    # read while waiting for b'G'
+                else:
+                    sig = sock.recv(1)
                 if not sig:
                     print("[listener] downlink closed by server — reconnecting")
                     break
@@ -1318,6 +1349,10 @@ def downlink_loop():
                                     print("[listener] tap during the hail — answering")
                                     _tap_clock["last"] = cut_at
                                     os.write(_answer_w, b"a")
+                            elif terse_greeting:
+                                terse_greeting = False
+                                print("[listener] greeting received — playing")
+                                play_pushed_voice(path, volume=0.5)
                             else:
                                 print("[listener] pushed voice received — playing")
                                 play_pushed_voice(path)

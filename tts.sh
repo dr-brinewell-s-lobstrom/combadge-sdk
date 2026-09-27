@@ -3,10 +3,12 @@
 # tts.sh — write a WAV file from text using the SDK's own TTS engine.
 #
 # This mirrors sdk/computer.py::synth_wav() so generated assets sound identical
-# to the voice the SDK speaks at runtime:
+# to the voice the SDK speaks at runtime, first available:
+#     Piper            →  Lessac low (../.piper/ or ~/.piper/, or
+#                         $SDK_PIPER_MODEL), when piper-tts is installed
 #     Windows / MSYS2  →  SAPI via PowerShell (System.Speech, female voice,
 #                         Rate 2) — ships with .NET, no install needed.
-#     Linux / macOS    →  espeak-ng -v en-us -s 165
+#     Linux / macOS    →  espeak-ng -v en-us+f3 -s 165 (female variant)
 #
 # Unlike speak/speak.sh, this does NOT play the audio — it only writes the WAV,
 # so you can regenerate the sdk/assets/*.wav phrases with a neutral TTS voice.
@@ -55,9 +57,30 @@ case "$OUT" in
     *)   OUT_PATH="$SCRIPT_DIR/$OUT" ;;
 esac
 
-if [[ "$OSTYPE" == "linux-gnu"* || "$OSTYPE" == "darwin"* ]]; then
+# Piper first, as computer.py: the named voice, else Lessac low in either place.
+PIPER_MODEL="${SDK_PIPER_MODEL:-}"
+if [[ -z "$PIPER_MODEL" ]]; then
+    for d in "$SCRIPT_DIR/../.piper" "$HOME/.piper"; do
+        if [[ -f "$d/en_US-lessac-low.onnx" ]]; then
+            PIPER_MODEL="$d/en_US-lessac-low.onnx"
+            break
+        fi
+    done
+fi
+PY=python
+command -v python >/dev/null 2>&1 || PY=python3
+
+if [[ -n "$PIPER_MODEL" ]] && "$PY" -c "import piper" 2>/dev/null; then
+    MODEL_ARG="$PIPER_MODEL"
+    OUT_ARG="$OUT_PATH"
+    if command -v cygpath >/dev/null 2>&1; then
+        MODEL_ARG="$(cygpath -m "$PIPER_MODEL")"
+        OUT_ARG="$(cygpath -m "$OUT_PATH")"
+    fi
+    printf '%s' "$PHRASE" | "$PY" -m piper -m "$MODEL_ARG" -f "$OUT_ARG"
+elif [[ "$OSTYPE" == "linux-gnu"* || "$OSTYPE" == "darwin"* ]]; then
     # Linux / macOS: espeak-ng, same flags the SDK uses.
-    espeak-ng -v en-us -s 165 -w "$OUT_PATH" "$PHRASE"
+    espeak-ng -v en-us+f3 -s 165 -w "$OUT_PATH" "$PHRASE"
 else
     # Windows / MSYS2: SAPI via PowerShell needs a native Windows path.
     WIN_PATH="$(cygpath -w "$OUT_PATH")"
