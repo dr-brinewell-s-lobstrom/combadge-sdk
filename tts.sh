@@ -38,10 +38,16 @@
 # from this list, which is how its meaning went unrecorded. Keep the list
 # complete.
 #
-# ⚠ AND listening.wav AS SHIPPED IS TAIL-TRIMMED: 1189 ms -> 671 ms on
-# 2026-09-06, to cut dead air before capture begins. Regenerating it here
-# gives the untrimmed file back. The HEAD is what PRIME_MS_LISTENING = 160 is
-# sized against, so trim only the tail if you re-cut it.
+# ⚠ THE SHIPPED ASSETS ARE POST-PROCESSED, not raw tts.sh output. Regenerated
+# 2026-09-27 in Piper Lessac low (they were Zira), then:
+#   - every file's lead-in set to 90 ms, as the Zira files had: the HEAD is
+#     what PRIME_MS_LISTENING = 160 is sized against, and Piper's own lead-in
+#     runs 0-218 ms;
+#   - listening.wav's tail trimmed to 90 ms after the last sound (as on
+#     2026-09-06, 1189 -> 671 ms), to cut dead air before capture begins.
+# Piper's level is kept (peak-normalized, ~9 dB above the old Zira files), the
+# same level as the live Piper responses. Regenerating here gives the raw
+# files back; redo both steps if you re-cut them.
 
 set -euo pipefail
 
