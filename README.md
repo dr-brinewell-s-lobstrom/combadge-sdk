@@ -45,54 +45,30 @@ Point your AI at this repo and `make it so`.  Note that this approach is technic
 
 Two terminal windows are all you need. The **relay host** is the Linux machine the badge is paired to. The **server** (running `computer.py`) can be the same machine or any other machine on the same network - Linux, macOS, or Windows.
 
+**Step 0 - Install the dependencies** (once per machine):
+```bash
+./install-dependencies.sh            # Linux: transceiver + server; Windows (Git Bash / MSYS2): server
+./install-dependencies.sh --check    # report only
+```
+It checks first, lists what is missing, and asks before installing: the system packages (Debian/Ubuntu `apt`), the Python packages (`vosk`, `piper-tts`), both Vosk models into `../.vosk/` and the Piper voice Lessac low into `../.piper/` (about 2 GB of downloads, most of it the large Vosk model). `--transceiver` or `--server` limits it to one role. It installs dependencies only: there is no setup step, because everything else configures itself on first use - badges are paired by the transceiver and named by voice. The full list is in §2.
+
 **Step 1 - Start the server** (any OS with Python):
 ```bash
-# Install dependencies
-pip install vosk piper-tts       # piper-tts + a voice: see §2, "TTS for responses"
-sudo apt install espeak-ng       # Linux fallback voice - skip on Windows (SAPI built-in)
-
-# Download Vosk model (~40 MB): https://alphacephei.com/vosk/models
-# Unpack vosk-model-small-en-us-0.15/ somewhere, then:
-python3 computer.py /path/to/vosk-model-small-en-us-0.15
+./computer.sh
 ```
+That is `computer.py` with both Vosk models: the small one for commands, the large one for dictation - captain's log, a core feature ([§11](#large-vocab)). Both are required; `computer.sh` stops with a pointer to the installer if either is missing. Run by hand: `python3 computer.py ../.vosk/vosk-model-small-en-us-0.15 ../.vosk/vosk-model-en-us-0.22`.
 
-The small model is all you need for commands. A **second, optional** argument
-enables free-form dictation - see [§11](#large-vocab):
-
+**Step 2 - Start the transceiver** (Linux, the host the badges pair to; asks for sudo):
 ```bash
-python3 computer.py /path/to/vosk-model-small-en-us-0.15 \
-                    /path/to/vosk-model-en-us-0.22
+./transceiver.sh                                  # computer.py on this machine
+SDK_SERVER_HOST=192.168.x.x ./transceiver.sh      # computer.py elsewhere
 ```
+Power a badge on nearby: the transceiver finds it, pairs it on a free Bluetooth adapter, and the server asks its wearer to name it (§4, §13).
 
-**Step 2 - Start the relay** (Linux relay host, must be root):
-```bash
-pip install evdev
-
-# If computer.py is on the same machine:
-sudo SDK_USER=$USER python3 transceiver.py
-
-# If computer.py is on a different machine:
-sudo SDK_USER=$USER SDK_SERVER_HOST=192.168.x.x python3 transceiver.py
-```
-
-**Launcher scripts (optional, recommended):** the two commands above are wrapped
-in one-line launchers so the full invocation isn't retyped each session:
-
-- `computer.sh` (server host) - runs `computer.py` with the small model.
-  As shipped it expects the unpacked Vosk model in a `.vosk/` directory one level
-  above this folder - edit the path to wherever yours lives. If the **large**
-  model is sitting beside it, the launcher passes that too and dictation
-  ([§11](#large-vocab)) switches itself on; if it isn't, nothing changes.
-- `transceiver.sh` (relay host) - `sudo SDK_SERVER_HOST=<server-ip-or-hostname> python transceiver.py`.
-  The env var **must** be inline on the sudo command line: `sudo` resets the
-  environment by default, so a prior `export SDK_SERVER_HOST=...` is silently
-  stripped and listener.py falls back to `localhost` (symptom: endless
-  "waiting for server localhost:1701" while the server runs fine elsewhere).
-  Add `SDK_SERVER_PORT=<port>` inline the same way if not using 1701.
-  Hostname targets (e.g. `myserver`) work if the relay host resolves them.
+`transceiver.sh` expands `SDK_SERVER_HOST` (default `localhost`) and `SDK_SERVER_PORT` (default 1701) in your shell and puts them on the `sudo` command line. By hand it is `sudo SDK_SERVER_HOST=<host> python3 transceiver.py`, and the variable **must** be inline there: `sudo` resets the environment, so a prior `export SDK_SERVER_HOST=...` is silently stripped and the listeners fall back to `localhost` (symptom: endless "waiting for server localhost:1701" while the server runs fine elsewhere). Hostnames work if the transceiver host resolves them.
 
 **Server and relay on one machine** (`multiuser/PI.md` phase 4, verified on PAN
-2026-09-27): run `computer.py` on the relay host itself and start the
+2026-09-27): run `computer.sh` on the relay host itself and start the
 transceiver with no `SDK_SERVER_HOST`; it defaults to `localhost`. Run the
 server as the ordinary user, the transceiver as root. Keep the Vosk and Piper
 models on the host's own disk, not a network mount. On PAN (Core 2 Duo P8400,
@@ -106,9 +82,8 @@ under 1 GB without it.
 discovery yet (`multiuser/PI.md` phase 5, on hold), so moving the badges to
 another server (say a Windows box running `computer.sh`) is manual:
 
-1. **On the new server:** `pip install vosk piper-tts`; the Vosk models in
-   `../.vosk/` and the Lessac low voice in `../.piper/` (or pass the paths);
-   start `computer.sh` or `python computer.py <small> [large]`. On Windows,
+1. **On the new server:** `./install-dependencies.sh --server` (Python
+   packages, both Vosk models, the Lessac low voice); start `computer.sh`. On Windows,
    allow inbound TCP 1701 through the firewall - Python's first listen
    usually prompts for it, and a dismissed prompt means the relay never
    connects.
@@ -119,8 +94,9 @@ another server (say a Windows box running `computer.sh`) is manual:
    wrote it.
 3. **On the relay host** (SSH): stop the transceiver; optionally stop a local
    `computer.py` (harmless if left, but ~5 GB with the large model); restart
-   the transceiver with the address inline on `sudo`:
-   `sudo SDK_SERVER_HOST=192.168.x.x python3 transceiver.py`. The transceiver
+   the transceiver pointed at it: `SDK_SERVER_HOST=192.168.x.x ./transceiver.sh`
+   (by hand, inline on `sudo`: `sudo SDK_SERVER_HOST=192.168.x.x python3
+   transceiver.py`). The transceiver
    hands the address to each listener as it launches them, so changing server
    always means restarting the transceiver.
 
@@ -157,13 +133,9 @@ Edit the `COMMANDS` dict in `computer.py` to add your own phrases and responses.
 > matching is a substring scan - this note is only about file re-reading.)
 
 **Before your first run - checklist:**
-- [ ] Badge paired to the relay Linux host (`bluetoothctl pair <MAC>` + `trust <MAC>`)
-- [ ] WirePlumber seat-monitoring fix applied if running headless/SSH (see §3)
-- [ ] `sudo apt install ffmpeg pipewire pipewire-pulse wireplumber pulseaudio-utils` on relay
-- [ ] `pip install evdev` on relay
-- [ ] `pip install vosk` on server host
-- [ ] Vosk model downloaded and unpacked
-- [ ] `sudo apt install espeak-ng` on server host (Linux) - not needed on Windows
+- [ ] `./install-dependencies.sh --check` reports everything installed, on each machine
+- [ ] WirePlumber seat-monitoring fix applied if the transceiver host runs headless/SSH (see §3)
+- [ ] Badge powered on near the transceiver host (it pairs itself - §4)
 
 ---
 
@@ -207,23 +179,24 @@ Two processes on the relay host, one on the server:
 
 **OS:** Debian/Ubuntu-flavored Linux is the tested baseline. Anything with PipeWire ≥ 0.3.50 and BlueZ ≥ 5.60 should work. The Main Computer side runs anywhere Python and Vosk run (Linux, macOS, Windows).
 
-**System packages:**
-```bash
-sudo apt install bluez bluez-tools pipewire pipewire-pulse wireplumber \
-                 pulseaudio-utils ffmpeg python3 python3-pip
-```
+`./install-dependencies.sh` installs all of the following (§0); this is what it does, for other distributions or for doing it by hand.
 
-**Python packages (relay host):**
+**Transceiver host (Linux):**
 ```bash
-pip install evdev
+sudo apt install bluez pipewire pipewire-pulse wireplumber libspa-0.2-bluetooth \
+                 pulseaudio-utils ffmpeg python3 python3-evdev
 ```
+`libspa-0.2-bluetooth` is PipeWire's Bluetooth plugin: without it there is no HFP audio at all. `evdev` comes from apt as `python3-evdev`: on Debian 12+ / Ubuntu 23.04+ Python is "externally managed" and a plain `pip install evdev` is refused.
 
-**Python packages (server host):**
+**Server host:**
 ```bash
-pip install vosk
+sudo apt install python3 python3-pip espeak-ng curl                   # Linux; espeak-ng is the fallback voice
+sudo pip install --break-system-packages vosk piper-tts               # Linux, externally managed Python
+pip install vosk piper-tts                                            # Windows
 ```
+vosk and piper-tts are not packaged by Debian, so on an externally managed Python they go into `/usr/local` with `--break-system-packages` (omit the flag where pip does not ask for it).
 
-**Vosk model:** download `vosk-model-small-en-us-0.15` (~40 MB) from https://alphacephei.com/vosk/models and unpack it anywhere and pass the path on the command line to `computer.py`.
+**Vosk models** from https://alphacephei.com/vosk/models, unpacked into `../.vosk/` (where `computer.sh` looks): `vosk-model-small-en-us-0.15` (~40 MB, commands) and `vosk-model-en-us-0.22` (1.8 GB, dictation; ~5 GB of RAM in use). Both are required.
 
 **TTS for responses:** `computer.py` speaks with **Piper**, Piper's standard US English female voice **Lessac, low quality**, wherever Piper and that voice are installed; otherwise it falls back to the built-in PowerShell `System.Speech` synthesizer on Windows (a female voice, Zira on stock Windows; no install required) or `espeak-ng` on Linux/macOS. The server log's startup line says which it is using.
 
@@ -835,7 +808,7 @@ On a non-Windows server the import fails, the phrases are absent, and everything
 
 ## <a name="large-vocab"></a>11. Large-Vocabulary Dictation - `captain's log` and `computer transcribe`
 
-**Optional.** Enabled by passing a second model path; absent otherwise.
+**A core feature: the large model is required** (Captain, 2026-09-27). `computer.sh` passes it and will not start without it. `computer.py` still runs with the small model alone if started by hand, and dictation is then simply absent.
 
 Everything up to this point matches a phrase you defined in advance. Dictation is the opposite problem: capturing a sentence nobody can enumerate ahead of time. That needs a different recognizer, and switching to it mid-utterance is the entire mechanism behind both features here.
 
@@ -863,7 +836,7 @@ Capture then continues on the live socket until you stop talking.
 
 This is the one decision in the feature that is not a preference. Loading `vosk-model-en-us-0.22` takes tens of seconds and gigabytes of RAM, and a dictation begins **inside a live badge transaction** - the relay is already recording, and `listener.py` gives up `RECORD_MAX_S` (13 s) after the last byte from the server. Loading on first use would therefore blow the recording window every time, and the badge would fail the very command that triggered the load.
 
-Paying it once at startup is what makes the switch feel instantaneous. The cost is a slower launch and the memory: `computer.py` measured **about 5 GB resident** with both models loaded (PAN, 2026-09-27), under 1 GB with the small model alone. If you do not want that, omit the argument and the feature is simply not there.
+Paying it once at startup is what makes the switch feel instantaneous. The cost is a slower launch and the memory: `computer.py` measured **about 5 GB resident** with both models loaded (PAN, 2026-09-27), under 1 GB with the small model alone. That cost is accepted: captain's log is a core feature, and the saving is not worth the complexity of making it optional.
 
 ### Availability
 

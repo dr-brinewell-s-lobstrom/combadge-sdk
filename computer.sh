@@ -1,18 +1,25 @@
-# Server launcher.  Small model always; large model too if it is there.
+#!/usr/bin/env bash
+# Server launcher: computer.py with both Vosk models.
 #
-# The large model (~1.8 GB) enables dictation — "captain's log" and
-# "computer transcribe", README §11.  It is passed ONLY when the directory
-# exists, so this stays a one-command start whether or not you have
-# downloaded it: no large model, no dictation, everything else unchanged.
+# The large model (~1.8 GB) is REQUIRED: captain's log is a core feature and
+# depends on it (Captain, 2026-09-27; README §11). It costs a slower start and
+# ~5 GB of RAM, which is accepted rather than making dictation optional.
+# ./install-dependencies.sh --server fetches both models into ../.vosk/.
 #
-# computer.py exits on a large-model path that does not resolve, which is
-# what you want from a typo on a command line but not from a launcher
-# shipped to people who may never fetch that model — hence the test.
+# Paths are relative to this script, not to wherever it is run from.
+cd "$(dirname "$0")" || exit 1
 SMALL=../.vosk/vosk-model-small-en-us-0.15
 LARGE=../.vosk/vosk-model-en-us-0.22
 
-if [ -d "$LARGE" ]; then
-    python computer.py "$SMALL" "$LARGE"
-else
-    python computer.py "$SMALL"
-fi
+for m in "$SMALL" "$LARGE"; do
+    if [ ! -d "$m" ]; then
+        echo "computer.sh: Vosk model not found: $m" >&2
+        echo "             run ./install-dependencies.sh --server" >&2
+        exit 1
+    fi
+done
+
+# Debian and Ubuntu ship python3 but no `python`; Windows has `python`.
+PY=python
+command -v python >/dev/null 2>&1 || PY=python3
+exec "$PY" computer.py "$SMALL" "$LARGE"
