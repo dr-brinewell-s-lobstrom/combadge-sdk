@@ -840,8 +840,8 @@ def page_loop():
 #
 # Every badge found is claimed while an adapter is free (Ruling 1).  DISABLING
 # (a file, so it survives a power cut) stops that: the server's "computer,
-# disable onboarding" sends b'D' down a badge's downlink and its
-# listener writes ONBOARDING_OFF_FILE; "computer, enable onboarding"
+# disable on boarding" sends b'D' down a badge's downlink and its
+# listener writes ONBOARDING_OFF_FILE; "computer, enable on boarding"
 # removes it.
 # ---------------------------------------------------------------------------
 

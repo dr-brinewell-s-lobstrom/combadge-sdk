@@ -1237,7 +1237,7 @@ def downlink_loop():
                     continue
                 if sig in (b"D", b"Y"):
                     # Onboarding off / on (multiuser/PI.md phase 2): the server
-                    # heard "computer, disable/enable onboarding" from this
+                    # heard "computer, disable/enable on boarding" from this
                     # badge. The transceiver on this host decides whether to
                     # claim new badges by the presence of this file, so it
                     # outlives a power cut (Ruling 1). Written here because this

@@ -370,8 +370,8 @@ COMMANDS = {
     # the speaker's transceiver. Phrases chosen by the Captain, 2026-09-26.
     # Neither is a substring of the other ("computer enable" does not occur in
     # "computer disable"), so the match loop cannot confuse them.
-    "computer disable onboarding": NeedsMac(lambda mac: _set_onboarding(mac, False)),
-    "computer enable onboarding":  NeedsMac(lambda mac: _set_onboarding(mac, True)),
+    "computer disable on boarding": NeedsMac(lambda mac: _set_onboarding(mac, False)),
+    "computer enable on boarding":  NeedsMac(lambda mac: _set_onboarding(mac, True)),
 }
 
 

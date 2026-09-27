@@ -303,8 +303,10 @@ To keep a badge out, unpair it from this host. The pairings *are* the set; there
 
 Every badge found is claimed by default. To stop that - taking the transceiver somewhere other people's badges are about - say:
 
-- *"computer, disable onboarding"* → *"Onboarding disabled."*
-- *"computer, enable onboarding"* → *"Onboarding enabled."*
+- *"computer, disable on boarding"* → *"Onboarding disabled."*
+- *"computer, enable on boarding"* → *"Onboarding enabled."*
+
+"On boarding" is two words in the phrase because "onboarding" is not in the vosk model's vocabulary.
 
 The badges already claimed are unaffected. The setting is a file, `onboarding_disabled.flag` beside `transceiver.py`, so it **survives a power cut**: a transceiver that reboots mid-convention does not start claiming again. The server sends `b'D'` / `b'Y'` (onboarding disabled / enabled) down the speaking badge's downlink; that badge's listener writes or removes the file; the transceiver checks it before every scan. The server console has `onboarding on|off` too (every connected transceiver). It is not a security control - it only decides whether new badges are looked for. Verified 2026-09-26: with onboarding disabled, a free adapter and a discoverable badge were left alone for 75 s; enabled, it was claimed in the next window.
 
