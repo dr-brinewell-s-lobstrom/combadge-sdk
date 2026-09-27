@@ -102,6 +102,34 @@ replay all as with a separate server; *"computer time"* spoken in 0.5 s. The
 cost is memory: **about 5 GB resident with the large model** (dictation),
 under 1 GB without it.
 
+**Pointing a relay at a different server, by hand.** There is no server
+discovery yet (`multiuser/PI.md` phase 5, on hold), so moving the badges to
+another server (say a Windows box running `computer.sh`) is manual:
+
+1. **On the new server:** `pip install vosk piper-tts`; the Vosk models in
+   `../.vosk/` and the Lessac low voice in `../.piper/` (or pass the paths);
+   start `computer.sh` or `python computer.py <small> [large]`. On Windows,
+   allow inbound TCP 1701 through the firewall - Python's first listen
+   usually prompts for it, and a dismissed prompt means the relay never
+   connects.
+2. **Copy `aliases.conf` from the old server.** Badge names live on the
+   server, beside `computer.py`, not on the relay host: a server without them
+   treats every badge as new and starts the naming dialogue again. The
+   captain's log (`captainslog.txt`) likewise stays with the server that
+   wrote it.
+3. **On the relay host** (SSH): stop the transceiver; optionally stop a local
+   `computer.py` (harmless if left, but ~5 GB with the large model); restart
+   the transceiver with the address inline on `sudo`:
+   `sudo SDK_SERVER_HOST=192.168.x.x python3 transceiver.py`. The transceiver
+   hands the address to each listener as it launches them, so changing server
+   always means restarting the transceiver.
+
+Onboarding on/off and health stay with the relay host and are unaffected. To
+go back, restart the transceiver without `SDK_SERVER_HOST` (`localhost`). If
+the other server goes away, the badges say *"Main computer offline."* and
+retry its address every 5 s; nothing falls back to the local server on its
+own.
+
 **Step 3 - Test it:**  
 Tap the badge once. You hear a chirp from the badge speaker. Speak one of these phrases:
 
