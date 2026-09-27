@@ -198,9 +198,10 @@ MAINCOMPUTER_OFFLINE_WAV = os.path.join(ASSET_DIR, "maincomputeroffline.wav")
 # diagnosis; on BOX (severed) it stays local.
 
 LOG_DIR  = os.path.join(SCRIPT_DIR, "log")
-# Lockdown flag, shared with transceiver.py (which checks it before claiming a
-# new badge). Present = locked. See the b'L'/b'U' downlink handler.
-LOCKDOWN_FILE = os.path.join(SCRIPT_DIR, "lockdown.flag")
+# New badge discovery setting, shared with transceiver.py (which checks it
+# before claiming a new badge). Present = discovery disabled. See the
+# b'D'/b'Y' downlink handler.
+DISCOVERY_OFF_FILE = os.path.join(SCRIPT_DIR, "discovery_disabled.flag")
 # Health sentence written by transceiver.py (PI.md Ruling 6); see health_watch().
 HEALTH_FILE   = os.path.join(SCRIPT_DIR, "health.txt")
 HEALTH_POLL_S = 3
@@ -1234,8 +1235,8 @@ def downlink_loop():
                         force_sco_teardown()
                         audio_lock.release()
                     continue
-                if sig in (b"L", b"U"):
-                    # Lockdown on / off (multiuser/PI.md phase 2): the server
+                if sig in (b"D", b"Y"):
+                    # New badge discovery off / on (multiuser/PI.md phase 2): the server
                     # heard "computer, disable/enable new badge discovery" from this
                     # badge. The transceiver on this host decides whether to
                     # claim new badges by the presence of this file, so it
@@ -1243,18 +1244,18 @@ def downlink_loop():
                     # is the process with the server's socket; the transceiver
                     # (root) only reads it. Payload-free, non-terminal.
                     try:
-                        if sig == b"L":
-                            with open(LOCKDOWN_FILE, "w", encoding="utf-8", newline="\n") as f:
-                                f.write(f"locked {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                        if sig == b"D":
+                            with open(DISCOVERY_OFF_FILE, "w", encoding="utf-8", newline="\n") as f:
+                                f.write(f"discovery disabled {time.strftime('%Y-%m-%d %H:%M:%S')} "
                                         f"by {BADGE_MAC}\n")
-                            print("[listener] lockdown ON -- the transceiver will claim "
+                            print("[listener] new badge discovery DISABLED -- the transceiver will claim "
                                   "no new badges")
                         else:
-                            if os.path.exists(LOCKDOWN_FILE):
-                                os.remove(LOCKDOWN_FILE)
-                            print("[listener] lockdown OFF -- new badges will be claimed")
+                            if os.path.exists(DISCOVERY_OFF_FILE):
+                                os.remove(DISCOVERY_OFF_FILE)
+                            print("[listener] new badge discovery ENABLED -- new badges will be claimed")
                     except OSError as e:
-                        print(f"[listener] lockdown flag could not be changed: {e}")
+                        print(f"[listener] discovery setting could not be changed: {e}")
                     continue
                 if sig in (b"H", b"E"):
                     # Hail pending / ended (INTERCOM.md Phase 9). b'H' arrives

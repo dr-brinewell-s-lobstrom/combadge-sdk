@@ -306,7 +306,7 @@ Every badge found is claimed by default. To stop that - taking the transceiver s
 - *"computer, disable new badge discovery"* → *"New badge discovery disabled."*
 - *"computer, enable new badge discovery"* → *"New badge discovery enabled."*
 
-The badges already claimed are unaffected. The state is a file, `lockdown.flag` beside `transceiver.py`, so it **survives a power cut**: a transceiver that reboots mid-convention does not start claiming again. The server sends `b'L'` / `b'U'` down the speaking badge's downlink; that badge's listener writes or removes the file; the transceiver checks it before every scan. The server console has `lockdown on|off` too (every connected transceiver). Verified 2026-09-26: with discovery disabled, a free adapter and a discoverable badge were left alone for 75 s; enabled, it was claimed in the next window.
+The badges already claimed are unaffected. The setting is a file, `discovery_disabled.flag` beside `transceiver.py`, so it **survives a power cut**: a transceiver that reboots mid-convention does not start claiming again. The server sends `b'D'` / `b'Y'` (discovery disabled / enabled) down the speaking badge's downlink; that badge's listener writes or removes the file; the transceiver checks it before every scan. The server console has `discovery on|off` too (every connected transceiver). It is not a security control - it only decides whether new badges are looked for. Verified 2026-09-26: with discovery disabled, a free adapter and a discoverable badge were left alone for 75 s; enabled, it was claimed in the next window.
 
 ### Health: a failing adapter is announced on the badges that work
 
@@ -410,7 +410,7 @@ ffmpeg is not a stylistic choice - `parec`, `parecord --file-format=raw`, and `p
 | `b'W'` | prewarm (downlink)   | bring SCO up now and hold it - a hail is about to arrive     |
 | `b'H'` | hail pending (downlink) | the next tap answers a hail - skip the `listening.wav` chirp for it |
 | `b'E'` | hail ended (downlink) | the answer window closed unanswered - taps are commands again |
-| `b'L'` / `b'U'` | new badge discovery off / on (downlink) | write / remove `lockdown.flag` for the transceiver (§4) |
+| `b'D'` / `b'Y'` | new badge discovery disabled / enabled (downlink) | write / remove `discovery_disabled.flag` for the transceiver (§4) |
 | `b'O'` | channel open         | this tap socket is now a live intercom (see `INTERCOM.md`); play `channelopen.wav` |
 | `b'A'`+len+PCM | channel audio | peer audio frame (2-byte BE len); pipe into the stdin player |
 | `b'X'` | channel closed       | play `channelclosed.wav`, tear down                          |
@@ -419,7 +419,7 @@ The badge-to-badge hail/channel system built on these (aliases, prewarm, hystere
 
 **Turn-taking in a live channel.** The channel carries one talker at a time. Pause for less than **0.5 s** (`CHANNEL_GATE_HOLD`) and you still have the floor: your next words go straight through. After a pause of 0.5 s the floor is released, and for the next **0.4 s** (`CHANNEL_FLOOR_RELEASE_MS`) neither badge transmits. That window lets the tail of your voice die away on the other badge, so it can't open that badge's gate. From 0.9 s on, whoever speaks first has the floor. Picking it up takes a little more voice than keeping it (gate open at 50, close below 16), so a whispered first syllable may be lost. In practice this is hard to notice: counting aloud at 0.5 s, 1 s and 1.5 s intervals comes through without drops on badges an arm's length apart (PAN, 2026-09-26). Both values are server environment variables (`SDK_CHANNEL_GATE_HOLD`, `SDK_CHANNEL_FLOOR_RELEASE_MS`); their tuning history and the same-room trade-offs are in `INTERCOM.md`.
 
-The SDK uses `c`, `f`, `v`, `V`, `k`, the four channel bytes above, and the downlink's `H`/`E`/`L`/`U`. One byte goes the other way on the downlink: `b'R'` + 2-byte length + UTF-8 text, a health report from the relay host, which the server speaks on that badge (§4). Other letters are free for your own extensions - a signal byte can trigger any relay-side behavior you like (the author's fuller system uses `l` for dictation-recorded and `p` for prompt-dispatched, for example).
+The SDK uses `c`, `f`, `v`, `V`, `k`, the four channel bytes above, and the downlink's `H`/`E`/`D`/`Y`. One byte goes the other way on the downlink: `b'R'` + 2-byte length + UTF-8 text, a health report from the relay host, which the server speaks on that badge (§4). Other letters are free for your own extensions - a signal byte can trigger any relay-side behavior you like (the author's fuller system uses `l` for dictation-recorded and `p` for prompt-dispatched, for example).
 
 `listener.py` expects these asset files in `assets/` (next to the scripts): `listening.wav` (chirp on tap), `commandexecuted.wav`, `commandfailure.wav`, `badge-to-comms-relay-online.wav` (played on startup once the badge connects), `maincomputeronline.wav` (played once the server is reachable), `channelopen.wav` and `channelclosed.wav` (spoken when an intercom channel opens and closes). Any short WAV/MP3 clips work - record or synthesize your own and drop them in under these names.
 

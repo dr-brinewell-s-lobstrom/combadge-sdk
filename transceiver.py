@@ -401,7 +401,7 @@ def survey(tree):
         say_once(f"unpaired:{mac}",
                  f"[transceiver] {mac} is visible but not paired to this host -- "
                  "the claim loop will take it if an adapter is free and the "
-                 "transceiver is not locked down.")
+                 "new badge discovery is enabled.")
     return adapters, paired
 
 
@@ -824,7 +824,7 @@ def page_loop():
 # CLAIMING -- a never-paired badge becomes this host's (multiuser/PI.md phase 2)
 #
 # Out of the box nobody pairs anything (Ruling 8): while an adapter has no
-# badge of its own and the transceiver is not locked down, it scans that
+# badge of its own and new badge discovery is enabled, it scans that
 # adapter for a TNG COMBADGE paired to NO adapter here, and pairs, trusts and
 # connects it -- on that adapter only.  The pre-flight survey then sees the new
 # pairing, a supervisor starts its listener, and the server, finding the badge
@@ -838,23 +838,23 @@ def page_loop():
 # silent.  A badge the host has unpaired goes straight back to discoverable.
 # The rest of this file keeps using busctl; only claiming needs a session.
 #
-# Every badge found is claimed while an adapter is free (Ruling 1).  LOCKDOWN
+# Every badge found is claimed while an adapter is free (Ruling 1).  DISABLING
 # (a file, so it survives a power cut) stops that: the server's "computer,
-# disable new badge discovery" sends b'L' down a badge's downlink and its
-# listener writes LOCKDOWN_FILE; "computer, enable new badge discovery"
+# disable new badge discovery" sends b'D' down a badge's downlink and its
+# listener writes DISCOVERY_OFF_FILE; "computer, enable new badge discovery"
 # removes it.
 # ---------------------------------------------------------------------------
 
 CLAIM_SCAN_S  = 20    # one scan window on a free adapter
 CLAIM_GAP_S   = 30    # between windows: a free adapter is scanned ~40% of the time
 CLAIM_NAME    = "TNG COMBADGE"
-LOCKDOWN_FILE = os.path.join(SCRIPT_DIR, "lockdown.flag")
+DISCOVERY_OFF_FILE = os.path.join(SCRIPT_DIR, "discovery_disabled.flag")
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x01\x02\r]")
 _MACPAT = r"((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})"
 
 
-def lockdown_active():
-    return os.path.exists(LOCKDOWN_FILE)
+def discovery_disabled():
+    return os.path.exists(DISCOVERY_OFF_FILE)
 
 
 class Bluetoothctl:
@@ -976,14 +976,14 @@ def claim_on(adapter, known):
 
 def claim_loop():
     """While an adapter has no badge of its own and the transceiver is not
-    locked down, look for a new badge on it. One adapter at a time, one
+    new badge discovery is enabled, look for a new badge on it. One adapter at a time, one
     bluetoothctl session at a time."""
     time.sleep(max(5.0, DETECT_INTERVAL * 2))   # let the first survey settle
     while True:
         try:
-            if lockdown_active():
-                say_once("claim", "[transceiver] claiming: LOCKED DOWN -- no new badges "
-                         f"will be accepted ({LOCKDOWN_FILE} present).")
+            if discovery_disabled():
+                say_once("claim", "[transceiver] claiming: NEW BADGE DISCOVERY DISABLED -- "
+                         f"no new badges will be accepted ({DISCOVERY_OFF_FILE} present).")
                 time.sleep(CLAIM_GAP_S)
                 continue
             with _state_lock:
@@ -1207,8 +1207,8 @@ def main():
 
     threading.Thread(target=page_loop, daemon=True, name="page").start()
     threading.Thread(target=claim_loop, daemon=True, name="claim").start()
-    print("[transceiver] lockdown: " + ("ON -- no new badges will be accepted"
-                                        if lockdown_active() else "off -- new badges are claimed"))
+    print("[transceiver] new badge discovery: " + ("DISABLED -- no new badges will be accepted"
+                                                   if discovery_disabled() else "enabled -- new badges are claimed"))
 
     print(f"[transceiver] detect every {DETECT_INTERVAL}s, page every "
           f"~{PAGE_GAP}s + page timeout per absent badge; one badge per adapter")

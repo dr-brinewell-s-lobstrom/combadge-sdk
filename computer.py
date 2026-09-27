@@ -346,16 +346,19 @@ class NeedsMac:
         self.fn = fn
 
 
-def _lockdown(mac, on):
-    """Lock / release claiming on the speaking badge's transceiver host
-    (multiuser/PI.md phase 2, Ruling 1). The state lives THERE, as a file its
-    listener writes on b'L' and removes on b'U', so it survives a power cut and
-    the transceiver reads it without any socket of its own."""
-    if not _downlink_signal(mac, b"L" if on else b"U"):
+def _set_discovery(mac, enabled):
+    """Turn new badge discovery on or off on the speaking badge's transceiver
+    host (multiuser/PI.md phase 2, Ruling 1). The setting lives THERE, as a file
+    its listener writes on b'D' (disabled) and removes on b'Y' (enabled), so it
+    survives a power cut and the transceiver reads it without a socket of its
+    own. Not a security control -- it only decides whether new badges are
+    looked for."""
+    if not _downlink_signal(mac, b"Y" if enabled else b"D"):
         return "Unable to reach this badge's transceiver."
-    print(f"[computer] [{mac}] lockdown {'ON' if on else 'OFF'} sent to its transceiver")
-    return ("New badge discovery disabled." if on
-            else "New badge discovery enabled.")
+    print(f"[computer] [{mac}] new badge discovery {'ENABLED' if enabled else 'DISABLED'} "
+          f"sent to its transceiver")
+    return ("New badge discovery enabled." if enabled
+            else "New badge discovery disabled.")
 
 
 COMMANDS = {
@@ -363,12 +366,12 @@ COMMANDS = {
     "computer status":  "All systems nominal.",
     "computer time":    _time_phrase,   # e.g. "sixteen eleven hours."
     "computer goodbye": "Acknowledged.",
-    # Lockdown (multiuser/PI.md phase 2): stop / resume claiming new badges on
+    # New badge discovery (multiuser/PI.md phase 2): stop / resume claiming new badges on
     # the speaker's transceiver. Phrases chosen by the Captain, 2026-09-26.
     # Neither is a substring of the other ("computer enable" does not occur in
     # "computer disable"), so the match loop cannot confuse them.
-    "computer disable new badge discovery": NeedsMac(lambda mac: _lockdown(mac, True)),
-    "computer enable new badge discovery":  NeedsMac(lambda mac: _lockdown(mac, False)),
+    "computer disable new badge discovery": NeedsMac(lambda mac: _set_discovery(mac, False)),
+    "computer enable new badge discovery":  NeedsMac(lambda mac: _set_discovery(mac, True)),
 }
 
 
@@ -2706,17 +2709,18 @@ def console_loop():
                 print(f"[console] channel closed ({chan['from']} <-> "
                       f"{chan.get('answer_mac')})")
 
-        elif cmd == "lockdown":
-            # Lock / release claiming on EVERY connected transceiver host (each
-            # listener that hears b'L'/b'U' writes its host's lockdown.flag).
+        elif cmd == "discovery":
+            # New badge discovery on / off on EVERY connected transceiver host
+            # (each listener that hears b'Y'/b'D' updates its host's
+            # discovery_disabled.flag).
             if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
-                print("[console] usage: lockdown on|off")
+                print("[console] usage: discovery on|off")
                 continue
             with downlinks_lock:
                 macs = list(downlinks)
-            byte = b"L" if parts[1].lower() == "on" else b"U"
+            byte = b"Y" if parts[1].lower() == "on" else b"D"
             sent = [m for m in macs if _downlink_signal(m, byte)]
-            print(f"[console] lockdown {parts[1].lower()} sent to "
+            print(f"[console] new badge discovery {parts[1].lower()} sent to "
                   f"{', '.join(sent) or 'no connected badge'}")
 
         elif cmd == "game":
@@ -2737,7 +2741,7 @@ def console_loop():
 
         else:
             print("[console] commands: badges | hail <mac> [text] | close | "
-                  "lockdown on|off | game [on|off]")
+                  "discovery on|off | game [on|off]")
 
 
 # ---------------------------------------------------------------------------

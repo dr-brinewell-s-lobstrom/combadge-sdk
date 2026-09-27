@@ -12,9 +12,9 @@ log/
 # rather it never land here at all.
 captainslog.txt
 
-# Lockdown state (multiuser/PI.md phase 2): per installation, written by the
+# New badge discovery setting (multiuser/PI.md phase 2): per installation, written by the
 # listener when "computer, secure transceiver" is heard. Never committed.
-lockdown.flag
+discovery_disabled.flag
 # Transceiver health sentence (phase 2): runtime state, never committed.
 health.txt
 health.txt.tmp
