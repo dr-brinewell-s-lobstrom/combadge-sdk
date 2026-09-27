@@ -610,20 +610,29 @@ _tts_cache = {}                   # text -> WAV bytes, insertion-ordered
 _tts_cache_lock = threading.Lock()
 
 
+def _fallback_voice():
+    """The voice synth_wav() uses when Piper is not available, by name."""
+    if sys.platform == "win32":
+        return "Windows SAPI, female voice (Zira on stock Windows)"
+    return "espeak-ng en-us+f3"
+
+
 def load_piper():
-    """Load the Piper voice once, at startup. Returns a status line."""
+    """Load the Piper voice once, at startup. Returns the status line for the
+    console / log -- which voice the badges will hear, and why. Never spoken."""
     if not PIPER_MODEL:
-        return "no Piper voice model found -- using the platform voice"
+        return (f"TTS: {_fallback_voice()} -- no Piper voice model found "
+                f"({PIPER_DEFAULT_VOICE} in ../.piper/ or ~/.piper/, or SDK_PIPER_MODEL)")
     try:
         from piper import PiperVoice
     except ImportError:
-        return (f"Piper voice {PIPER_MODEL} found but piper-tts is not installed "
-                "(pip install piper-tts) -- using the platform voice")
+        return (f"TTS: {_fallback_voice()} -- Piper voice {PIPER_MODEL} found but "
+                "piper-tts is not installed (pip install piper-tts)")
     t = time.time()
     try:
         _piper["voice"] = PiperVoice.load(PIPER_MODEL)
     except Exception as e:
-        return f"Piper voice {PIPER_MODEL} failed to load ({e}) -- using the platform voice"
+        return f"TTS: {_fallback_voice()} -- Piper voice {PIPER_MODEL} failed to load ({e})"
     return f"TTS: Piper, {os.path.basename(PIPER_MODEL)} (loaded in {time.time() - t:.1f}s)"
 
 
