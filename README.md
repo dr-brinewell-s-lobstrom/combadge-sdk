@@ -484,14 +484,14 @@ The badge-to-badge hail/channel system built on these (aliases, prewarm, hystere
 
 The SDK uses `c`, `f`, `v`, `V`, `k`, the four channel bytes above, and the downlink's `H`/`E`/`D`/`Y`. One byte goes the other way on the downlink: `b'R'` + 2-byte length + UTF-8 text, a health report from the relay host, which the server speaks on that badge (§4). Other letters are free for your own extensions - a signal byte can trigger any relay-side behavior you like (the author's fuller system uses `l` for dictation-recorded and `p` for prompt-dispatched, for example).
 
-`listener.py` expects these asset files in `assets/` (next to the scripts): `listening.wav` (chirp on tap), `commandexecuted.wav`, `commandfailure.wav`, `badge-to-comms-relay-online.wav` (played on startup once the badge connects), `maincomputeronline.wav` (played once the server is reachable), `channelopen.wav` and `channelclosed.wav` (spoken when an intercom channel opens and closes). Any short WAV/MP3 clips work - record or synthesize your own and drop them in under these names.
+`listener.py` expects these asset files in `assets/` (next to the scripts): `listening.wav` (chirp on tap), `commandexecuted.wav`, `commandfailure.wav`, `badge-to-transceiver-online.wav` (played on startup once the badge connects), `maincomputeronline.wav` (played once the server is reachable), `channelopen.wav` and `channelclosed.wav` (spoken when an intercom channel opens and closes). Any short WAV/MP3 clips work - record or synthesize your own and drop them in under these names.
 
 **Generating the spoken assets - `tts.sh`.** For the spoken (as opposed to purely sound-effect) assets, `tts.sh` writes a WAV from a phrase using the *same* TTS engine `computer.py` speaks with - Windows SAPI (`System.Speech`, female voice, Rate 2) or `espeak-ng -v en-us -s 165` on Linux/macOS - so your startup and acknowledgement tones match the voice that answers commands. Unlike `speak`-style tools it only writes the file; it never plays audio. A bare filename lands next to the script; a path containing a slash is used as given:
 
 ```bash
 ./tts.sh "Access granted."               assets/access_granted.wav
 ./tts.sh "Main computer online."         assets/maincomputeronline.wav
-./tts.sh "Badge to comms relay online."  assets/badge-to-comms-relay-online.wav
+./tts.sh "Badge to transceiver, online." assets/badge-to-transceiver-online.wav
 ./tts.sh "Command executed."             assets/commandexecuted.wav
 ./tts.sh "Command failure."              assets/commandfailure.wav
 ./tts.sh "Channel open."                 assets/channelopen.wav

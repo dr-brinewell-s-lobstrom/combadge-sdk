@@ -13,7 +13,7 @@ log/
 captainslog.txt
 
 # Onboarding setting (multiuser/PI.md phase 2): per installation, written by the
-# listener when "computer, secure transceiver" is heard. Never committed.
+# listener when "computer, disable on boarding" is heard. Never committed.
 onboarding_disabled.flag
 # Transceiver health sentence (phase 2): runtime state, never committed.
 health.txt

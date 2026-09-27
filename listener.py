@@ -179,7 +179,7 @@ hail_pending            = {"until": 0.0}
 NACK_WAV                = os.path.join(ASSET_DIR, "commandfailure.wav")
 # Spoken "Cancelled." -- a tap ended the recording and nothing came of it.
 CANCELLED_WAV           = os.path.join(ASSET_DIR, "cancelled.wav")
-BADGE_ONLINE_WAV        = os.path.join(ASSET_DIR, "badge-to-comms-relay-online.wav")
+BADGE_ONLINE_WAV        = os.path.join(ASSET_DIR, "badge-to-transceiver-online.wav")
 MAINCOMPUTER_ONLINE_WAV = os.path.join(ASSET_DIR, "maincomputeronline.wav")
 # The other edge.  Added 2026-09-06: the server going away was logged and
 # otherwise silent, so a badge that had stopped working sounded exactly like a

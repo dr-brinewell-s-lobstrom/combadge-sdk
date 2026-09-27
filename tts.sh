@@ -22,7 +22,7 @@
 #   ./tts.sh "Access granted."               assets/access_granted.wav
 #   ./tts.sh "Main computer online."         assets/maincomputeronline.wav
 #   ./tts.sh "Main computer offline."        assets/maincomputeroffline.wav
-#   ./tts.sh "Badge to comms relay online."  assets/badge-to-comms-relay-online.wav
+#   ./tts.sh "Badge to transceiver, online." assets/badge-to-transceiver-online.wav
 #   ./tts.sh "Command executed."             assets/commandexecuted.wav
 #   ./tts.sh "Command failure."              assets/commandfailure.wav
 #   ./tts.sh "Channel open."                 assets/channelopen.wav
