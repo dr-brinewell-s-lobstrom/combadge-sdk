@@ -1365,7 +1365,7 @@ def _btmon_taps(fd, buf):
     return tapped, buf, True
 
 
-def run_channel(sock, ffmpeg, btmon=(None, None)):
+def run_channel(sock, ffmpeg, btmon=(None, None), tap_at=0.0):
     """Live intercom: this tap socket is now a full-duplex audio channel.
 
     Entered when the server sends b'O' (this badge is one end of an
@@ -1487,8 +1487,19 @@ def run_channel(sock, ffmpeg, btmon=(None, None)):
     # and PipeWire mixes it with the channel player.
     announce_mute_until = [float("inf")]
 
+    # tap_at: the answering tap, when it landed on a LIVE link (during the
+    # hail, or on the link held after it). The badge chirps ~0.5 s after such
+    # a tap, and played at once "Channel open." was masked on the answering
+    # badge and heard only on the caller's -- found in TOS relay-linux on the
+    # badge, 2026-09-26, whose answering path is this one. So it waits the
+    # chirp out as every tap-ended sound does; the uplink stays silent
+    # meanwhile. 0.0 = nothing to wait for (the caller; a cold tap, since the
+    # badge does not chirp on link-up).
     def _announce():
-        play_wav(CHANNEL_OPEN_WAV, prime=False)
+        if tap_at:
+            _play_after_tap_chirp(CHANNEL_OPEN_WAV, tap_at, "Channel open.")
+        else:
+            play_wav(CHANNEL_OPEN_WAV, prime=False)
         announce_mute_until[0] = time.time() + ANNOUNCE_TAIL_S
 
     threading.Thread(target=_announce, daemon=True).start()
@@ -1989,7 +2000,11 @@ def _stream_and_handle_response(reuse=None):
                     # Answered hail — this socket becomes the live intercom.
                     # No SHUT_WR: the uplink keeps flowing inside the channel.
                     signal_byte = sig
-                    run_channel(sock, ffmpeg, (btmon_pid, btmon_fd))
+                    # An answering tap on a live link chirps; its time is the
+                    # tap clock (the cut, or the held-link tap).
+                    run_channel(sock, ffmpeg, (btmon_pid, btmon_fd),
+                                tap_at=(_tap_clock["last"]
+                                        if answering and reused else 0.0))
                     break
                 signal_byte = sig
                 # Half-close our send side right away: the signal byte means

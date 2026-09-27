@@ -1131,6 +1131,18 @@ Three were new here; one had been there all along:
   for "Cancelled."; the far side, closed by `b'X'`, plays at once as before.
   This one was not new to two badges on one host, only newly noticed with
   both badges in hand.
+- **"Channel open." was masked on the badge that answered.** The same
+  collision at the other end of the channel: an answering tap on a live link
+  (during the hail, or on the link held after it) makes the badge chirp, and
+  the cue played straight into it. Found in TOS `relay-linux`, whose answering
+  path is a port of this one. `run_channel()` now takes the answering tap's
+  time (the tap clock) and waits it out through `_play_after_tap_chirp()`,
+  with the uplink kept silent meanwhile. The caller never tapped and a cold
+  tap raises no chirp, so both still hear the cue at once.
+- **The end of a hail's last word was trimmed.** `HAIL_TRIM_GRACE_MS` 200 →
+  500: a soft final consonant on a narrowband badge mic falls below the trim
+  threshold. "…come in please" arrived with "please" half gone; at 500 it is
+  whole (confirmed on the badge, in TOS, which runs the same trim).
 
 Two faults that silenced the channel came from the new setup, not from
 this code:
