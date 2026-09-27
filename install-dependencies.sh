@@ -93,6 +93,31 @@ if [[ $os == windows ]]; then
     command -v python >/dev/null 2>&1 || PY=python3
 fi
 
+next_steps() {
+    echo
+    echo "Next:"
+    if [[ $want_server -eq 1 && $want_transceiver -eq 1 ]]; then
+        echo "  1. Start the server:       ./computer.sh"
+        echo "  2. Start the transceiver:  ./transceiver.sh     (in a second terminal; asks for sudo)"
+        echo "  3. Power a badge on nearby. The transceiver pairs it by itself, and the"
+        echo "     server asks you, on the badge, to name it. Tap to answer."
+    elif [[ $want_server -eq 1 ]]; then
+        echo "  1. Start the server:  ./computer.sh"
+        echo "  2. On the transceiver host (Linux), point it at this machine:"
+        echo "       SDK_SERVER_HOST=<this machine's address> ./transceiver.sh"
+        [[ $os == windows ]] && echo "     Allow Python through the Windows firewall (TCP 1701) when asked."
+        echo "  3. Power a badge on near the transceiver host. It is paired by itself, and"
+        echo "     the server asks you, on the badge, to name it. Tap to answer."
+    else
+        echo "  1. Start the server (./computer.sh) on its machine."
+        echo "  2. Start the transceiver:  SDK_SERVER_HOST=<server address> ./transceiver.sh"
+        echo "     (just ./transceiver.sh if the server runs on this machine)"
+        echo "  3. Power a badge on nearby. It is paired by itself, and the server asks"
+        echo "     you, on the badge, to name it. Tap to answer."
+    fi
+    echo "  README §0 (Quick Start) has the details."
+}
+
 # --- check ------------------------------------------------------------------
 
 missing_apt=(); missing_pip=(); missing_models=()
@@ -154,6 +179,7 @@ total=$(( ${#missing_apt[@]} + ${#missing_pip[@]} + ${#missing_models[@]} ))
 echo
 if [[ $total -eq 0 ]]; then
     echo "Everything is installed."
+    [[ $check_only -eq 0 ]] && next_steps
     exit 0
 fi
 echo "Missing: $total item(s)."
@@ -216,4 +242,5 @@ if [[ $fail -ne 0 ]]; then
     echo "Some items failed (see above). Run again to retry just those."
     exit 1
 fi
-echo "Done. Run it again with --check to confirm."
+echo "Done."
+next_steps
