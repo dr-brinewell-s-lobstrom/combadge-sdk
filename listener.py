@@ -46,6 +46,7 @@ loop plus the persistent downlink (sdk/INTERCOM.md Phase 2); while SCO is up,
 btmon watches for the tap that ends a recording or closes a channel (Phase 10).
 """
 import atexit
+import fcntl
 import os
 import pty
 import re
@@ -397,6 +398,54 @@ PREWARM_MAX_S    = 25   # max seconds to hold a prewarmed SCO awaiting the b'v'
 # (paplay, no volume flag) — pushed hails must match the channel's level or
 # the opening hail sounds half as loud as the conversation that follows.
 PUSH_VOLUME = float(os.environ.get("SDK_PUSH_VOLUME", "1.0"))
+
+# ONE BADGE SPEAKS AT A TIME (Captain, 2026-09-27). After a restart every
+# badge on the host announced itself at once -- "Badge to transceiver,
+# online.", "Captain, online.", "Chief engineer, online." all over each other,
+# confusing with two badges in one room. Every announcement (the startup
+# phrase and every server-pushed voice: greeting, "Main computer online.",
+# onboarding prompt, health, a hail) now plays under a lock shared by all the
+# listeners on this host, so they take turns with no added delay: the next
+# starts as the previous one's teardown finishes. Order does not matter.
+#
+# fcntl.flock on a file, because the listeners are separate processes; the
+# kernel drops the lock if one dies. Taken INSIDE audio_lock, around the
+# playback only, so a long tap cycle on one badge (a captain's log) does not
+# hold another badge's announcement. Waits at most ANNOUNCE_WAIT_S: a listener
+# stuck mid-playback must not silence the rest. Not used for a prewarmed hail
+# (hot path, already live).
+ANNOUNCE_LOCK_FILE = os.environ.get("SDK_ANNOUNCE_LOCK", "/tmp/sdk_announce.lock")
+ANNOUNCE_WAIT_S = 20.0
+
+
+class host_announce_turn:
+    """Context manager: wait for this host's announcement turn."""
+    def __enter__(self):
+        self.fd = None
+        try:
+            self.fd = os.open(ANNOUNCE_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o666)
+        except OSError as e:
+            print(f"[listener] announcement lock unavailable ({e}) -- playing anyway")
+            return self
+        deadline = time.time() + ANNOUNCE_WAIT_S
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.time() > deadline:
+                    print(f"[listener] another badge held the announcement turn "
+                          f"over {ANNOUNCE_WAIT_S:.0f} s -- playing anyway")
+                    return self
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1107,7 +1156,7 @@ def play_pushed_voice(path, volume=None):
     """
     if volume is None:
         volume = PUSH_VOLUME
-    with audio_lock:
+    with audio_lock, host_announce_turn():
         ensure_hfp_profile()
         play_wav_cold(path, volume=volume)
         force_sco_teardown()
@@ -2328,7 +2377,7 @@ def main():
 
     # Play the badge-online sound (cold SCO start via play_wav_cold).
     # This confirms audio is routing to the badge before we wait for the server.
-    with audio_lock:
+    with audio_lock, host_announce_turn():
         play_wav_cold(BADGE_ONLINE_WAV)
 
     # Establish the persistent downlink (background thread).  It plays
