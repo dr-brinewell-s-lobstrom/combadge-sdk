@@ -12,6 +12,10 @@ log/
 # rather it never land here at all.
 captainslog.txt
 
+# Badge names (README §13): written by voice onboarding, per installation.
+# Not shipped: a fresh SDK knows no badges, so each is named by voice.
+aliases.conf
+
 # Onboarding setting (multiuser/PI.md phase 2): per installation, written by the
 # listener when "computer, disable on boarding" is heard. Never committed.
 onboarding_disabled.flag

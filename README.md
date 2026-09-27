@@ -1016,7 +1016,7 @@ State is in-process, as it is for Vibe Control, and here that buys something ext
 
 ## <a name="onboarding"></a>13. Naming a New Badge by Voice
 
-A badge with no line in `aliases.conf` is **new**, and the server asks its wearer to name it, on the badge, the moment it connects. No file editing, no console:
+A badge with no line in `aliases.conf` is **new**, and the server asks its wearer to name it, on the badge, the moment it connects. No file editing, no console. A fresh SDK has no `aliases.conf` at all (it is not shipped, and git ignores it): every badge starts out new, and naming the first one creates the file, with a header explaining its format:
 
 ```
 badge (pushed, no tap)  "New badge detected. Tap, then state this badge's name."

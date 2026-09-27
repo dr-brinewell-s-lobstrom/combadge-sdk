@@ -231,10 +231,41 @@ KEEPALIVE_S    = 5                # downlink keepalive cadence; relay calls 15 s
 #
 # Aliases live in sdk/aliases.conf (alias -> MAC, many-to-one), reloaded on
 # every tap.  The first alias of a badge is its spoken name.
+#
+# NOT SHIPPED, and not tracked in git (Captain, 2026-09-27): a fresh SDK knows
+# no badges, so every badge is new and is named by voice (README §13), which
+# creates the file with ALIASES_HEADER on top. It had shipped with the
+# Captain's own two badges, which left "captain", "bridge", "chief engineer"
+# and "engineering" taken by badges no one else owns.
 # ---------------------------------------------------------------------------
 
 ALIASES_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "aliases.conf")
+ALIASES_HEADER = """\
+# aliases.conf — badge alias directory (TOS SDK, sdk/INTERCOM.md Phase 3)
+#
+# Written by voice onboarding (README §13); edit by hand if you like.
+#
+# Format:      MAC = alias, alias, ...
+# Resolution:  alias -> badge (many-to-one).  Person, role, and location
+#              aliases are all the same thing: strings resolving to a badge.
+#
+# Ordering convention: name/role FIRST, location second, others after.
+# The first alias is the badge's spoken name — it is what the computer says
+# in responses ("There is no response from chief engineer.").
+#
+# Reloaded on every tap: edits take effect live, no server restart.
+# An alias mapping to two badges is a config error (reported at load; the
+# first mapping wins).  To rename a badge, delete its line and switch the
+# badge off and on: it is new again.
+#
+# Vosk note: aliases must be recognizable by the speech model.  If a proper
+# noun won't recognize, add a phonetic spelling as an extra alias
+# (e.g. "nep fler") — it maps to the same badge like any other alias.
+#
+# Example:
+#   00:11:22:33:44:55 = captain, bridge
+"""
 HAIL_SILENCE_S     = float(os.environ.get("SDK_HAIL_SILENCE_S", "1.5"))
                                   # end-of-hail: seconds without new recognized words
 HAIL_ANSWER_S      = float(os.environ.get("SDK_HAIL_ANSWER_S", "30"))
@@ -1490,7 +1521,9 @@ def _write_aliases(mac, names):
             with open(ALIASES_FILE, encoding="utf-8") as fh:
                 existing = fh.read()
         with open(ALIASES_FILE, "a", encoding="utf-8", newline="\n") as fh:
-            if existing and not existing.endswith("\n"):
+            if not existing:
+                fh.write(ALIASES_HEADER)    # the first badge named creates it
+            elif not existing.endswith("\n"):
                 fh.write("\n")
             fh.write(f"\n# Named by voice onboarding, "
                      f"{datetime.datetime.now():%Y-%m-%d %H:%M}\n")
