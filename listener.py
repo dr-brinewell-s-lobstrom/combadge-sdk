@@ -198,6 +198,12 @@ MAINCOMPUTER_OFFLINE_WAV = os.path.join(ASSET_DIR, "maincomputeroffline.wav")
 # diagnosis; on BOX (severed) it stays local.
 
 LOG_DIR  = os.path.join(SCRIPT_DIR, "log")
+# Lockdown flag, shared with transceiver.py (which checks it before claiming a
+# new badge). Present = locked. See the b'L'/b'U' downlink handler.
+LOCKDOWN_FILE = os.path.join(SCRIPT_DIR, "lockdown.flag")
+# Health sentence written by transceiver.py (PI.md Ruling 6); see health_watch().
+HEALTH_FILE   = os.path.join(SCRIPT_DIR, "health.txt")
+HEALTH_POLL_S = 3
 LOG_FILE = os.path.join(LOG_DIR, f"listener_{BADGE_MAC.replace(':', '_')}.log")
 try:
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -406,6 +412,9 @@ PUSH_VOLUME = float(os.environ.get("SDK_PUSH_VOLUME", "1.0"))
 # rather than playing over the top of it (and vice versa).
 
 audio_lock  = threading.Lock()    # whoever holds this owns the badge's audio
+# The live downlink socket, published for health_watch(), which is the only
+# thing that ever SENDS on the downlink (b'R'). None while it is down.
+_downlink = {"sock": None}
 downlink_up = threading.Event()   # set while the downlink is established
 
 
@@ -1100,6 +1109,42 @@ def play_pushed_voice(path, volume=None):
         force_sco_teardown()
 
 
+def health_watch():
+    """Report this host's transceiver health to the server (PI.md Ruling 6).
+
+    transceiver.py keeps one sentence in HEALTH_FILE -- empty when all is
+    well. Whenever it changes to something non-empty, or a new downlink comes
+    up while it is non-empty, it goes up the downlink as b'R' + 2-byte
+    big-endian length + UTF-8 text, and the server speaks it on this badge.
+    Every listener on the host does the same, so every working badge hears
+    it. The FIRST bytes a relay ever sends upstream on the downlink; older
+    servers already ignore them as strays."""
+    reported, last_sock = None, None
+    while True:
+        time.sleep(HEALTH_POLL_S)
+        sock = _downlink["sock"]
+        if sock is None:
+            continue
+        if sock is not last_sock:
+            reported, last_sock = None, sock      # a new downlink hears it again
+        try:
+            with open(HEALTH_FILE, encoding="utf-8") as f:
+                text = f.read().strip()
+        except OSError:
+            text = ""
+        if text == reported:
+            continue
+        reported = text
+        if not text:
+            continue                              # healthy: nothing to say
+        data = text.encode("utf-8")[:65535]
+        try:
+            sock.sendall(b"R" + len(data).to_bytes(2, "big") + data)
+            print(f"[listener] transceiver health reported: {text}")
+        except OSError as e:
+            print(f"[listener] health report not sent: {e}")
+
+
 def downlink_loop():
     """Maintain the persistent downlink to the server forever (thread body).
 
@@ -1135,6 +1180,7 @@ def downlink_loop():
 
         print(f"[listener] downlink established to {SERVER_HOST}:{SERVER_PORT}")
         downlink_up.set()
+        _downlink["sock"] = sock
         hail_pending["until"] = 0.0     # a (re)connected server holds no hail for us
         # Announce on every (re)connect — audible "the server is (back) up."
         # Standard chirp level, NOT hail level — matches the badge-online
@@ -1187,6 +1233,28 @@ def downlink_loop():
                         print("[listener] prewarm failed — will fall back to cold path")
                         force_sco_teardown()
                         audio_lock.release()
+                    continue
+                if sig in (b"L", b"U"):
+                    # Lockdown on / off (multiuser/PI.md phase 2): the server
+                    # heard "computer, disable/enable new badge discovery" from this
+                    # badge. The transceiver on this host decides whether to
+                    # claim new badges by the presence of this file, so it
+                    # outlives a power cut (Ruling 1). Written here because this
+                    # is the process with the server's socket; the transceiver
+                    # (root) only reads it. Payload-free, non-terminal.
+                    try:
+                        if sig == b"L":
+                            with open(LOCKDOWN_FILE, "w", encoding="utf-8", newline="\n") as f:
+                                f.write(f"locked {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                                        f"by {BADGE_MAC}\n")
+                            print("[listener] lockdown ON -- the transceiver will claim "
+                                  "no new badges")
+                        else:
+                            if os.path.exists(LOCKDOWN_FILE):
+                                os.remove(LOCKDOWN_FILE)
+                            print("[listener] lockdown OFF -- new badges will be claimed")
+                    except OSError as e:
+                        print(f"[listener] lockdown flag could not be changed: {e}")
                     continue
                 if sig in (b"H", b"E"):
                     # Hail pending / ended (INTERCOM.md Phase 9). b'H' arrives
@@ -2233,6 +2301,7 @@ def main():
     # not appear ready before there is a server, so wait for the first
     # connect here before accepting taps.
     threading.Thread(target=downlink_loop, daemon=True).start()
+    threading.Thread(target=health_watch, daemon=True).start()
     print(f"[listener] waiting for downlink to {SERVER_HOST}:{SERVER_PORT} — "
           f"start computer.py on that host if it isn't running...")
     downlink_up.wait()

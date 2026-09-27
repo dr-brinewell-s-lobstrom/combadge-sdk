@@ -112,8 +112,10 @@ Stripped down from relay-linux/combadge.py: no per-host PID files, no IPC
 flags, no log file rotation, foreground.
 """
 import os
+import pty
 import pwd
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -221,6 +223,7 @@ def unsay(key):
 
 # Full paths to system tools.  Adjust if your distro puts them elsewhere.
 BUSCTL  = "/usr/bin/busctl"         # systemd's D-Bus client -- talks to BlueZ
+BTCTL_BIN = "/usr/bin/bluetoothctl" # claiming only: one interactive session (see CLAIMING)
 PACTL   = "/usr/bin/pactl"          # PipeWire/PulseAudio control tool
 RUNUSER = "/usr/sbin/runuser"       # Run a command as a different user (needs root)
 
@@ -362,8 +365,11 @@ def survey(tree):
                          f"off and will not power on: {why}. Check `rfkill list`.")
         if powered:
             unsay(f"power:{addr}")
+            _POWER_FAULTS.discard(addr)
             adapters[addr] = {"hci": hci, "path": path}
             hci_addr[hci] = addr
+        else:
+            _POWER_FAULTS.add(addr)
 
     paired, unpaired = {}, set()
     for path in tree:
@@ -394,8 +400,8 @@ def survey(tree):
     for mac in sorted(unpaired - set(paired)):
         say_once(f"unpaired:{mac}",
                  f"[transceiver] {mac} is visible but not paired to this host -- "
-                 "ignored. (Claiming new badges is phase 2; pair and trust it by "
-                 "hand for now.)")
+                 "the claim loop will take it if an adapter is free and the "
+                 "transceiver is not locked down.")
     return adapters, paired
 
 
@@ -486,6 +492,73 @@ def enforce(assigned, evict, paired, live):
               "Two badges never share an adapter -- disconnected"
               + ("" if ok else f" -- FAILED: {why}"))
     return changed
+
+
+# ---------------------------------------------------------------------------
+# HEALTH -- say what is wrong, on the badges that work (PI.md Ruling 6)
+#
+# An appliance has no screen, so a failing dongle must be SPOKEN: at startup,
+# and whenever it happens later, with the other badges kept running. The
+# transceiver knows the facts; only the server can speak. So the facts become
+# one sentence in HEALTH_FILE, rewritten whenever it changes; every listener
+# on this host watches the file and sends a new sentence up its downlink
+# (b'R' + 2-byte length + UTF-8 text), and the server speaks it on that badge.
+# Every working badge hears it. Empty file = healthy = nothing said: silence
+# means all is well.
+#
+# Faults: an adapter that will not power on (rfkill, a USB fault); an adapter
+# seen earlier in this run that has DISAPPEARED (unplugged, or its USB device
+# died); a paired badge with no adapter of its own (Ruling 11). No MAC
+# addresses in the sentence -- they do not survive TTS. The log has the detail.
+# ---------------------------------------------------------------------------
+
+HEALTH_FILE   = os.path.join(SCRIPT_DIR, "health.txt")
+_POWER_FAULTS = set()        # adapter addrs that would not power on (survey)
+_seen_adapters = set()       # every adapter present at some point this run
+_health_text  = None         # last sentence written (None = never written)
+
+
+def _count_word(n):
+    return {1: "one", 2: "two", 3: "three", 4: "four"}.get(n, str(n))
+
+
+def update_health(adapters, orphans):
+    """Recompute the health sentence; write HEALTH_FILE if it changed."""
+    global _health_text
+    _seen_adapters.update(adapters)
+    lost = _seen_adapters - set(adapters) - _POWER_FAULTS
+    parts = []
+    if _POWER_FAULTS:
+        n = len(_POWER_FAULTS)
+        parts.append(f"{_count_word(n)} Bluetooth adapter{'s are' if n > 1 else ' is'} "
+                     "not responding")
+    if lost:
+        n = len(lost)
+        parts.append(f"{_count_word(n)} Bluetooth adapter{'s have' if n > 1 else ' has'} "
+                     "been lost")
+    if orphans:
+        n = len(orphans)
+        parts.append(f"{_count_word(n)} badge{'s have' if n > 1 else ' has'} no adapter of "
+                     f"{'their' if n > 1 else 'its'} own")
+    text = ("" if not parts else
+            "Warning. " + ". ".join(p[0].upper() + p[1:] for p in parts)
+            + ". Check the transceiver log over SSH.")
+    if text == _health_text:
+        return
+    _health_text = text
+    tmp = HEALTH_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text + ("\n" if text else ""))
+        os.replace(tmp, HEALTH_FILE)
+    except OSError as e:
+        print(f"[transceiver] health: could not write {HEALTH_FILE}: {e}")
+        return
+    if text:
+        print(f"[transceiver] HEALTH: {text}  (faulty: {sorted(_POWER_FAULTS)}, "
+              f"lost: {sorted(lost)}, no adapter: {orphans})")
+    else:
+        print("[transceiver] health: all well")
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +821,189 @@ def page_loop():
 
 
 # ---------------------------------------------------------------------------
+# CLAIMING -- a never-paired badge becomes this host's (multiuser/PI.md phase 2)
+#
+# Out of the box nobody pairs anything (Ruling 8): while an adapter has no
+# badge of its own and the transceiver is not locked down, it scans that
+# adapter for a TNG COMBADGE paired to NO adapter here, and pairs, trusts and
+# connects it -- on that adapter only.  The pre-flight survey then sees the new
+# pairing, a supervisor starts its listener, and the server, finding the badge
+# unnamed, asks its wearer to name it (PI.md phase 3).  Power on, name, done.
+#
+# ONE bluetoothctl session per attempt, driven under a pty, the approach the
+# Captain proposed: `select` the adapter, then scan / pair / trust / connect in
+# the same session (select lasts only for the session it was typed in).
+# Proven by multiuser/claim_probe.py on PAN, 2026-09-26: pair 5.4 s, trust
+# 0.2 s, connect 0.5 s, NO agent prompt -- the NoInputNoOutput agent makes it
+# silent.  A badge the host has unpaired goes straight back to discoverable.
+# The rest of this file keeps using busctl; only claiming needs a session.
+#
+# Every badge found is claimed while an adapter is free (Ruling 1).  LOCKDOWN
+# (a file, so it survives a power cut) stops that: the server's "computer,
+# disable new badge discovery" sends b'L' down a badge's downlink and its
+# listener writes LOCKDOWN_FILE; "computer, enable new badge discovery"
+# removes it.
+# ---------------------------------------------------------------------------
+
+CLAIM_SCAN_S  = 20    # one scan window on a free adapter
+CLAIM_GAP_S   = 30    # between windows: a free adapter is scanned ~40% of the time
+CLAIM_NAME    = "TNG COMBADGE"
+LOCKDOWN_FILE = os.path.join(SCRIPT_DIR, "lockdown.flag")
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x01\x02\r]")
+_MACPAT = r"((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})"
+
+
+def lockdown_active():
+    return os.path.exists(LOCKDOWN_FILE)
+
+
+class Bluetoothctl:
+    """One interactive bluetoothctl session under a pty. Agent prompts --
+    which the NoInputNoOutput agent should never raise -- are answered "yes"
+    and logged loudly, since silence is the point of the design."""
+
+    def __init__(self):
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.execvp(BTCTL_BIN, [BTCTL_BIN])
+        self.buf = ""
+
+    def send(self, cmd):
+        os.write(self.fd, (cmd + "\n").encode())
+
+    def lines(self, timeout):
+        end, out = time.time() + timeout, []
+        while time.time() < end:
+            r, _, _ = select.select([self.fd], [], [], 0.1)
+            if not r:
+                continue
+            try:
+                self.buf += os.read(self.fd, 4096).decode("utf-8", "replace")
+            except OSError:
+                break
+            while "\n" in self.buf:
+                line, self.buf = self.buf.split("\n", 1)
+                line = _ANSI.sub("", line).strip()
+                if line:
+                    out.append(line)
+            tail = _ANSI.sub("", self.buf)
+            if re.search(r"\(yes/no\):\s*$", tail):
+                print(f"[transceiver] claim: AGENT PROMPT {tail.strip()!r} -- answering yes")
+                self.buf = ""
+                self.send("yes")
+        return out
+
+    def expect(self, patterns, timeout):
+        """The first of `patterns` to appear, or None. The whole line that
+        matched is kept in self.last, so a failure can be reported in
+        bluetoothctl's own words."""
+        end = time.time() + timeout
+        self.last = ""
+        while time.time() < end:
+            for line in self.lines(0.2):
+                for p in patterns:
+                    if re.search(p, line, re.I):
+                        self.last = line
+                        return p
+        return None
+
+    def close(self):
+        try:
+            self.send("quit")
+            self.lines(1)
+        except OSError:
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+        try:
+            os.kill(self.pid, signal.SIGTERM)
+            os.waitpid(self.pid, 0)
+        except (OSError, ChildProcessError):
+            pass
+
+
+def claim_on(adapter, known):
+    """Scan `adapter` for CLAIM_SCAN_S for a combadge not in `known` (the MACs
+    paired to any adapter here) and claim the first one: pair, trust, connect,
+    on this adapter. Returns the MAC claimed, or None."""
+    s = Bluetoothctl()
+    try:
+        s.lines(1)
+        s.send("agent NoInputNoOutput")
+        s.expect([r"Agent registered", r"already registered"], 5)
+        s.send("default-agent")
+        s.expect([r"Default agent request successful"], 5)
+        s.send(f"select {adapter}")
+        s.lines(0.5)
+        s.send("scan on")
+        found, end = None, time.time() + CLAIM_SCAN_S
+        while time.time() < end and not found:
+            for line in s.lines(0.3):
+                m = re.search(rf"Device {_MACPAT}\b.*{CLAIM_NAME}", line, re.I)
+                if m and m.group(1).upper() not in known:
+                    found = m.group(1).upper()
+                    break
+        s.send("scan off")
+        s.lines(0.5)
+        if not found:
+            return None
+        print(f"[transceiver] claim: new badge {found} seen on {adapter} -- claiming it")
+        s.send(f"pair {found}")
+        if s.expect([r"Pairing successful", r"Failed to pair", r"AlreadyExists"], 40) \
+                != r"Pairing successful":
+            # bluetoothctl's own line, e.g. "Failed to pair:
+            # org.bluez.Error.AuthenticationFailed" -- or nothing within 40 s.
+            # The next scan window tries again (a first attempt failed once on
+            # PAN, 2026-09-26, and the retry 36 s later succeeded).
+            print(f"[transceiver] claim: pairing {found} on {adapter} FAILED -- "
+                  f"{s.last or 'no reply within 40s'}; retrying next window")
+            return None
+        s.send(f"trust {found}")
+        if not s.expect([r"trust succeeded"], 10):
+            print(f"[transceiver] claim: {found} paired on {adapter} but trust FAILED "
+                  "-- the pre-flight will retry it")
+        s.send(f"connect {found}")
+        ok = s.expect([r"Connection successful", r"Failed to connect"], 25)
+        print(f"[transceiver] claim: {found} claimed on {adapter} (paired, trusted"
+              + (", connected)" if ok == r"Connection successful" else "; connect failed, "
+                 "the page loop will reach it)"))
+        return found
+    finally:
+        s.close()
+
+
+def claim_loop():
+    """While an adapter has no badge of its own and the transceiver is not
+    locked down, look for a new badge on it. One adapter at a time, one
+    bluetoothctl session at a time."""
+    time.sleep(max(5.0, DETECT_INTERVAL * 2))   # let the first survey settle
+    while True:
+        try:
+            if lockdown_active():
+                say_once("claim", "[transceiver] claiming: LOCKED DOWN -- no new badges "
+                         f"will be accepted ({LOCKDOWN_FILE} present).")
+                time.sleep(CLAIM_GAP_S)
+                continue
+            with _state_lock:
+                free = sorted(a for a in ADAPTERS if a not in ASSIGNED.values())
+                known = set(PAIRED)
+            if not free:
+                say_once("claim", "[transceiver] claiming: every adapter has its badge -- "
+                         "not scanning.")
+                time.sleep(CLAIM_GAP_S)
+                continue
+            say_once("claim", f"[transceiver] claiming: open -- scanning {', '.join(free)} "
+                     f"for a new badge ({CLAIM_SCAN_S:.0f}s every "
+                     f"{CLAIM_SCAN_S + CLAIM_GAP_S:.0f}s).")
+            claim_on(free[0], known)
+        except Exception as e:
+            print(f"[transceiver] claim loop error: {e}")
+        time.sleep(CLAIM_GAP_S)
+
+
+# ---------------------------------------------------------------------------
 # Per-badge supervisor
 # ---------------------------------------------------------------------------
 
@@ -950,6 +1206,9 @@ def main():
     ensure_no_badge_default(username)
 
     threading.Thread(target=page_loop, daemon=True, name="page").start()
+    threading.Thread(target=claim_loop, daemon=True, name="claim").start()
+    print("[transceiver] lockdown: " + ("ON -- no new badges will be accepted"
+                                        if lockdown_active() else "off -- new badges are claimed"))
 
     print(f"[transceiver] detect every {DETECT_INTERVAL}s, page every "
           f"~{PAGE_GAP}s + page timeout per absent badge; one badge per adapter")
@@ -995,6 +1254,7 @@ def main():
                          "badges never share an adapter.")
             else:
                 unsay("orphans")
+            update_health(adapters, orphans)
             if not adapters:
                 say_once("idle", "[transceiver] no Bluetooth adapter is available.")
             elif not paired:

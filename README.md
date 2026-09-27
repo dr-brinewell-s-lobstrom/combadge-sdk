@@ -285,11 +285,36 @@ Runs before any paging, and assumes nothing about who set things up - the user m
 | badge paired on **two adapters** | once it connects, remove its pairing on the other adapter. Not before: until then there is no telling which one is the extra |
 | **two badges paired on one adapter** (the likeliest mistake when pairing by hand - `bluetoothctl` pairs on the default adapter) | the connected one keeps it, otherwise the lower MAC; the other is left unconnected and logged |
 | more paired badges than adapters | one per adapter; the rest are left unconnected and logged |
-| a combadge seen but not paired | ignored - pair and trust it yourself |
+| a combadge seen but not paired | claimed, if an adapter is free and discovery is enabled - see *Claiming* below |
 
 **Two badges never share an adapter.** It is not a preference: two badges on one adapter produced audio chaos and Bluetooth stack crashes (TOS, 2026-09-13). A badge that comes up on an adapter another badge owns - it is paired there, so it may connect by itself - is disconnected, every time.
 
 To keep a badge out, unpair it from this host. The pairings *are* the set; there is no allow-list.
+
+### Claiming: a new badge pairs itself
+
+**Nobody pairs a badge by hand.** Switch on a badge that has never been paired here and, if an adapter has no badge of its own, the transceiver finds it, pairs it, trusts it and connects it on that adapter; its listener starts; and the server, finding it unnamed, asks its wearer to name it (§13). From the box to talking, the only steps are *power on* and *say a name*.
+
+- **How:** a claim thread scans each free adapter for 20 s, then waits 30 s. A TNG COMBADGE paired to **no** adapter here is claimed through **one interactive `bluetoothctl` session** driven under a pty: `select` the adapter, `scan on`, `pair`, `trust`, `connect` - `select` only lasts for the session it was typed in, which is why one-off commands cannot do this. A `NoInputNoOutput` agent makes pairing silent; if a badge ever did raise a prompt, the transceiver would answer it and log it loudly. The rest of the transceiver keeps using `busctl`.
+- **Measured** (PAN, 2026-09-26): pair 5.4 s, trust 0.2 s, connect 0.5 s, no prompt; both badges claimed from a full wipe, one per adapter. A badge its host has unpaired goes **straight back to discoverable** - no button, no power cycle. A pairing can fail on the first try (it did once); the next window tries again, and the log gives `bluetoothctl`'s own reason.
+- **Only while an adapter is free.** With every adapter holding its badge, nothing is scanned.
+
+### Disabling new badge discovery
+
+Every badge found is claimed by default. To stop that - taking the transceiver somewhere other people's badges are about - say:
+
+- *"computer, disable new badge discovery"* → *"New badge discovery disabled."*
+- *"computer, enable new badge discovery"* → *"New badge discovery enabled."*
+
+The badges already claimed are unaffected. The state is a file, `lockdown.flag` beside `transceiver.py`, so it **survives a power cut**: a transceiver that reboots mid-convention does not start claiming again. The server sends `b'L'` / `b'U'` down the speaking badge's downlink; that badge's listener writes or removes the file; the transceiver checks it before every scan. The server console has `lockdown on|off` too (every connected transceiver). Verified 2026-09-26: with discovery disabled, a free adapter and a discoverable badge were left alone for 75 s; enabled, it was claimed in the next window.
+
+### Health: a failing adapter is announced on the badges that work
+
+An appliance has no screen, so faults are spoken. The transceiver keeps one sentence in `health.txt` - empty when all is well - and every listener sends a new sentence up its downlink (`b'R'` + 2-byte length + text, the only thing a relay sends upstream there); the server speaks it on that badge. Reported: an adapter that will not power on, an adapter that has disappeared since startup, a badge with no adapter of its own:
+
+> *"Warning. One Bluetooth adapter is not responding. Check the transceiver log over SSH."*
+
+The other badges keep running. Recovery clears the file and says nothing. Verified by `rfkill`-blocking one adapter of two: the fault was spoken on the other badge within a second, and unblocking brought its badge back on its own.
 
 ### Why two loops
 
@@ -385,6 +410,7 @@ ffmpeg is not a stylistic choice - `parec`, `parecord --file-format=raw`, and `p
 | `b'W'` | prewarm (downlink)   | bring SCO up now and hold it - a hail is about to arrive     |
 | `b'H'` | hail pending (downlink) | the next tap answers a hail - skip the `listening.wav` chirp for it |
 | `b'E'` | hail ended (downlink) | the answer window closed unanswered - taps are commands again |
+| `b'L'` / `b'U'` | new badge discovery off / on (downlink) | write / remove `lockdown.flag` for the transceiver (§4) |
 | `b'O'` | channel open         | this tap socket is now a live intercom (see `INTERCOM.md`); play `channelopen.wav` |
 | `b'A'`+len+PCM | channel audio | peer audio frame (2-byte BE len); pipe into the stdin player |
 | `b'X'` | channel closed       | play `channelclosed.wav`, tear down                          |
@@ -393,7 +419,7 @@ The badge-to-badge hail/channel system built on these (aliases, prewarm, hystere
 
 **Turn-taking in a live channel.** The channel carries one talker at a time. Pause for less than **0.5 s** (`CHANNEL_GATE_HOLD`) and you still have the floor: your next words go straight through. After a pause of 0.5 s the floor is released, and for the next **0.4 s** (`CHANNEL_FLOOR_RELEASE_MS`) neither badge transmits. That window lets the tail of your voice die away on the other badge, so it can't open that badge's gate. From 0.9 s on, whoever speaks first has the floor. Picking it up takes a little more voice than keeping it (gate open at 50, close below 16), so a whispered first syllable may be lost. In practice this is hard to notice: counting aloud at 0.5 s, 1 s and 1.5 s intervals comes through without drops on badges an arm's length apart (PAN, 2026-09-26). Both values are server environment variables (`SDK_CHANNEL_GATE_HOLD`, `SDK_CHANNEL_FLOOR_RELEASE_MS`); their tuning history and the same-room trade-offs are in `INTERCOM.md`.
 
-The SDK uses `c`, `f`, `v`, `k`, the four channel bytes above, and the downlink's `H`/`E`. Other letters are free for your own extensions - a signal byte can trigger any relay-side behavior you like (the author's fuller system uses `l` for dictation-recorded and `p` for prompt-dispatched, for example).
+The SDK uses `c`, `f`, `v`, `V`, `k`, the four channel bytes above, and the downlink's `H`/`E`/`L`/`U`. One byte goes the other way on the downlink: `b'R'` + 2-byte length + UTF-8 text, a health report from the relay host, which the server speaks on that badge (§4). Other letters are free for your own extensions - a signal byte can trigger any relay-side behavior you like (the author's fuller system uses `l` for dictation-recorded and `p` for prompt-dispatched, for example).
 
 `listener.py` expects these asset files in `assets/` (next to the scripts): `listening.wav` (chirp on tap), `commandexecuted.wav`, `commandfailure.wav`, `badge-to-comms-relay-online.wav` (played on startup once the badge connects), `maincomputeronline.wav` (played once the server is reachable), `channelopen.wav` and `channelclosed.wav` (spoken when an intercom channel opens and closes). Any short WAV/MP3 clips work - record or synthesize your own and drop them in under these names.
 

@@ -11,3 +11,10 @@ log/
 # publishing it.  Point SDK_CAPTAINSLOG_FILE outside the repo if you would
 # rather it never land here at all.
 captainslog.txt
+
+# Lockdown state (multiuser/PI.md phase 2): per installation, written by the
+# listener when "computer, secure transceiver" is heard. Never committed.
+lockdown.flag
+# Transceiver health sentence (phase 2): runtime state, never committed.
+health.txt
+health.txt.tmp

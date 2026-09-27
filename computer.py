@@ -338,11 +338,37 @@ def _time_phrase():
 ACK = object()
 
 
+class NeedsMac:
+    """A COMMANDS value that needs to know which badge spoke. match_command()
+    calls it with the speaker's MAC; plain callables are still called bare."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+
+def _lockdown(mac, on):
+    """Lock / release claiming on the speaking badge's transceiver host
+    (multiuser/PI.md phase 2, Ruling 1). The state lives THERE, as a file its
+    listener writes on b'L' and removes on b'U', so it survives a power cut and
+    the transceiver reads it without any socket of its own."""
+    if not _downlink_signal(mac, b"L" if on else b"U"):
+        return "Unable to reach this badge's transceiver."
+    print(f"[computer] [{mac}] lockdown {'ON' if on else 'OFF'} sent to its transceiver")
+    return ("New badge discovery disabled." if on
+            else "New badge discovery enabled.")
+
+
 COMMANDS = {
     "computer hello":   "Hello.",
     "computer status":  "All systems nominal.",
     "computer time":    _time_phrase,   # e.g. "sixteen eleven hours."
     "computer goodbye": "Acknowledged.",
+    # Lockdown (multiuser/PI.md phase 2): stop / resume claiming new badges on
+    # the speaker's transceiver. Phrases chosen by the Captain, 2026-09-26.
+    # Neither is a substring of the other ("computer enable" does not occur in
+    # "computer disable"), so the match loop cannot confuse them.
+    "computer disable new badge discovery": NeedsMac(lambda mac: _lockdown(mac, True)),
+    "computer enable new badge discovery":  NeedsMac(lambda mac: _lockdown(mac, False)),
 }
 
 
@@ -861,7 +887,7 @@ def active_commands():
     return COMMANDS
 
 
-def match_command(text):
+def match_command(text, mac=CONSOLE_MAC):
     """Return the response for the first matching phrase in `text`, or None.
 
     Iterates the active vocabulary in insertion order (Python 3.7+ dict
@@ -875,6 +901,8 @@ def match_command(text):
     """
     for phrase, response in active_commands().items():
         if phrase in text:
+            if isinstance(response, NeedsMac):
+                return response.fn(mac)
             return response() if callable(response) else response
     return None
 
@@ -1653,7 +1681,7 @@ def handle_connection(conn, addr, model):
                 if trig:
                     handle_large_vocab_phase(conn, mac, pcm, trig[0], trig[1])
                     return
-                response = match_command(accumulated)
+                response = match_command(accumulated, mac)
                 if response is not None:
                     print(f"[computer] [{mac}] match on {accumulated!r} -> {response!r}")
                     respond(conn, response, mac)
@@ -1683,7 +1711,7 @@ def handle_connection(conn, addr, model):
             if trig:
                 handle_large_vocab_phase(conn, mac, pcm, trig[0], trig[1])
                 return
-            response = match_command(final)
+            response = match_command(final, mac)
             if response is not None:
                 respond(conn, response, mac)
                 return
@@ -1722,6 +1750,17 @@ def serve_connection(conn, addr, model):
 # ---------------------------------------------------------------------------
 # Persistent downlink: hold, keepalive, push
 # ---------------------------------------------------------------------------
+
+def _recv_exact(conn, n):
+    """Exactly n bytes from conn, or raise OSError if it closes first."""
+    got = b""
+    while len(got) < n:
+        chunk = conn.recv(n - len(got))
+        if not chunk:
+            raise OSError("connection closed mid-message")
+        got += chunk
+    return got
+
 
 def run_downlink(conn, addr, mac):
     """Hold a relay's persistent downlink open until it dies (thread body).
@@ -1775,7 +1814,19 @@ def run_downlink(conn, addr, mac):
                 data = conn.recv(1)
                 if not data:
                     break            # relay closed its end
-                # The relay sends nothing after the handshake — ignore strays.
+                if data == b"R":
+                    # Health report from this badge's transceiver host (PI.md
+                    # Ruling 6): b'R' + 2-byte length + UTF-8 text. The one
+                    # thing a relay sends upstream on the downlink. Spoken on
+                    # this badge -- the host has no screen.
+                    size = int.from_bytes(_recv_exact(conn, 2), "big")
+                    text = _recv_exact(conn, size).decode("utf-8", "replace").strip()
+                    print(f"[computer] [{mac}] transceiver health: {text!r}")
+                    if text:
+                        threading.Thread(target=push_voice, args=(mac, text),
+                                         daemon=True).start()
+                    continue
+                # Anything else from the relay is a stray — ignore it.
             except socket.timeout:
                 # Quiet interval elapsed — keepalive time.
                 try:
@@ -2655,6 +2706,19 @@ def console_loop():
                 print(f"[console] channel closed ({chan['from']} <-> "
                       f"{chan.get('answer_mac')})")
 
+        elif cmd == "lockdown":
+            # Lock / release claiming on EVERY connected transceiver host (each
+            # listener that hears b'L'/b'U' writes its host's lockdown.flag).
+            if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
+                print("[console] usage: lockdown on|off")
+                continue
+            with downlinks_lock:
+                macs = list(downlinks)
+            byte = b"L" if parts[1].lower() == "on" else b"U"
+            sent = [m for m in macs if _downlink_signal(m, byte)]
+            print(f"[console] lockdown {parts[1].lower()} sent to "
+                  f"{', '.join(sent) or 'no connected badge'}")
+
         elif cmd == "game":
             # The way OUT of Game Mode, and the reason activate() prints a
             # banner pointing here: while the mode is on every badge tap is a
@@ -2673,7 +2737,7 @@ def console_loop():
 
         else:
             print("[console] commands: badges | hail <mac> [text] | close | "
-                  "game [on|off]")
+                  "lockdown on|off | game [on|off]")
 
 
 # ---------------------------------------------------------------------------
