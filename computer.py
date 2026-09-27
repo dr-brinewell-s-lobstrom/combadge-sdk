@@ -747,7 +747,11 @@ def detect_unknown_hail(final_text, caller_mac, alias_to_mac, mac_to_aliases):
 
 HAIL_TARGET_PEAK   = 29000  # normalize to ~90% of 16-bit full scale
 HAIL_MAX_GAIN      = 20.0   # never amplify more than this (dead-air guard)
-HAIL_TRIM_GRACE_MS = 200    # audio kept either side of detected speech
+# 200 -> 500 on 2026-09-26: the trim keeps this much after the LAST sample above
+# max(250, ref/8), and a soft final consonant (the "z" of "please") on a
+# narrowband badge mic sits below it -- 200 cut "please" halfway in TOS, whose
+# trim is this code. At 500 the word arrived whole (PAN, on the badge).
+HAIL_TRIM_GRACE_MS = 500    # audio kept either side of detected speech
 
 
 def prepare_hail_pcm(pcm_bytes, tag=""):
