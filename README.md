@@ -47,9 +47,9 @@ Two terminal windows are all you need. The **relay host** is the Linux machine t
 
 **Step 1 - Start the server** (any OS with Python):
 ```bash
-# Install dependencies (Linux/macOS)
-pip install vosk
-sudo apt install espeak-ng       # Linux - skip on Windows (SAPI built-in)
+# Install dependencies
+pip install vosk piper-tts       # piper-tts + a voice: see §2, "TTS for responses"
+sudo apt install espeak-ng       # Linux fallback voice - skip on Windows (SAPI built-in)
 
 # Download Vosk model (~40 MB): https://alphacephei.com/vosk/models
 # Unpack vosk-model-small-en-us-0.15/ somewhere, then:
@@ -90,6 +90,17 @@ in one-line launchers so the full invocation isn't retyped each session:
   "waiting for server localhost:1701" while the server runs fine elsewhere).
   Add `SDK_SERVER_PORT=<port>` inline the same way if not using 1701.
   Hostname targets (e.g. `myserver`) work if the relay host resolves them.
+
+**Server and relay on one machine** (`multiuser/PI.md` phase 4, verified on PAN
+2026-09-27): run `computer.py` on the relay host itself and start the
+transceiver with no `SDK_SERVER_HOST`; it defaults to `localhost`. Run the
+server as the ordinary user, the transceiver as root. Keep the Vosk and Piper
+models on the host's own disk, not a network mount. On PAN (Core 2 Duo P8400,
+2008, 7.7 GB) with both Vosk models and Piper Lessac low: listening 13 s after
+launch; greetings, commands, onboarding, hails both ways, captain's log and
+replay all as with a separate server; *"computer time"* spoken in 0.5 s. The
+cost is memory: **about 5 GB resident with the large model** (dictation),
+under 1 GB without it.
 
 **Step 3 - Test it:**  
 Tap the badge once. You hear a chirp from the badge speaker. Speak one of these phrases:
@@ -824,7 +835,7 @@ Capture then continues on the live socket until you stop talking.
 
 This is the one decision in the feature that is not a preference. Loading `vosk-model-en-us-0.22` takes tens of seconds and gigabytes of RAM, and a dictation begins **inside a live badge transaction** - the relay is already recording, and `listener.py` gives up `RECORD_MAX_S` (13 s) after the last byte from the server. Loading on first use would therefore blow the recording window every time, and the badge would fail the very command that triggered the load.
 
-Paying it once at startup is what makes the switch feel instantaneous. The cost is a slower launch and a resident ~2 GB; if you do not want either, omit the argument and the feature is simply not there.
+Paying it once at startup is what makes the switch feel instantaneous. The cost is a slower launch and the memory: `computer.py` measured **about 5 GB resident** with both models loaded (PAN, 2026-09-27), under 1 GB with the small model alone. If you do not want that, omit the argument and the feature is simply not there.
 
 ### Availability
 
