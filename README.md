@@ -35,6 +35,7 @@ While AI was obviously used for generating code - EVERY prompt was human-written
 10. [Vibe Control - driving a terminal by voice](#vibe-control)
 11. [Large-Vocabulary Dictation - captain's log and computer transcribe](#large-vocab)
 12. [Game Mode - the tap as a mouse click](#game-mode)
+13. [Naming a New Badge by Voice](#onboarding)
 
 ## <a name="ai-assisted-quick-start"></a>-1.  AI Assisted Quick Start
 
@@ -379,6 +380,7 @@ ffmpeg is not a stylistic choice - `parec`, `parecord --file-format=raw`, and `p
 | `b'c'` | command executed     | play `commandexecuted.wav` through the badge                 |
 | `b'f'` | no match             | play `commandfailure.wav`                                    |
 | `b'v'` | voice response       | read 4-byte big-endian size, then exactly N bytes of WAV; play |
+| `b'V'` | voice, keep listening | as `b'v'`, but NOT terminal: play it, discard the mic while it plays (and 0.35 s after), then keep streaming - see §13 |
 | `b'k'` | keepalive            | reset the recv timeout (and slide the recording deadline), keep waiting |
 | `b'W'` | prewarm (downlink)   | bring SCO up now and hold it - a hail is about to arrive     |
 | `b'H'` | hail pending (downlink) | the next tap answers a hail - skip the `listening.wav` chirp for it |
@@ -461,7 +463,7 @@ See `listener.py` in this folder for the runnable minimal version.
 2. **Discard the 44-byte WAV header.** Vosk wants raw PCM, not WAV.
 3. **Recognize.** Build a `KaldiRecognizer(model, 16000)`. Loop on `conn.recv(4096)`; for each chunk, call `AcceptWaveform(chunk)` then poll `PartialResult()` and `Result()`. Match against your command vocabulary on every poll - fire as soon as a match appears, don't wait for end-of-utterance. Cap the loop at ~10 s of wall time.
 4. **On match: act.** A "command" can be anything - play a sound locally, run a shell command, hit an API. The minimal server prints the recognized text and picks a canned response.
-5. **Acknowledge.** Send `b'c'` (matched), `b'f'` (no match within timeout), or `b'v'` followed by `<4-byte big-endian size><WAV bytes>` to deliver a voice response.
+5. **Acknowledge.** Send `b'c'` (matched), `b'f'` (no match within timeout), or `b'v'` followed by `<4-byte big-endian size><WAV bytes>` to deliver a voice response. (`b'V'`, same framing, speaks without ending the cycle; §13 uses it.)
 
 `computer.py` uses the unconstrained small model and substring matches against a tiny phrase list - easiest to start with, fine for a few commands. If you grow to dozens of phrases, Vosk also accepts a constrained grammar (a JSON list of exact phrases passed to `KaldiRecognizer`), which keeps recognition dramatically tighter at the cost of only hearing what's in the list.
 
@@ -923,7 +925,46 @@ State is in-process, as it is for Vibe Control, and here that buys something ext
 
 **Rate:** roughly one click per tap cycle - about a second, governed by the badge audio link coming up and down, not by anything in `clicker.py`. Right for a transporter, wrong for a fire button.
 
-## 13.  More Info
+## <a name="onboarding"></a>13. Naming a New Badge by Voice
+
+A badge with no line in `aliases.conf` is **new**, and the server asks its wearer to name it, on the badge, the moment it connects. No file editing, no console:
+
+```
+badge (pushed, no tap)  "New badge detected. Tap, then state this badge's name."
+you   (one tap)         "chief engineer"
+badge                   "Chief engineer. Confirm?"
+you                     "yes"
+badge                   "Additional identity?"
+you                     "engineering"
+badge                   "Engineering. Confirm?"
+you                     "yes"
+badge                   "Additional identity?"
+you                     "done"
+badge                   "Identity established: chief engineer, engineering, on-line."
+```
+
+`aliases.conf` gains `MAC = chief engineer, engineering` (with a dated comment above it), and the badge can hail and be hailed at once: the file is re-read on every tap, so there is no restart. The first name is the badge's spoken name; the rest are further aliases (a role, a location), in any order. The closing line reads **every** name back, so you hear that they were all saved. That is the only time the whole list is spoken: a badge that reconnects later is not re-introduced by name at all in the SDK, and in TOS, whose reconnect greeting names the badge, it says one name (`{callsign}, on-line.`).
+
+**One tap for the whole dialogue.** After the first tap you just answer. Each question goes out as `b'V'`, the non-terminal voice frame: the listener plays it, throws away what its own microphone hears while the question plays and for 0.35 s after (the badge would otherwise hear itself), and keeps streaming. Only the closing line is an ordinary `b'v'`, which ends the cycle.
+
+**Pausing.** Say nothing for 12 s at any question, or tap to end the recording, and the badge says *"Onboarding paused. Tap to continue."* Progress is kept: the next tap picks up at the same question. An answer spoken just before such a tap still counts.
+
+**What it refuses**, and asks again for:
+
+- a name another badge already has;
+- a name containing **"to"** (it would break the hail grammar, *"\<self\> to \<target\>"*) or **"computer"** (which starts every command);
+- more than three words;
+- nothing heard.
+
+"no" at a *Confirm?* discards that name and asks again. At *Additional identity?*, "done" (or "no", "none", "finished") ends it.
+
+**Names are heard by the small model**, the same unconstrained recognizer that later matches hails. So any name it transcribes is by definition one it can hear again: a name outside its vocabulary comes back as some other word, and the readback lets you reject it before it is saved. (Large-vocabulary dictation would transcribe names the small model then cannot match.)
+
+**To rename a badge**, delete its line from `aliases.conf` and reconnect it (switch it off and on): it is new again. While a badge is being named, its taps do nothing else. A server restart forgets an unfinished dialogue; the badge is asked again when it next connects.
+
+Tuning, all in `computer.py`: `ONBOARD_ANSWER_WAIT_S` (12 s, how long a question waits for an answer), `ONBOARD_SILENCE_S` (1.2 s of silence ends an answer), `ONBOARD_MAX_WORDS` (3). The dialogue's logic is `_onboard_step()`, a pure function; `multiuser/test_onboarding.py` in the TOS tree drives it offline.
+
+## 14.  More Info
 
 This SDK is the distilled foundation of a much larger system - the Terran Operating System (TOS), the author's full starship-computer environment built on this same voice command pipeline (voice-print identity, command vocabularies, dictation, an AI main computer, and more). To see where this foundation can lead, visit https://tos.md.
 

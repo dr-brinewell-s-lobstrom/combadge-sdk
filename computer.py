@@ -38,6 +38,8 @@ Response signals back to listener.py:
     b'g'                       — Game Mode click: terminal and SILENT, so the
                                  relay tears SCO down at once (see §12)
 Downlink-only signals: b'k' keepalive, b'W' prewarm, b'M'/b'N' Game Mode on/off.
+    b'V' + 4-byte size + WAV   — voice, NOT terminal: the badge plays it and
+                                 keeps listening (voice onboarding)
     b'v' + 4-byte size + WAV   — voice response (badge plays the WAV)
 
 A command returns either a string (spoken back) or the ACK sentinel (acted
@@ -1210,6 +1212,252 @@ def finish_captains_log(conn, mac, text, body):
 # Per-connection handler
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Voice onboarding — naming a new badge by voice (multiuser/PI.md phase 3)
+#
+# A badge that connects with no line in aliases.conf is new.  The server
+# asks its wearer to name it, and ONE TAP carries the whole dialogue:
+#
+#   pushed  "New badge detected. Tap, then state this badge's name."
+#   tap     "captain"   -> "Captain. Confirm?"         (b'V': keep listening)
+#           "yes"       -> "Additional identity?"      (b'V')
+#           "bridge"    -> "Bridge. Confirm?" -> "yes" -> "Additional identity?"
+#           "done"      -> aliases.conf gains  MAC = captain, bridge
+#                          "Identity established: captain, bridge, on-line."  (b'v': end)
+#
+# b'V' is the non-terminal voice frame: the listener plays it with the mic
+# kept open (discarding its own prompt as it plays), then goes on streaming,
+# so the wearer simply answers.  Until 2026-09-26 every turn was a separate
+# tap cycle -- answer, wait out the reply and the chirps, tap, answer -- which
+# the Captain found cumbersome on the badge.
+#
+# No answer within ONBOARD_ANSWER_WAIT_S, or a tap that ends the recording,
+# ends the session with "Onboarding paused. Tap to continue." and KEEPS the
+# progress: the next tap resumes at the same question.  An answer spoken just
+# before such a tap is still acted on.
+#
+# The first name is the badge's spoken name; the rest are further hail
+# aliases.  aliases.conf is re-read on every tap, so the identity is live the
+# moment it is written: no restart.
+#
+# NAMES ARE HEARD WITH THE SMALL MODEL, not large-vocabulary dictation (the
+# plan in PI.md).  The small model is the one that later matches hails, so a
+# name it transcribes is by construction a name it can hear again -- the
+# vocabulary check the plan called for comes for free.  A word outside its
+# vocabulary comes back as some other word, and the readback shows that
+# before anything is saved.
+#
+# While a badge is onboarding, its taps do nothing else.  A badge that
+# reconnects mid-onboarding starts over; a server restart forgets it, and the
+# badge is asked again when it next connects.
+# ---------------------------------------------------------------------------
+
+ONBOARD_ANSWER_WAIT_S = 12   # no first word this long after a prompt: pause
+ONBOARD_SILENCE_S     = 1.2  # a short answer: this long without a new word ends it
+ONBOARD_MAX_S         = 20   # cap on one answer, however noisy the room
+ONBOARD_KEEPALIVE_S   = 4    # b'k' while waiting: the listener gives up 13 s after
+                             # the last byte from us (RECORD_MAX_S)
+ONBOARD_MAX_WORDS     = 3    # a name is a word or three, not a sentence
+ONBOARD_PAUSED        = "Onboarding paused. Tap to continue."
+
+ONBOARD_YES  = {"yes", "yeah", "yep", "confirm", "confirmed", "correct", "affirmative"}
+ONBOARD_NO   = {"no", "nope", "negative", "incorrect", "wrong"}
+ONBOARD_DONE = {"no", "nope", "negative", "done", "none", "finished", "complete"}
+# Words a name may not contain: "to" is the hail grammar's separator
+# ("<self> to <target>"), and "computer" starts every command.
+ONBOARD_RESERVED = {"to", "computer"}
+# Vosk's small model turns noise and hesitation into these; they are trimmed
+# from either end of what it heard.
+ONBOARD_FILLER = {"the", "a", "uh", "um", "huh", "hmm", "ah", "oh"}
+
+onboarding         = {}   # MAC -> {"stage": "name"|"confirm"|"more", "pending": str, "names": [str]}
+onboarding_lock    = threading.Lock()
+aliases_write_lock = threading.Lock()
+
+
+def begin_onboarding(mac):
+    """Put a new badge into onboarding and ask for its name (pushed, no tap).
+    Runs on its own thread: synthesis must not hold up the downlink."""
+    with onboarding_lock:
+        onboarding[mac] = {"stage": "name", "pending": "", "names": []}
+    print(f"[computer] [{mac}] new badge (no aliases.conf entry) — onboarding by voice")
+    push_voice(mac, "New badge detected. Tap, then state this badge's name.")
+
+
+def send_prompt(conn, text, mac=CONSOLE_MAC):
+    """Say `text` and KEEP LISTENING: the non-terminal voice frame.
+
+    Wire format, as send_voice() but with a capital V:
+        b'V' + 4-byte big-endian size + WAV bytes
+    The listener plays it, discards its own mic audio while it plays, and
+    carries on streaming -- the tap cycle does not end.  Returns False if
+    nothing could be sent (TTS failed, or the connection is gone)."""
+    path = synth_wav(text)
+    if not path:
+        return False
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        conn.sendall(b"V")
+        conn.sendall(len(data).to_bytes(4, "big"))
+        conn.sendall(data)
+        print(f"[computer] [{mac}] sent prompt (keep listening): {text!r}")
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _capture_words(conn, model):
+    """Recognize one answer with the small model.
+
+    Ends when ONBOARD_SILENCE_S passes with no new word (after the first), when
+    no first word has come within ONBOARD_ANSWER_WAIT_S, at ONBOARD_MAX_S, or
+    when the stream closes.  Keepalives go out meanwhile.
+    Returns (words, ended): words lowercase and single-spaced; ended True if
+    the stream closed (a tap ended the recording, or the link went)."""
+    rec = KaldiRecognizer(model, 16000)
+    conn.settimeout(0.3)
+    start = last_progress = last_keepalive = time.time()
+    last_heard, segments, ended = "", [], False
+    while True:
+        now = time.time()
+        if last_heard and now - last_progress >= ONBOARD_SILENCE_S:
+            break
+        if not last_heard and now - start >= ONBOARD_ANSWER_WAIT_S:
+            break
+        if now - start >= ONBOARD_MAX_S:
+            break
+        if now - last_keepalive >= ONBOARD_KEEPALIVE_S:
+            try:
+                conn.sendall(b"k")
+            except OSError:
+                ended = True
+                break
+            last_keepalive = now
+        try:
+            data = conn.recv(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            ended = True
+            break
+        if not data:
+            ended = True
+            break
+        if rec.AcceptWaveform(data):
+            seg = json.loads(rec.Result()).get("text", "")
+            if seg:
+                segments.append(seg)
+            partial = ""
+        else:
+            partial = json.loads(rec.PartialResult()).get("partial", "")
+        heard = " ".join(segments + ([partial] if partial else []))
+        if heard and heard != last_heard:
+            last_heard, last_progress = heard, time.time()
+    tail = json.loads(rec.FinalResult()).get("text", "")
+    if tail:
+        segments.append(tail)
+    words = " ".join(segments).lower().split()
+    while words and words[0] in ONBOARD_FILLER:
+        words.pop(0)
+    while words and words[-1] in ONBOARD_FILLER:
+        words.pop()
+    return " ".join(words), ended
+
+
+def _write_aliases(mac, names):
+    """Append `MAC = name, name` to aliases.conf. LF line endings whatever the
+    platform: text mode on Windows would write CRLF (TOS.md, line endings)."""
+    with aliases_write_lock:
+        existing = ""
+        if os.path.isfile(ALIASES_FILE):
+            with open(ALIASES_FILE, encoding="utf-8") as fh:
+                existing = fh.read()
+        with open(ALIASES_FILE, "a", encoding="utf-8", newline="\n") as fh:
+            if existing and not existing.endswith("\n"):
+                fh.write("\n")
+            fh.write(f"\n# Named by voice onboarding, "
+                     f"{datetime.datetime.now():%Y-%m-%d %H:%M}\n")
+            fh.write(f"{mac} = {', '.join(names)}\n")
+
+
+def _onboard_step(mac, state, heard):
+    """The dialogue itself, one answer at a time. Updates `state`; returns
+    (reply, finished). Pure apart from writing aliases.conf when finished."""
+    words = set(heard.split())
+    if not heard:
+        if state["stage"] == "confirm":
+            return f"{state['pending'].capitalize()}. Confirm? Say yes or no.", False
+        return "Name not recognized. State the name again.", False
+
+    if state["stage"] == "confirm":
+        if words & ONBOARD_YES:
+            state["names"].append(state["pending"])
+            state["pending"], state["stage"] = "", "more"
+            return "Additional identity?", False
+        if words & ONBOARD_NO:
+            state["pending"] = ""
+            state["stage"] = "more" if state["names"] else "name"
+            return "State the name again.", False
+        return f"{state['pending'].capitalize()}. Confirm? Say yes or no.", False
+
+    if state["stage"] == "more" and (words & ONBOARD_DONE) and len(heard.split()) <= 2:
+        names = state["names"]
+        _write_aliases(mac, names)
+        with onboarding_lock:
+            onboarding.pop(mac, None)
+        print(f"[computer] [{mac}] onboarding complete: {mac} = {', '.join(names)}")
+        # EVERY name, in the order given (Captain, 2026-09-26): hearing them all
+        # confirms they were all saved, and the order says nothing about which
+        # is a name, a role or a location, so none is singled out.
+        return f"Identity established: {', '.join(names)}, on-line.", True
+
+    # A proposed name ("name" stage, or another one at "more").
+    alias_to_mac, _ = load_aliases()
+    if len(heard.split()) > ONBOARD_MAX_WORDS:
+        return f"A name is {ONBOARD_MAX_WORDS} words at most. State the name.", False
+    if words & ONBOARD_RESERVED:
+        return f"{heard.capitalize()} cannot be used as a name. State another name.", False
+    if heard in alias_to_mac and alias_to_mac[heard] != mac:
+        return (f"{heard.capitalize()} is already assigned to another badge. "
+                f"State another name."), False
+    if heard in state["names"]:
+        return f"{heard.capitalize()} is already assigned. Additional identity?", False
+    state["pending"], state["stage"] = heard, "confirm"
+    return f"{heard.capitalize()}. Confirm?", False
+
+
+def onboarding_tap(conn, mac, model):
+    """Run the onboarding dialogue on this tap, for as many turns as the
+    wearer keeps answering. Returns False if this badge is not onboarding
+    (the tap is then an ordinary one), True once the tap has been handled."""
+    with onboarding_lock:
+        state = onboarding.get(mac)
+    if state is None:
+        return False
+    while True:
+        heard, ended = _capture_words(conn, model)
+        print(f"[computer] [{mac}] onboarding ({state['stage']}): heard {heard!r}"
+              + (" [stream ended]" if ended else ""))
+        if not heard:
+            # No answer in time, or a tap with nothing said: stop, keep progress.
+            send_voice(conn, ONBOARD_PAUSED, mac)
+            return True
+        reply, finished = _onboard_step(mac, state, heard)
+        if finished or ended:
+            # A finished dialogue ends the cycle; so does a closed stream, over
+            # which there is no "keep listening" -- the next tap resumes.
+            send_voice(conn, reply if finished else reply + " Tap to continue.", mac)
+            return True
+        if not send_prompt(conn, reply, mac):
+            return True
+
+
 def handle_connection(conn, addr, model):
     """Handle one complete tap session.
 
@@ -1312,6 +1560,13 @@ def handle_connection(conn, addr, model):
         if hail_entry:
             print(f"[computer] [{mac}] tap answers pending hail from {hail_entry['from']}")
             run_channel_answer(conn, mac, hail_entry)
+            return
+
+        # --- voice onboarding: a new badge's taps name it (PI.md phase 3) ---
+        # After the answer-tap check (a new badge has no aliases, so it cannot
+        # be hailed anyway) and before Game Mode: naming a badge should not be
+        # blocked by a mode another badge turned on.
+        if onboarding_tap(conn, mac, model):
             return
 
         # --- Game Mode: this tap IS a click, not a command ---
@@ -1508,6 +1763,10 @@ def run_downlink(conn, addr, mac):
         except OSError:
             pass
     print(f"[computer] [{mac}] downlink registered from {addr[0]}:{addr[1]}")
+    # A badge with no aliases.conf entry is new: name it by voice (PI.md
+    # phase 3). Every (re)connect of an unnamed badge starts the dialogue over.
+    if mac not in load_aliases()[1]:
+        threading.Thread(target=begin_onboarding, args=(mac,), daemon=True).start()
 
     try:
         conn.settimeout(KEEPALIVE_S)

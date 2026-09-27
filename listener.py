@@ -1996,6 +1996,42 @@ def _stream_and_handle_response(reuse=None):
                     # non-keepalive byte is still the terminal signal.
                     deadline = time.time() + RECORD_MAX_S
                     continue
+                if sig == b"V":
+                    # NON-TERMINAL voice (voice onboarding, 2026-09-26): say
+                    # this, then keep listening -- the wearer answers without
+                    # a new tap.  The mic stays open (the capture IS the
+                    # link), but what it hears while the prompt plays, and
+                    # for ANNOUNCE_TAIL_S after while the room rings, is the
+                    # badge's own question: it is read and thrown away, never
+                    # sent, so it cannot be heard as the answer.  Same framing
+                    # as b'v'.
+                    path = read_voice_payload(sock)
+                    if path:
+                        stop_discard = threading.Event()
+
+                        def _discard_mic():
+                            while not stop_discard.is_set():
+                                try:
+                                    if not ffmpeg.stdout.read(4096):
+                                        break
+                                except Exception:
+                                    break
+
+                        discarder = threading.Thread(target=_discard_mic, daemon=True)
+                        discarder.start()
+                        try:
+                            print("[listener] prompt — playing, then listening")
+                            play_wav(path, prime=False)
+                            time.sleep(ANNOUNCE_TAIL_S)
+                        finally:
+                            stop_discard.set()
+                            discarder.join(timeout=1)
+                            try:
+                                os.unlink(path)
+                            except OSError:
+                                pass
+                    deadline = time.time() + RECORD_MAX_S
+                    continue
                 if sig == b"O":
                     # Answered hail — this socket becomes the live intercom.
                     # No SHUT_WR: the uplink keeps flowing inside the channel.
