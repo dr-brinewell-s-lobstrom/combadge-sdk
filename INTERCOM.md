@@ -810,6 +810,13 @@ signal that it is over; what the next tap needs to hear is "Listening.",
 which that cycle plays for itself; and an expiring linger still ends in the
 badge's own chirp. `ready.wav` is deleted rather than left unused.
 
+**TOS followed on 2026-10-04** (Captain): its `ready_chirp` (a `listening.wav`
+tone) is now empty, so a held TOS cycle ends silently too and the two are in
+line. The reason given there generalises this one: the badge listens only
+after a tap, or right after it has asked a question, and a "listening" sound
+while the hold is discarding the microphone says otherwise. TOS
+`relay-linux/RELAY.md` → *A held cycle ends silently*.
+
 ⚠ **Two rules this leaves behind.** First, *a TOS asset name is not an SDK
 asset meaning* — check what a file actually says before reusing either side's
 cue. Second, *an accurate cue is not automatically a wanted one*: the test
