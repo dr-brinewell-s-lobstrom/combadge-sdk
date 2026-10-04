@@ -115,6 +115,7 @@ Tap the badge once. You hear a chirp from the badge speaker. Speak one of these 
 | "computer status"     | "All systems nominal." |
 | "computer time"       | current time readout   |
 | "computer goodbye"    | "Acknowledged."        |
+| "computer who is online" | the callsign of every connected badge |
 
 Edit the `COMMANDS` dict in `computer.py` to add your own phrases and responses.
 
@@ -439,6 +440,7 @@ ffmpeg is not a stylistic choice - `parec`, `parecord --file-format=raw`, and `p
 |--------|----------------------|--------------------------------------------------------------|
 | `b'c'` | command executed     | play `commandexecuted.wav` through the badge                 |
 | `b'f'` | no match             | play `commandfailure.wav`                                    |
+| `b'C'` | cancelled            | play `cancelled.wav` (after the badge's own chirp, if the tap was on a live link): this tap was meant to answer a hail to a shared location that another badge answered first (§13) |
 | `b'v'` | voice response       | read 4-byte big-endian size, then exactly N bytes of WAV; play |
 | `b'V'` | voice, keep listening | as `b'v'`, but NOT terminal: play it, discard the mic while it plays (and 0.35 s after), then keep streaming - see §13 |
 | `b'k'` | keepalive            | reset the recv timeout (and slide the recording deadline), keep waiting |
@@ -992,39 +994,47 @@ State is in-process, as it is for Vibe Control, and here that buys something ext
 A badge with no line in `aliases.conf` is **new**, and the server asks its wearer to name it, on the badge, the moment it connects. No file editing, no console. A fresh SDK has no `aliases.conf` at all (it is not shipped, and git ignores it): every badge starts out new, and naming the first one creates the file, with a header explaining its format:
 
 ```
-badge (pushed, no tap)  "New badge detected. Tap, then state this badge's name."
+badge (pushed, no tap)  "New communicator detected. Tap, then state your callsign."
 you   (one tap)         "chief engineer"
-badge                   "Chief engineer. Confirm?"
+badge                   "Chief engineer - confirm with Yes, or say Redo."
 you                     "yes"
-badge                   "Additional identity?"
+badge                   "State this badge's location."
 you                     "engineering"
-badge                   "Engineering. Confirm?"
+badge                   "Engineering - confirm with Yes, or say Redo."
 you                     "yes"
-badge                   "Additional identity?"
-you                     "done"
-badge                   "Identity established: chief engineer, engineering, on-line."
+badge                   "State additional callsign, or say Finish."
+you                     "finish"
+badge                   "Callsign established: chief engineer, on-line. Location: engineering."
 ```
 
-`aliases.conf` gains `MAC = chief engineer, engineering` (with a dated comment above it), and the badge can hail and be hailed at once: the file is re-read on every tap, so there is no restart. The first name is the badge's spoken name; the rest are further aliases (a role, a location), in any order. The closing line reads **every** name back, so you hear that they were all saved. That is the only time the whole list is spoken: a badge that reconnects later is not re-introduced by name at all in the SDK, and in TOS, whose reconnect greeting names the badge, it says one name (`{callsign}, on-line.`).
+`aliases.conf` gains `MAC = chief engineer, engineering` (with a dated comment above it), and the badge can hail and be hailed at once: the file is re-read on every tap, so there is no restart.
+
+**The line is positional** (2026-10-04, in step with TOS): the **first** name is the **callsign** (what the wearer is hailed as, and the badge's spoken name), the **second** is the badge's **location**, and any further names are **additional callsigns** (*"State additional callsign, or say Finish."* repeats until "finish"). Every name is hailable. The closing line reads everything back, so you hear that it was all saved. That is the only time it is all spoken: a badge that reconnects later is greeted by its callsign alone (*"Captain, online."*).
+
+**A location may be shared**: two badges can both be on the bridge. A hail to *"bridge"* then rings **every** badge there at once (they play it in step), and whoever taps first gets the channel; the others are released at once (`b'E'`), and a tap from one of them within 5 s, meant as the answer, ends as a cancel (`b'C'`, *"Cancelled."*). A hail from a badge on the bridge to the bridge rings the rest of it. A **callsign** names one person, so it may not be any other badge's name, and a location may not be another badge's callsign.
+
+**Changing them later.** *"computer, set callsign"* asks for your callsign and additional callsigns again (they replace the old ones; the location is kept). *"computer, set location"* asks only for the location. Both run on the same tap, like naming does. Say *"cancel"*, or nothing, to leave things as they were (*"Location unchanged."*).
+
+**Finding someone.** *"computer, locate chief engineer"* (or *"computer, location of chief engineer"*), from any badge: *"Chief engineer is in engineering."*, *"Captain is on the bridge."*, or *"Chief engineer badge off-line."* when that badge is not connected. Callsigns only: you locate a person, not a place. How each location is said is the `LOCATION_PHRASES` dict in `computer.py`; anything not listed is "in ...". *"computer, who is online"* lists the callsign of every connected badge.
 
 **One tap for the whole dialogue.** After the first tap you just answer. Each question goes out as `b'V'`, the non-terminal voice frame: the listener plays it, throws away what its own microphone hears while the question plays and for 0.35 s after (the badge would otherwise hear itself), and keeps streaming. Only the closing line is an ordinary `b'v'`, which ends the cycle.
 
-**Pausing.** Say nothing for 12 s at any question, or tap to end the recording, and the badge says *"Onboarding paused. Tap to continue."* Progress is kept: the next tap picks up at the same question. An answer spoken just before such a tap still counts.
+**Pausing.** Say nothing for 12 s at any question, tap to end the recording, or say "cancel", and a new badge says *"Onboarding paused. Tap to continue."* Progress is kept: the next tap picks up at the same question. An answer spoken just before such a tap still counts. A *change* (set callsign / set location) is abandoned by silence or "cancel" instead; one paused by a tap is resumed by the next tap within 60 s (`ONBOARD_EDIT_STALE_S`), and dropped after that.
 
 **What it refuses**, and asks again for:
 
-- a name another badge already has;
-- a name containing **"to"** (it would break the hail grammar, *"\<self\> to \<target\>"*) or **"computer"** (which starts every command);
+- as a callsign, any name another badge has; as a location, another badge's callsign;
+- a name containing **"to"** (it would break the hail grammar, *"\<self\> to \<target\>"*), **"computer"** (which starts every command), **"cancel"** or **"redo"**;
 - more than three words;
 - nothing heard.
 
-"no" at a *Confirm?* discards that name and asks again. At *Additional identity?*, "done" (or "no", "none", "finished") ends it.
+"redo" (or "no") at a confirmation discards that answer and asks again. At *"State additional callsign, or say Finish."*, "finish" (or "done", "no", "none") ends it; at the callsign or location question it is refused: neither may be skipped.
 
 **Names are heard by the small model**, the same unconstrained recognizer that later matches hails. So any name it transcribes is by definition one it can hear again: a name outside its vocabulary comes back as some other word, and the readback lets you reject it before it is saved. (Large-vocabulary dictation would transcribe names the small model then cannot match.)
 
-**To rename a badge**, delete its line from `aliases.conf` and reconnect it (switch it off and on): it is new again. While a badge is being named, its taps do nothing else. A server restart forgets an unfinished dialogue; the badge is asked again when it next connects.
+**To rename a badge**, say *"computer, set callsign"*, or delete its line from `aliases.conf` and reconnect it (switch it off and on): it is new again. While a badge is being named, its taps do nothing else. A server restart forgets an unfinished dialogue; the badge is asked again when it next connects.
 
-Tuning, all in `computer.py`: `ONBOARD_ANSWER_WAIT_S` (12 s, how long a question waits for an answer), `ONBOARD_SILENCE_S` (1.2 s of silence ends an answer), `ONBOARD_MAX_WORDS` (3). The dialogue's logic is `_onboard_step()`, a pure function; `multiuser/test_onboarding.py` in the TOS tree drives it offline.
+Tuning, all in `computer.py`: `ONBOARD_ANSWER_WAIT_S` (12 s, how long a question waits for an answer), `ONBOARD_SILENCE_S` (1.2 s of silence ends an answer), `ONBOARD_MAX_WORDS` (3). The dialogue's logic is `_onboard_step()`, a pure function; `multiuser/test_onboarding.py` in the TOS tree drives it offline, along with the changes, shared-location hails, locate and the hail claim race.
 
 ## 14.  More Info
 

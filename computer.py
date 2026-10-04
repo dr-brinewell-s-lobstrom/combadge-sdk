@@ -246,34 +246,62 @@ ALIASES_HEADER = """\
 #
 # Written by voice onboarding (README §13); edit by hand if you like.
 #
-# Format:      MAC = alias, alias, ...
-# Resolution:  alias -> badge (many-to-one).  Person, role, and location
-#              aliases are all the same thing: strings resolving to a badge.
+# Format:      MAC = callsign, location, additional callsign, ...
 #
-# Ordering convention: name/role FIRST, location second, others after.
-# The first alias is the badge's spoken name — it is what the computer says
-# in responses ("There is no response from chief engineer.").
+# POSITIONAL.  The FIRST name is the CALLSIGN: what the wearer is hailed as
+# and the badge's spoken name ("There is no response from chief engineer.").
+# The SECOND is the badge's LOCATION ("computer locate chief engineer" ->
+# "Chief engineer is in engineering.").  Any further names are additional
+# callsigns.  Every name is hailable.
 #
-# Reloaded on every tap: edits take effect live, no server restart.
-# An alias mapping to two badges is a config error (reported at load; the
-# first mapping wins).  To rename a badge, delete its line and switch the
-# badge off and on: it is new again.
+# A callsign names ONE badge: no other badge may hold it, in any position.
+# A location may be SHARED -- two badges can both be on the bridge, and a
+# hail to the bridge then rings both; whoever answers first gets the channel.
+# A location may not be another badge's callsign.
 #
-# Vosk note: aliases must be recognizable by the speech model.  If a proper
-# noun won't recognize, add a phonetic spelling as an extra alias
-# (e.g. "nep fler") — it maps to the same badge like any other alias.
+# Reloaded on every tap: edits take effect live, no server restart.  Change
+# your own names by voice: "computer, set callsign" / "computer, set
+# location".  Or delete a badge's line and switch the badge off and on: it
+# is new again.
+#
+# Vosk note: names must be recognizable by the speech model.  If a proper
+# noun won't recognize, add a phonetic spelling as an additional callsign
+# (e.g. "nep fler") — it maps to the same badge like any other name.
 #
 # Example:
 #   00:11:22:33:44:55 = captain, bridge
 """
+# How the computer says WHERE a badge is, for "computer locate <callsign>":
+# "Captain is ON THE BRIDGE", "Chief engineer is IN ENGINEERING".  Key = a
+# location as written in aliases.conf (lowercase); value = the words after
+# "is".  A location not listed is "in <location>", so only the exceptions need
+# an entry.  Edit freely.  (TOS keeps the same table in TOS.conf [locations].)
+LOCATION_PHRASES = {
+    "bridge":             "on the bridge",
+    "battle bridge":      "on the battle bridge",
+    "holodeck":           "on the holodeck",
+    "away team":          "with the away team",
+    "ready room":         "in the ready room",
+    "observation lounge": "in the observation lounge",
+    "transporter room":   "in the transporter room",
+    "shuttle bay":        "in the shuttle bay",
+    "cargo bay":          "in the cargo bay",
+}
 HAIL_SILENCE_S     = float(os.environ.get("SDK_HAIL_SILENCE_S", "1.5"))
                                   # end-of-hail: seconds without new recognized words
 HAIL_ANSWER_S      = float(os.environ.get("SDK_HAIL_ANSWER_S", "30"))
                                   # window for the target's user to tap and answer
 HAIL_MAX_CAPTURE_S = 20           # hard cap on hail capture (noisy-room backstop)
 
-pending_hails      = {}           # target MAC -> channel entry dict (see handle_hail)
+pending_hails      = {}           # target MAC -> channel entry dict (see handle_hail);
+                                  # a hail to a shared location is pending on
+                                  # several MACs under ONE entry
 pending_hails_lock = threading.Lock()
+# Target MAC -> (answering MAC, wall time): a badge hailed together with others
+# that lost the race to answer.  A tap from it within ANSWERED_ELSEWHERE_S was
+# meant as the answer, and ends as a cancel (b'C') -- see claim_pending_hail().
+answered_elsewhere = {}
+ANSWERED_ELSEWHERE_S = 5
 
 CHANNEL_GAIN       = float(os.environ.get("SDK_CHANNEL_GAIN", "3"))
                                   # per-chunk software gain on bridged mic PCM —
@@ -403,6 +431,14 @@ COMMANDS = {
     # "computer disable"), so the match loop cannot confuse them.
     "computer disable on boarding": NeedsMac(lambda mac: _set_onboarding(mac, False)),
     "computer enable on boarding":  NeedsMac(lambda mac: _set_onboarding(mac, True)),
+    # The callsign of every badge on-line (2026-10-04). Both spellings: the
+    # small model runs unconstrained, so either may come back.
+    "computer who is online":  lambda: online_reply(),
+    "computer who is on line": lambda: online_reply(),
+    # NOT here, because they are not one-shot answers: "computer set callsign"
+    # / "computer set location" hold a dialogue on the tap (EDIT_PHRASES), and
+    # "computer locate <callsign>" is generated from aliases.conf like the
+    # hail phrases (locate_phrases). Both are matched in handle_connection().
 }
 
 
@@ -808,9 +844,16 @@ def load_aliases():
     Called on every tap so edits take effect live.  A missing file simply
     disables hails (both maps empty) — the command loop is unaffected.
     Aliases are normalized to lowercase single-spaced (matching Vosk
-    output); an alias claimed by two badges is reported and the first
-    mapping wins.  mac_to_aliases preserves file order — the FIRST alias is
-    the badge's spoken name, used in responses about it.
+    output).
+
+    mac_to_aliases is POSITIONAL and complete: every name of every badge, in
+    file order -- [callsign, location, additional callsign, ...].  The first
+    is the badge's spoken name.
+
+    alias_to_mac keeps the FIRST badge for each name.  A shared LOCATION is
+    legal and silent (two badges on the bridge); any other name held by two
+    badges is a config error and is reported.  Hails resolve through
+    alias_targets(), which keeps every badge.
     """
     alias_to_mac   = {}
     mac_to_aliases = {}
@@ -826,15 +869,18 @@ def load_aliases():
             if not MAC_RE.match(file_mac):
                 print(f"[computer] aliases.conf: bad MAC {mac_part.strip()!r} — line skipped")
                 continue
-            for raw in alias_part.split(","):
-                alias = " ".join(raw.lower().split())
-                if not alias:
-                    continue
-                if alias in alias_to_mac and alias_to_mac[alias] != file_mac:
-                    print(f"[computer] aliases.conf: {alias!r} maps to both "
-                          f"{alias_to_mac[alias]} and {file_mac} — keeping first")
-                    continue
-                alias_to_mac[alias] = file_mac
+            names = [n for n in (" ".join(r.lower().split())
+                                 for r in alias_part.split(",")) if n]
+            for pos, alias in enumerate(names):
+                first = alias_to_mac.get(alias)
+                if first and first != file_mac:
+                    shared_location = (pos == 1 and len(mac_to_aliases.get(first, [])) > 1
+                                       and mac_to_aliases[first][1] == alias)
+                    if not shared_location:
+                        print(f"[computer] aliases.conf: {alias!r} maps to both "
+                              f"{first} and {file_mac} — keeping first")
+                else:
+                    alias_to_mac[alias] = file_mac
                 mac_to_aliases.setdefault(file_mac, []).append(alias)
     return alias_to_mac, mac_to_aliases
 
@@ -845,32 +891,115 @@ def badge_name(mac, mac_to_aliases):
     return aliases[0] if aliases else mac
 
 
-def hail_phrases(caller_mac, alias_to_mac, mac_to_aliases):
-    """Every valid hail phrase for this caller, longest first.
+def badge_callsigns(names):
+    """A badge's PERSON names: its callsign and additional callsigns -- every
+    position but 1, which is the location."""
+    return names[:1] + names[2:]
 
-    Cross-product of the caller's own aliases with every OTHER badge's
-    aliases: "<self> to <target>".  Validity is by construction — a phrase
-    using someone else's self-alias, or targeting the caller's own badge,
-    is simply never generated, so it can never match.  Longest-first
-    ordering makes the most specific target win if one alias happens to be
-    a prefix of another.
+
+def alias_targets(mac_to_aliases):
+    """{name: [mac, ...]}: every badge a hail to `name` rings, in file order.
+    One for a callsign; possibly several for a shared location."""
+    targets = {}
+    for mac, names in mac_to_aliases.items():
+        for name in names:
+            if mac not in targets.setdefault(name, []):
+                targets[name].append(mac)
+    return targets
+
+
+def hail_phrases(caller_mac, alias_to_mac, mac_to_aliases):
+    """Every valid hail phrase for this caller, longest first:
+    [("<self> to <target>", [target_mac, ...])].
+
+    Cross-product of the caller's own names with every name another badge
+    holds.  Validity is by construction — a phrase using someone else's
+    self-name, or reaching only the caller's own badge, is simply never
+    generated, so it can never match.  A SHARED location lists every OTHER
+    badge there: on the bridge, hailing the bridge rings the rest of the
+    bridge, not yourself.  Longest-first ordering makes the most specific
+    target win if one name happens to be a prefix of another.
     """
     pairs = []
     for self_alias in mac_to_aliases.get(caller_mac, []):
-        for target_alias, target_mac in alias_to_mac.items():
-            if target_mac == caller_mac:
-                continue
-            pairs.append((f"{self_alias} to {target_alias}", target_mac))
+        for target_alias, macs in alias_targets(mac_to_aliases).items():
+            others = [m for m in macs if m != caller_mac]
+            if others:
+                pairs.append((f"{self_alias} to {target_alias}", others))
     pairs.sort(key=lambda p: len(p[0]), reverse=True)
     return pairs
 
 
 def match_hail(text, hails):
-    """Return (phrase, target_mac) for the first hail phrase in `text`, or None."""
-    for phrase, target_mac in hails:
+    """Return (phrase, [target_mac, ...]) for the first hail phrase in `text`, or None."""
+    for phrase, targets in hails:
         if phrase in text:
-            return phrase, target_mac
+            return phrase, targets
     return None
+
+
+# ---------------------------------------------------------------------------
+# Locate and who-is-online
+#
+# "computer locate <callsign>" / "computer location of <callsign>", from any
+# badge, about any badge in aliases.conf.  CALLSIGNS ONLY: a badge belongs to
+# a person, and the location is the thing being asked for.  The answer is the
+# badge's location (position 1) said through LOCATION_PHRASES -- but only
+# while the badge has a live downlink; otherwise "<callsign> badge off-line."
+# ---------------------------------------------------------------------------
+
+LOCATE_PREFIXES = ("computer locate", "computer location of")
+LOCATE_HOLD_S   = 0.4    # an ambiguous locate fires after the hypothesis is this still
+
+
+def locate_phrases(mac_to_aliases):
+    """[(phrase, mac)], longest first, one per callsign per prefix."""
+    owner = {}
+    for mac, names in mac_to_aliases.items():
+        for name in badge_callsigns(names):
+            owner.setdefault(name, mac)
+    pairs = [(f"{prefix} {name}", mac)
+             for name, mac in owner.items() for prefix in LOCATE_PREFIXES]
+    pairs.sort(key=lambda p: len(p[0]), reverse=True)
+    return pairs
+
+
+def match_locate(text, locates):
+    """(phrase, mac) for the first locate phrase `text` ENDS with, or None.
+    Ends with, not contains: "computer locate chief" must not fire inside
+    "computer locate chief engineer" -- see the hold in handle_connection()."""
+    for phrase, mac in locates:
+        if text == phrase or text.endswith(" " + phrase):
+            return phrase, mac
+    return None
+
+
+def location_phrase(location):
+    return LOCATION_PHRASES.get(location) or f"in {location}"
+
+
+def locate_reply(mac, mac_to_aliases):
+    names = mac_to_aliases.get(mac, [])
+    callsign = names[0] if names else mac
+    with downlinks_lock:
+        online = mac in downlinks
+    if not online:
+        return f"{callsign.capitalize()} badge off-line."
+    if len(names) < 2:
+        return f"Location of {callsign} is not available."
+    return f"{callsign.capitalize()} is {location_phrase(names[1])}."
+
+
+def online_reply():
+    """The callsign of every badge with a live downlink, in aliases.conf
+    order.  A badge with no line (one being named) has no callsign to say."""
+    _, mac_to_aliases = load_aliases()
+    with downlinks_lock:
+        live = set(downlinks)
+    names = [n[0] for mac, n in mac_to_aliases.items() if mac in live and n]
+    if not names:
+        return "No badges are on-line."
+    return f"Badges on-line: {', '.join(names)}."
 
 
 def detect_unknown_hail(final_text, caller_mac, alias_to_mac, mac_to_aliases):
@@ -1369,12 +1498,22 @@ def finish_captains_log(conn, mac, text, body):
 # A badge that connects with no line in aliases.conf is new.  The server
 # asks its wearer to name it, and ONE TAP carries the whole dialogue:
 #
-#   pushed  "New badge detected. Tap, then state this badge's name."
-#   tap     "captain"   -> "Captain. Confirm?"         (b'V': keep listening)
-#           "yes"       -> "Additional identity?"      (b'V')
-#           "bridge"    -> "Bridge. Confirm?" -> "yes" -> "Additional identity?"
-#           "done"      -> aliases.conf gains  MAC = captain, bridge
-#                          "Identity established: captain, bridge, on-line."  (b'v': end)
+#   pushed  "New communicator detected. Tap, then state your callsign."
+#   tap     "captain"   -> "Captain - confirm with Yes, or say Redo."
+#                                                      (b'V': keep listening)
+#           "yes"       -> "State this badge's location."
+#           "bridge"    -> "Bridge - confirm with Yes, or say Redo."
+#           "yes"       -> "State additional callsign, or say Finish."  (repeats)
+#           "finish"    -> aliases.conf gains  MAC = captain, bridge
+#                          "Callsign established: captain, on-line.
+#                           Location: bridge."                          (b'v': end)
+#
+# CALLSIGN AND LOCATION ARE DIFFERENT THINGS (TOS, Captain, 2026-10-04): the
+# callsign is who you are hailed as, the location is where the badge is, and
+# "computer, set callsign" / "computer, set location" change either at any
+# time (edit_tap).  Both are hailable; the line is positional (ALIASES_HEADER).
+# "Redo" (or "no") at a confirmation asks that question again; "cancel"
+# abandons a change, or pauses a new badge's naming.
 #
 # b'V' is the non-terminal voice frame: the listener plays it with the mic
 # kept open (discarding its own prompt as it plays), then goes on streaming,
@@ -1387,9 +1526,8 @@ def finish_captains_log(conn, mac, text, body):
 # progress: the next tap resumes at the same question.  An answer spoken just
 # before such a tap is still acted on.
 #
-# The first name is the badge's spoken name; the rest are further hail
-# aliases.  aliases.conf is re-read on every tap, so the identity is live the
-# moment it is written: no restart.
+# The callsign is the badge's spoken name.  aliases.conf is re-read on every
+# tap, so the names are live the moment they are written: no restart.
 #
 # NAMES ARE HEARD WITH THE SMALL MODEL, not large-vocabulary dictation (the
 # plan in PI.md).  The small model is the one that later matches hails, so a
@@ -1408,31 +1546,55 @@ ONBOARD_SILENCE_S     = 1.2  # a short answer: this long without a new word ends
 ONBOARD_MAX_S         = 20   # cap on one answer, however noisy the room
 ONBOARD_KEEPALIVE_S   = 4    # b'k' while waiting: the listener gives up 13 s after
                              # the last byte from us (RECORD_MAX_S)
-ONBOARD_MAX_WORDS     = 3    # a name is a word or three, not a sentence
+ONBOARD_MAX_WORDS     = 3    # a callsign or location is a word or three, not a sentence
+# A CHANGE paused by a tap is resumed by the next tap only within this window;
+# after it the next tap is an ordinary command again, so an abandoned change
+# cannot capture the badge's taps.
+ONBOARD_EDIT_STALE_S  = 60
 ONBOARD_PAUSED        = "Onboarding paused. Tap to continue."
+PROMPT_CALLSIGN = "State your callsign."
+PROMPT_LOCATION = "State this badge's location."
+PROMPT_MORE     = "State additional callsign, or say Finish."
+# "communicator", not "badge": TOS's mobile relay serves any headset a phone
+# connects, so TOS says this, and the SDK says the same so the two dialogues
+# stay word for word alike.
+ONBOARD_GREETING = "New communicator detected. Tap, then state your callsign."
 
 ONBOARD_YES  = {"yes", "yeah", "yep", "confirm", "confirmed", "correct", "affirmative"}
-ONBOARD_NO   = {"no", "nope", "negative", "incorrect", "wrong"}
-ONBOARD_DONE = {"no", "nope", "negative", "done", "none", "finished", "complete"}
+# "redo" is the word the confirmation offers; the rest still work.
+ONBOARD_NO   = {"redo", "no", "nope", "negative", "incorrect", "wrong"}
+ONBOARD_DONE = {"no", "nope", "negative", "done", "none", "finish", "finished",
+                "complete"}
+ONBOARD_CANCEL = {"cancel"}
 # Words a name may not contain: "to" is the hail grammar's separator
-# ("<self> to <target>"), and "computer" starts every command.
-ONBOARD_RESERVED = {"to", "computer"}
+# ("<self> to <target>"), "computer" starts every command, "cancel" ends a
+# change and "redo" answers a confirmation.
+ONBOARD_RESERVED = {"to", "computer", "cancel", "redo"}
 # Vosk's small model turns noise and hesitation into these; they are trimmed
 # from either end of what it heard.
 ONBOARD_FILLER = {"the", "a", "uh", "um", "huh", "hmm", "ah", "oh"}
 
-onboarding         = {}   # MAC -> {"stage": "name"|"confirm"|"more", "pending": str, "names": [str]}
+onboarding         = {}   # MAC -> dialogue state, see _new_onboard_state()
 onboarding_lock    = threading.Lock()
 aliases_write_lock = threading.Lock()
 
 
+def _new_onboard_state(mode, stage, callsign=None, location=None, extras=None):
+    """mode: "new" | "callsign" | "location" (what is being set).
+    stage: "callsign" | "location" | "more" | "confirm" (what is being asked).
+    callsign / location / extras: what the line will hold if saved now."""
+    return {"mode": mode, "stage": stage, "pending": "", "confirming": None,
+            "callsign": callsign, "location": location, "extras": list(extras or []),
+            "asked_location": False, "touched": time.time()}
+
+
 def begin_onboarding(mac):
-    """Put a new badge into onboarding and ask for its name (pushed, no tap).
-    Runs on its own thread: synthesis must not hold up the downlink."""
+    """Put a new badge into onboarding and ask for its callsign (pushed, no
+    tap).  Runs on its own thread: synthesis must not hold up the downlink."""
     with onboarding_lock:
-        onboarding[mac] = {"stage": "name", "pending": "", "names": []}
+        onboarding[mac] = _new_onboard_state("new", "callsign")
     print(f"[computer] [{mac}] new badge (no aliases.conf entry) — onboarding by voice")
-    push_voice(mac, "New badge detected. Tap, then state this badge's name.")
+    push_voice(mac, ONBOARD_GREETING)
 
 
 def send_prompt(conn, text, mac=CONSOLE_MAC):
@@ -1446,6 +1608,10 @@ def send_prompt(conn, text, mac=CONSOLE_MAC):
     path = synth_wav(text)
     if not path:
         return False
+    # AFTER synthesis, right before sending: nothing said before a question
+    # can be its answer.  Matters most for the first question of a change,
+    # where the uplink still holds the tail of "computer set callsign".
+    _drain_uplink(conn)
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -1459,6 +1625,27 @@ def send_prompt(conn, text, mac=CONSOLE_MAC):
     finally:
         try:
             os.unlink(path)
+        except OSError:
+            pass
+
+
+def _drain_uplink(conn):
+    """Discard uplink audio already received.  Non-blocking; an EOF found
+    here stays an EOF for the next reader."""
+    previous = conn.gettimeout()
+    try:
+        conn.settimeout(0.0)
+        while True:
+            try:
+                if not conn.recv(65536):
+                    break
+            except (BlockingIOError, socket.timeout):
+                break
+    except OSError:
+        pass
+    finally:
+        try:
+            conn.settimeout(previous)
         except OSError:
             pass
 
@@ -1522,13 +1709,25 @@ def _capture_words(conn, model):
 
 
 def _write_aliases(mac, names):
-    """Append `MAC = name, name` to aliases.conf. LF line endings whatever the
+    """Write `MAC = callsign, location, ...` to aliases.conf: REPLACING this
+    badge's line if it has one (a "set callsign" / "set location" change),
+    otherwise appending it with a dated comment (a new badge).  Everything
+    else in the file is kept as written.  LF line endings whatever the
     platform: text mode on Windows would write CRLF (TOS.md, line endings)."""
+    entry = f"{mac} = {', '.join(names)}"
     with aliases_write_lock:
         existing = ""
         if os.path.isfile(ALIASES_FILE):
             with open(ALIASES_FILE, encoding="utf-8") as fh:
                 existing = fh.read()
+        lines = existing.split("\n") if existing else []
+        for i, line in enumerate(lines):
+            if (not line.lstrip().startswith("#") and "=" in line
+                    and line.split("=", 1)[0].strip().upper() == mac):
+                lines[i] = entry
+                with open(ALIASES_FILE, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write("\n".join(lines))
+                return
         with open(ALIASES_FILE, "a", encoding="utf-8", newline="\n") as fh:
             if not existing:
                 fh.write(ALIASES_HEADER)    # the first badge named creates it
@@ -1536,53 +1735,135 @@ def _write_aliases(mac, names):
                 fh.write("\n")
             fh.write(f"\n# Named by voice onboarding, "
                      f"{datetime.datetime.now():%Y-%m-%d %H:%M}\n")
-            fh.write(f"{mac} = {', '.join(names)}\n")
+            fh.write(entry + "\n")
+
+
+def _prompt_for(stage):
+    return {"callsign": PROMPT_CALLSIGN, "location": PROMPT_LOCATION,
+            "more": PROMPT_MORE}[stage]
+
+
+def _noun(stage):
+    return "location" if stage == "location" else "callsign"
+
+
+def _held(state):
+    """Every name the line will carry if saved now (the pending one excluded)."""
+    return [n for n in (state["callsign"], state["location"], *state["extras"]) if n]
+
+
+def _confirm(name):
+    return f"{name.capitalize()} - confirm with Yes, or say Redo."
+
+
+def _onboard_accept(mac, state):
+    """A confirmed answer: store it, then ask the next question or save."""
+    target, value = state["confirming"], state["pending"]
+    state["pending"], state["confirming"] = "", None
+    if target == "callsign":
+        state["callsign"] = value
+        if state["location"] is None:
+            state["stage"], state["asked_location"] = "location", True
+            return PROMPT_LOCATION, False
+        state["stage"] = "more"
+        return PROMPT_MORE, False
+    if target == "location":
+        state["location"] = value
+        if state["mode"] == "location":
+            return _onboard_finish(mac, state)
+        state["stage"] = "more"
+        return PROMPT_MORE, False
+    state["extras"].append(value)
+    state["stage"] = "more"
+    return PROMPT_MORE, False
+
+
+def _onboard_finish(mac, state):
+    names = _held(state)
+    try:
+        _write_aliases(mac, names)
+    except OSError as e:
+        # Progress kept, parked on "more": "finish" on the next tap retries.
+        print(f"[computer] [{mac}] could not write aliases.conf: {e}")
+        state["stage"] = "more"
+        return "Unable to save. Tap, then say Finish to try again.", True
+    with onboarding_lock:
+        onboarding.pop(mac, None)
+    print(f"[computer] [{mac}] {'onboarding' if state['mode'] == 'new' else 'set ' + state['mode']} "
+          f"complete: {mac} = {', '.join(names)}")
+    # Read back everything that was set: hearing it confirms it was saved.
+    extras = (f" Additional callsigns: {', '.join(state['extras'])}."
+              if state["extras"] else "")
+    if state["mode"] == "new":
+        return (f"Callsign established: {state['callsign']}, on-line. "
+                f"Location: {state['location']}.{extras}"), True
+    if state["mode"] == "location":
+        return f"Location updated: {state['location']}.", True
+    reply = f"Callsign updated: {state['callsign']}."
+    if state["asked_location"]:
+        reply += f" Location: {state['location']}."
+    return reply + extras, True
 
 
 def _onboard_step(mac, state, heard):
     """The dialogue itself, one answer at a time. Updates `state`; returns
     (reply, finished). Pure apart from writing aliases.conf when finished."""
     words = set(heard.split())
-    if not heard:
-        if state["stage"] == "confirm":
-            return f"{state['pending'].capitalize()}. Confirm? Say yes or no.", False
-        return "Name not recognized. State the name again.", False
+    n_words = len(heard.split())
+    stage = state["stage"]
 
-    if state["stage"] == "confirm":
+    if stage == "confirm":
+        if not heard:
+            return _confirm(state["pending"]), False
         if words & ONBOARD_YES:
-            state["names"].append(state["pending"])
-            state["pending"], state["stage"] = "", "more"
-            return "Additional identity?", False
+            return _onboard_accept(mac, state)
         if words & ONBOARD_NO:
-            state["pending"] = ""
-            state["stage"] = "more" if state["names"] else "name"
-            return "State the name again.", False
-        return f"{state['pending'].capitalize()}. Confirm? Say yes or no.", False
+            target = state["confirming"]
+            state["pending"], state["confirming"], state["stage"] = "", None, target
+            return _prompt_for(target), False
+        return _confirm(state["pending"]), False
 
-    if state["stage"] == "more" and (words & ONBOARD_DONE) and len(heard.split()) <= 2:
-        names = state["names"]
-        _write_aliases(mac, names)
+    if not heard:
+        return f"Not recognized. {_prompt_for(stage)}", False
+
+    if words & ONBOARD_CANCEL and n_words <= 2:
+        if state["mode"] == "new":
+            # A new badge cannot be left nameless: cancelling pauses it,
+            # progress kept, exactly as silence does.
+            return ONBOARD_PAUSED, True
         with onboarding_lock:
             onboarding.pop(mac, None)
-        print(f"[computer] [{mac}] onboarding complete: {mac} = {', '.join(names)}")
-        # EVERY name, in the order given (Captain, 2026-09-26): hearing them all
-        # confirms they were all saved, and the order says nothing about which
-        # is a name, a role or a location, so none is singled out.
-        return f"Identity established: {', '.join(names)}, on-line.", True
+        print(f"[computer] [{mac}] set {state['mode']}: cancelled, nothing changed")
+        return f"{state['mode'].capitalize()} unchanged.", True
 
-    # A proposed name ("name" stage, or another one at "more").
-    alias_to_mac, _ = load_aliases()
-    if len(heard.split()) > ONBOARD_MAX_WORDS:
-        return f"A name is {ONBOARD_MAX_WORDS} words at most. State the name.", False
+    if words & ONBOARD_DONE and n_words <= 2:
+        if stage == "more":
+            return _onboard_finish(mac, state)
+        # The positions carry meaning, so neither may be skipped.
+        return f"A {_noun(stage)} is required. {_prompt_for(stage)}", False
+
+    noun = _noun(stage)
+    if n_words > ONBOARD_MAX_WORDS:
+        return f"A {noun} is {ONBOARD_MAX_WORDS} words at most. {_prompt_for(stage)}", False
     if words & ONBOARD_RESERVED:
-        return f"{heard.capitalize()} cannot be used as a name. State another name.", False
-    if heard in alias_to_mac and alias_to_mac[heard] != mac:
+        return f"{heard.capitalize()} cannot be used as a {noun}. {_prompt_for(stage)}", False
+    # A CALLSIGN names one person: nobody else's name in any position. A
+    # LOCATION may be shared (a hail to it rings every badge there), but may
+    # not be someone's callsign, or hailing it would ring a person and a place.
+    others_callsigns, others_locations = set(), set()
+    for other, names in load_aliases()[1].items():
+        if other != mac:
+            others_callsigns.update(badge_callsigns(names))
+            others_locations.update(names[1:2])
+    if heard in others_callsigns:
         return (f"{heard.capitalize()} is already assigned to another badge. "
-                f"State another name."), False
-    if heard in state["names"]:
-        return f"{heard.capitalize()} is already assigned. Additional identity?", False
-    state["pending"], state["stage"] = heard, "confirm"
-    return f"{heard.capitalize()}. Confirm?", False
+                f"{_prompt_for(stage)}"), False
+    if stage != "location" and heard in others_locations:
+        return f"{heard.capitalize()} is a location. {_prompt_for(stage)}", False
+    if heard in _held(state):
+        return f"{heard.capitalize()} is already assigned. {_prompt_for(stage)}", False
+    state["pending"], state["confirming"], state["stage"] = heard, stage, "confirm"
+    return _confirm(heard), False
 
 
 def onboarding_tap(conn, mac, model):
@@ -1591,24 +1872,80 @@ def onboarding_tap(conn, mac, model):
     (the tap is then an ordinary one), True once the tap has been handled."""
     with onboarding_lock:
         state = onboarding.get(mac)
+        if (state is not None and state["mode"] != "new"
+                and time.time() - state["touched"] > ONBOARD_EDIT_STALE_S):
+            # A change paused by a tap and never resumed: drop it, and this
+            # tap is an ordinary one.
+            onboarding.pop(mac, None)
+            print(f"[computer] [{mac}] set {state['mode']}: paused change dropped")
+            state = None
     if state is None:
         return False
+    _onboard_converse(conn, mac, model, state)
+    return True
+
+
+# "computer set callsign" / "computer set location" (2026-10-04, TOS parity).
+# Not COMMANDS entries: they hold a dialogue on the tap rather than return one
+# answer. Both spellings of callsign, since the model runs unconstrained.
+EDIT_PHRASES = {"computer set callsign": "callsign",
+                "computer set call sign": "callsign",
+                "computer set location": "location"}
+
+
+def edit_tap(conn, mac, model, part):
+    """Re-run the callsign or the location part of the dialogue on this tap.
+    SET CALLSIGN replaces the callsign and every additional callsign and keeps
+    the location (asking for one if the line has none, so position 1 stays a
+    location). SET LOCATION changes position 1 only. A badge with no line at
+    all is simply named now."""
+    current = load_aliases()[1].get(mac, [])
+    if not current:
+        state = _new_onboard_state("new", "callsign")
+    elif part == "location":
+        state = _new_onboard_state("location", "location", callsign=current[0],
+                                   extras=current[2:])
+    else:
+        state = _new_onboard_state("callsign", "callsign",
+                                   location=current[1] if len(current) > 1 else None)
+    with onboarding_lock:
+        onboarding[mac] = state
+    print(f"[computer] [{mac}] set {state['mode']}: was {', '.join(current) or '(no entry)'}")
+    if not send_prompt(conn, _prompt_for(state["stage"]), mac):
+        with onboarding_lock:
+            onboarding.pop(mac, None)
+        return
+    _onboard_converse(conn, mac, model, state)
+
+
+def _onboard_converse(conn, mac, model, state):
+    """Answer, reply, answer... on one tap, until finished or paused."""
     while True:
         heard, ended = _capture_words(conn, model)
-        print(f"[computer] [{mac}] onboarding ({state['stage']}): heard {heard!r}"
+        state["touched"] = time.time()
+        print(f"[computer] [{mac}] onboarding ({state['mode']}/{state['stage']}): heard {heard!r}"
               + (" [stream ended]" if ended else ""))
         if not heard:
+            if state["mode"] != "new" and not ended:
+                # A change met with silence is abandoned. With the stream
+                # ENDED (a tap) it is kept, for ONBOARD_EDIT_STALE_S.
+                with onboarding_lock:
+                    onboarding.pop(mac, None)
+                send_voice(conn, f"{state['mode'].capitalize()} unchanged.", mac)
+                return
             # No answer in time, or a tap with nothing said: stop, keep progress.
-            send_voice(conn, ONBOARD_PAUSED, mac)
-            return True
+            resume = state["confirming"] if state["stage"] == "confirm" else state["stage"]
+            send_voice(conn, ONBOARD_PAUSED if state["mode"] == "new"
+                       else f"{_prompt_for(resume)} Tap to continue.", mac)
+            return
         reply, finished = _onboard_step(mac, state, heard)
         if finished or ended:
             # A finished dialogue ends the cycle; so does a closed stream, over
             # which there is no "keep listening" -- the next tap resumes.
             send_voice(conn, reply if finished else reply + " Tap to continue.", mac)
-            return True
+            return
         if not send_prompt(conn, reply, mac):
-            return True
+            return
 
 
 def handle_connection(conn, addr, model):
@@ -1708,11 +2045,20 @@ def handle_connection(conn, addr, model):
         # until the channel closes).  Benign race: a tap landing at the
         # exact moment the window expires gets a failure chirp while the
         # caller hears "no response" — both sides terminate cleanly.
-        with pending_hails_lock:
-            hail_entry = pending_hails.pop(mac, None)
+        hail_entry = claim_pending_hail(mac)
         if hail_entry:
             print(f"[computer] [{mac}] tap answers pending hail from {hail_entry['from']}")
             run_channel_answer(conn, mac, hail_entry)
+            return
+        # Hailed together with other badges (a shared location) and another
+        # answered first, moments ago: this tap was meant as the answer. End it
+        # as a CANCEL -- b'C', the listener's cancelled.wav -- not as a failed
+        # command, and not with a spoken "answered by": this wearer's attention
+        # belongs with that conversation, or their station (TOS, Captain,
+        # 2026-10-04).
+        if took_answered_elsewhere(mac):
+            print(f"[computer] [{mac}] hail already answered elsewhere — b'C' (cancelled)")
+            conn.sendall(b"C")
             return
 
         # --- voice onboarding: a new badge's taps name it (PI.md phase 3) ---
@@ -1764,6 +2110,13 @@ def handle_connection(conn, addr, model):
                            # (observed as final text 'huh' on real hails).
         alias_to_mac, mac_to_aliases = load_aliases()
         hails       = hail_phrases(mac, alias_to_mac, mac_to_aliases)
+        locates     = locate_phrases(mac_to_aliases)
+        # A locate phrase that is a word-prefix of another ("... chief" /
+        # "... chief engineer") is HELD until the hypothesis has stopped
+        # growing for LOCATE_HOLD_S, so the longer one can still arrive.
+        locate_held = {p for p, _ in locates
+                       if any(q.startswith(p + " ") for q, _ in locates)}
+        held        = None   # (phrase, mac, accumulated text, time it last changed)
         print(f"[computer] [{mac}] receiving audio")
 
         while time.time() - start < TIMEOUT_S:
@@ -1806,6 +2159,25 @@ def handle_connection(conn, addr, model):
                 if trig:
                     handle_large_vocab_phase(conn, mac, pcm, trig[0], trig[1])
                     return
+                # "computer set callsign / set location": a dialogue on this tap.
+                for phrase, part in EDIT_PHRASES.items():
+                    if phrase in accumulated:
+                        print(f"[computer] [{mac}] {phrase!r} — dialogue on this tap")
+                        edit_tap(conn, mac, model, part)
+                        return
+                # "computer locate <callsign>": fire at once unless ambiguous.
+                loc = match_locate(accumulated, locates)
+                if loc and loc[0] not in locate_held:
+                    send_voice(conn, locate_reply(loc[1], mac_to_aliases), mac)
+                    return
+                if loc and (held is None or held[0] != loc[0]):
+                    held = (loc[0], loc[1], accumulated, time.time())
+                elif held and accumulated != held[2]:
+                    held = None if not accumulated.endswith(held[0]) else \
+                        (held[0], held[1], accumulated, time.time())
+                if held and time.time() - held[3] >= LOCATE_HOLD_S:
+                    send_voice(conn, locate_reply(held[1], mac_to_aliases), mac)
+                    return
                 response = match_command(accumulated, mac)
                 if response is not None:
                     print(f"[computer] [{mac}] match on {accumulated!r} -> {response!r}")
@@ -1836,9 +2208,22 @@ def handle_connection(conn, addr, model):
             if trig:
                 handle_large_vocab_phase(conn, mac, pcm, trig[0], trig[1])
                 return
+            for phrase, part in EDIT_PHRASES.items():
+                if phrase in final:
+                    edit_tap(conn, mac, model, part)
+                    return
+            loc = match_locate(final, locates)
+            if loc:
+                send_voice(conn, locate_reply(loc[1], mac_to_aliases), mac)
+                return
             response = match_command(final, mac)
             if response is not None:
                 respond(conn, response, mac)
+                return
+            # "computer locate <someone no badge holds>": say so.
+            if any(p in final for p in LOCATE_PREFIXES):
+                print(f"[computer] [{mac}] locate of an unknown callsign: {final!r}")
+                send_voice(conn, "There is no listing for that callsign.", mac)
                 return
             # "<self-alias> to <name>" with an unknown name → say so, rather
             # than a bare failure chirp.  Final text only (see the helper).
@@ -2602,12 +2987,50 @@ def _downlink_signal(mac, byte):
         return False
 
 
+def claim_pending_hail(mac):
+    """Claim the pending hail targeting this badge, if any.
+
+    A hail to a SHARED location is pending on several badges under ONE entry.
+    The first claim wins and removes the entry from every other target in the
+    same locked step, so a second badge's tap can never answer it too.  The
+    losers get b'E' at once (their next tap is a command again) and are
+    remembered for ANSWERED_ELSEWHERE_S (took_answered_elsewhere)."""
+    with pending_hails_lock:
+        entry = pending_hails.pop(mac, None)
+        if entry is None:
+            return None
+        losers = [m for m, e in pending_hails.items() if e is entry]
+        for m in losers:
+            del pending_hails[m]
+            answered_elsewhere[m] = (mac, time.time())
+    for m in losers:
+        _downlink_signal(m, b"E")
+    if losers:
+        print(f"[computer] [{mac}] hail claimed; withdrawn from {', '.join(losers)}")
+    return entry
+
+
+def took_answered_elsewhere(mac):
+    """True (once) if another badge answered a hail this badge was also sent,
+    within ANSWERED_ELSEWHERE_S."""
+    with pending_hails_lock:
+        record = answered_elsewhere.pop(mac, None)
+    return record is not None and time.time() - record[1] <= ANSWERED_ELSEWHERE_S
+
+
 # ---------------------------------------------------------------------------
 # Hail flow (sdk/INTERCOM.md Phase 3)
 # ---------------------------------------------------------------------------
 
-def handle_hail(conn, caller_mac, target_mac, phrase, rec, pcm, mac_to_aliases):
-    """Run a matched hail to completion.  Steps:
+def handle_hail(conn, caller_mac, targets, phrase, rec, pcm, mac_to_aliases):
+    """Run a matched hail to completion.
+
+    `targets` is every badge the hailed name reaches (hail_phrases): one for
+    a callsign, possibly several for a shared location (2026-10-04, TOS
+    parity).  Each reachable one is prewarmed, gets b'H' and the hail, and is
+    pending under ONE entry; the first to answer gets the channel
+    (claim_pending_hail) and the rest are released with b'E'.  A bare MAC is
+    accepted as a single target.  Steps:
 
       1. Target reachability — no live downlink → "X is not available."
       2. Capture the REST of the caller's utterance until HAIL_SILENCE_S
@@ -2626,27 +3049,33 @@ def handle_hail(conn, caller_mac, target_mac, phrase, rec, pcm, mac_to_aliases):
     the locked transport decision, it becomes the channel socket when the
     hail is answered.
     """
-    target_name = badge_name(target_mac, mac_to_aliases)
-    print(f"[computer] [{caller_mac}] hail matched: {phrase!r} -> {target_mac}")
+    if isinstance(targets, str):
+        targets = [targets]
+    # One badge: its callsign. Several: the name that was hailed ("bridge").
+    spoken = phrase.split(" to ", 1)[1] if " to " in phrase else ""
+    target_name = (badge_name(targets[0], mac_to_aliases)
+                   if len(targets) == 1 or not spoken else spoken)
+    print(f"[computer] [{caller_mac}] hail matched: {phrase!r} -> {', '.join(targets)}")
 
-    # --- 1. target reachable? ---
+    # --- 1. targets reachable? ---
     with downlinks_lock:
-        target_entry = downlinks.get(target_mac)
-    if not target_entry:
-        print(f"[computer] [{caller_mac}] hail target {target_mac} has no downlink")
+        reachable = [m for m in targets if m in downlinks]
+    if not reachable:
+        print(f"[computer] [{caller_mac}] no hail target has a downlink")
         send_voice(conn, f"{target_name} is not available.", caller_mac)
         return
+    if len(reachable) < len(targets):
+        print(f"[computer] [{caller_mac}] no downlink, not hailed: "
+              f"{', '.join(m for m in targets if m not in reachable)}")
 
-    # Prewarm the target NOW: the caller is still speaking and the silence
-    # gate hasn't run yet — several seconds the target relay can spend
-    # bringing SCO up.  By delivery time its sink is hot and the hail plays
-    # near-instantly (no cold start, no 1 s prime).  Best-effort: a failed
-    # or expired prewarm just means the relay falls back to its cold path.
-    try:
-        with target_entry["lock"]:
-            target_entry["sock"].sendall(b"W")
-    except OSError:
-        pass
+    # Prewarm the targets NOW: the caller is still speaking and the silence
+    # gate hasn't run yet — several seconds the target relays can spend
+    # bringing SCO up.  By delivery time their sinks are hot and the hail
+    # plays near-instantly (no cold start, no 1 s prime).  Best-effort: a
+    # failed or expired prewarm just means that relay falls back to its cold
+    # path.
+    for m in reachable:
+        _downlink_signal(m, b"W")
 
     # --- 2. capture the rest of the utterance (silence finalize) ---
     conn.settimeout(0.2)   # tight poll: the silence gate is checked per beat
@@ -2697,13 +3126,18 @@ def handle_hail(conn, caller_mac, target_mac, phrase, rec, pcm, mac_to_aliases):
     # b'H' goes BEFORE the hail (Phase 9): the target's downlink handles bytes
     # in order, so by the time the hail has finished playing its listener
     # already knows the next tap answers -- no race with a quick tap.
-    _downlink_signal(target_mac, b"H")
-    if not push_frame(target_mac, hail_wav):
-        _downlink_signal(target_mac, b"E")
+    delivered = []
+    for m in reachable:
+        _downlink_signal(m, b"H")
+        if push_frame(m, hail_wav):
+            delivered.append(m)
+        else:
+            _downlink_signal(m, b"E")
+    if not delivered:
         conn.settimeout(10)
         send_voice(conn, f"{target_name} is not available.", caller_mac)
         return
-    print(f"[computer] [{caller_mac}] hail delivered to {target_mac} "
+    print(f"[computer] [{caller_mac}] hail delivered to {', '.join(delivered)} "
           f"({len(hail_wav)} bytes, {int(len(hail_wav) / 32000)}s audio)")
 
     # --- 4. pending window: hold the caller for the answer ---
@@ -2726,13 +3160,14 @@ def handle_hail(conn, caller_mac, target_mac, phrase, rec, pcm, mac_to_aliases):
                 # Floor-control state shared by both pumps (see _pump_audio).
                 "floor": {"holder": None, "guard_until": 0.0, "held_since": 0.0}}
     with pending_hails_lock:
-        pending_hails[target_mac] = entry
+        for m in delivered:
+            pending_hails[m] = entry          # ONE entry: the first claim wins
     # The window is HAIL_ANSWER_S from when the hail FINISHES playing, not from
     # when it was sent: a 15 s hail used to leave 15 s to answer.  The target
     # can also answer DURING playback (a tap cuts the hail off, INTERCOM.md
     # Phase 13), so starting the clock late costs nothing.
     hail_s   = len(hail_wav) / 32000.0
-    print(f"[computer] [{caller_mac}] awaiting answer from {target_mac} "
+    print(f"[computer] [{caller_mac}] awaiting answer from {', '.join(delivered)} "
           f"({int(HAIL_ANSWER_S)}s window after {hail_s:.0f}s of hail)")
     deadline       = time.time() + hail_s + HAIL_ANSWER_S
     last_keepalive = 0.0     # immediately: see the capture loop above
@@ -2758,17 +3193,19 @@ def handle_hail(conn, caller_mac, target_mac, phrase, rec, pcm, mac_to_aliases):
 
         conn.settimeout(10)                          # generous send window for the verdict
         if answered.is_set():
-            print(f"[computer] [{caller_mac}] hail ANSWERED by {target_mac}")
-            run_channel_bridge(entry, caller_mac, target_mac)
+            print(f"[computer] [{caller_mac}] hail ANSWERED by {entry['answer_mac']}")
+            run_channel_bridge(entry, caller_mac, entry["answer_mac"])
         else:
-            print(f"[computer] [{caller_mac}] hail to {target_mac} expired unanswered")
+            print(f"[computer] [{caller_mac}] hail to {', '.join(delivered)} expired unanswered")
             send_voice(conn, f"There is no response from {target_name}.", caller_mac)
     finally:
         with pending_hails_lock:
-            if pending_hails.get(target_mac) is entry:
-                del pending_hails[target_mac]
+            for m in delivered:
+                if pending_hails.get(m) is entry:
+                    del pending_hails[m]
         if not answered.is_set():
-            _downlink_signal(target_mac, b"E")   # window over: taps are commands again
+            for m in delivered:
+                _downlink_signal(m, b"E")   # window over: taps are commands again
 
 
 # ---------------------------------------------------------------------------

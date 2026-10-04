@@ -2314,7 +2314,7 @@ def _stream_and_handle_response(reuse=None):
         # drained for it -- reaped even if playing fails, since a stranded
         # capture on bluez_input is a second consumer on the next cycle's link.
         try:
-            if answer_cut or signal_byte in (None, b"f"):
+            if answer_cut or signal_byte in (None, b"f", b"C"):
                 # a tap ended it and nothing came of it, or cut its answer
                 # off — "Cancelled."
                 _play_after_tap_chirp(CANCELLED_WAV, tap_at, "cancelled.wav")
@@ -2337,6 +2337,16 @@ def _stream_and_handle_response(reuse=None):
         pass
     elif signal_byte == b"f":
         play_wav(NACK_WAV)      # no phrase matched — failure chirp
+    elif signal_byte == b"C":
+        # The server cancelled this tap (2026-10-04, TOS parity): it was meant
+        # to answer a hail to a shared location that another badge answered
+        # first. "Cancelled.", as for any cancel -- after the badge's own chirp
+        # if the tap landed on a live link (it chirps ~0.5 s later).
+        print("[listener] cancelled by the server (hail answered elsewhere)")
+        if reused:
+            _play_after_tap_chirp(CANCELLED_WAV, _tap_clock["last"], "cancelled.wav")
+        else:
+            play_wav(CANCELLED_WAV)
     elif signal_byte == b"v":
         pass                    # voice response already played in receive_voice_response()
     elif signal_byte == b"O":

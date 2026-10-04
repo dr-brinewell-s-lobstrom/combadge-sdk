@@ -1168,6 +1168,47 @@ The turn-taking numbers users meet in practice (0.5 s floor hold, 0.4 s
 release guard) are summarised for them in README §5, *Turn-taking in a live
 channel*; the tuning history is Phases 6–8 above.
 
+### Phase 14 — Callsigns, locations, shared locations; first answer wins ✓ code (2026-10-04, from TOS)
+
+Ported from TOS the morning it was verified there on the badges (TOS
+`maincomputer/MAINCOMPUTER.md` → *Shared locations*: a phone relay and a Linux
+relay, both on the bridge, played one hail **in perfect sync**; the first tap
+took the channel; the other badge's tap, moments later, got `b'C'` and the
+cancel). The SDK had the same single-target hail, so the same changes apply.
+
+- **`aliases.conf` is positional.** `MAC = callsign, location, additional
+  callsign, …`. Every name is hailable; a **callsign** names one badge, a
+  **location** may be shared, and may not be another badge's callsign.
+  `load_aliases()` keeps every name in `mac_to_aliases` (it used to drop one
+  that collided, which would shift positions) and no longer reports a shared
+  location as an error.
+- **A hail resolves to every badge holding the name** (`alias_targets()`;
+  `hail_phrases()` now yields `(phrase, [targets])`). `handle_hail()` prewarms,
+  sends `b'H'` and the hail to every reachable target and registers **one**
+  pending entry under all of them. A caller on the bridge hailing the bridge
+  rings the rest of the bridge.
+- **First answer wins.** `claim_pending_hail()` pops the entry and, in the same
+  locked step, withdraws it from every other target and sends them `b'E'`. A
+  loser that taps within `ANSWERED_ELSEWHERE_S` (5 s) gets **`b'C'`**: a new
+  terminal byte, *"cancelled"*, and the listener plays `cancelled.wav` (after
+  the badge's own chirp if the tap was on a live link). Not a spoken "answered
+  by": that wearer's attention belongs with the conversation under way, or
+  their station (Captain). An older listener logs it as unknown and stays
+  silent.
+- **The naming dialogue asks for a callsign and a location** (README §13) and
+  *"computer, set callsign"* / *"computer, set location"* change them later;
+  *"computer, locate \<callsign\>"* answers with the location (via
+  `LOCATION_PHRASES`: "on the bridge", "in engineering") or *"… badge
+  off-line."*; *"computer, who is online"* lists the connected badges.
+
+**Deliberately not ported:** TOS's identification on finishing onboarding. TOS
+gates every command on a voice print, and naming yourself now counts as one
+there; the SDK has no identification gate, so there is nothing to satisfy.
+
+Off-badge: `multiuser/test_onboarding.py` (TOS tree), 39 checks, including
+hail targets on a shared location and a two-thread claim race. Not yet run on
+the badges in the SDK.
+
 ## Resume Point (2026-07-17)
 
 **ALL PHASES (1–6) COMPLETE AND ON-BADGE VALIDATED.** The SDK
