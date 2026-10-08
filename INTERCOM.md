@@ -199,10 +199,7 @@ greetings + dual voice-print auth, console hails to both badges, full hail →
 answer → duplex conversation → close from either side, PAN (EC:28, Captain/
 bridge) ↔ S21 (2F:60, Chief Engineer/engineering). The production intercom is
 working and demonstrable. Findings: 2F:60's audio is slightly BETTER via the
-S21 than it was on BOX — so BOX contributed some of the glitchiness, but the
-badge itself is still suspected marginal; **Captain plans to buy a replacement
-badge** (when it arrives: pair to the host, update its MAC in TOS.conf
-`[intercom]` badge_* key + the relay host's `authorized_badges`/app config).
+S21 than it was on BOX — so BOX contributed some of the glitchiness.
 Tuning applied on hardware: TOS.conf `[relay] prime_ms_listening` 0 → 250
 (Captain, by ear). The SDK's counterpart is the module constant
 `PRIME_MS_LISTENING` in `listener.py`, which had sat at 0 for two months — the
@@ -1250,10 +1247,6 @@ reference implementation; production config lives in TOS.conf
   threshold discriminates them, the gate closes when speech actually
   stops, and the release guard kills the tail echo). Small `_pump_audio`
   change in both maincomputer/intercom.py and sdk/computer.py.
-- **Badge hardware**: COMBADGE 2 (2F:60) suspected marginal even on the S21 —
-  replacement badge planned. On arrival: pair, update TOS.conf `[intercom]`
-  badge_* MAC key and the host's badge authorization (relay
-  `authorized_badges` or the mobile app), re-run the four validation tests.
 - **BOX contention**: 2F:60 roams between the S21 relay-mobile and BOX
   (both target CUBE's maincomputer since 2026-07-19 — `[host-box]`
   relay.target_ip now points at CUBE, no shared fs needed). Run only ONE
