@@ -56,6 +56,7 @@ CLI:  python vibekeys.py report    — window/latch diagnostic (never injects)
 import ctypes
 import os
 import sys
+import atexit
 import threading
 import time
 
@@ -86,6 +87,15 @@ CONTINUE_GAP_S = _gap_s("SDK_VIBE_CONTINUE_GAP_MS", "250")
 # paste_and_submit() for the full account of why, and why the zero it replaced
 # looked correct.
 PASTE_GAP_S = _gap_s("SDK_VIBE_PASTE_GAP_MS", "250")
+# Review finding #34 (2026-10-15): the paste path had no length cap and no
+# control-character handling. A bad transcription could Ctrl+V megabytes into
+# the latched window, and embedded control characters went through verbatim.
+# The module does not know what window is latched (SDK_VIBE_TARGET_*), so if
+# the target were a shell rather than a text composer, each pasted newline
+# would SUBMIT a command — speech→keystroke becomes shell command injection
+# via misrecognition. Cap loudly; scrub controls (newlines/tabs documented
+# as passing through verbatim — see _sanitize_paste()).
+PASTE_MAX_CHARS = 4000
 # Pause after TAKING the foreground, before the keys go out — a terminal can
 # swallow a key delivered while its window is still activating.  Paid only when
 # focus actually had to be acquired.  See _focus().
@@ -282,6 +292,7 @@ _k32.GlobalAlloc.restype = w.HGLOBAL
 _k32.GlobalLock.argtypes = [w.HGLOBAL]
 _k32.GlobalLock.restype = ctypes.c_void_p
 _k32.GlobalUnlock.argtypes = [w.HGLOBAL]
+_k32.GlobalFree.argtypes = [w.HGLOBAL]
 _k32.GetCurrentThreadId.restype = w.DWORD
 
 
@@ -385,11 +396,21 @@ def _focus_unlock(hwnd):
     only the running value changes.  Nothing is written to the user's profile
     and no broadcast goes out.  The original is restored in a finally, so the
     window in which the machine's setting differs is one acquisition, ~10 ms.
+
+    Review finding #54 (2026-10-15): the finally does not cover a kill/crash
+    between the two SystemParametersInfoW calls — the timeout would stay 0
+    (any app can steal focus) until reboot.  The atexit handler below is the
+    belt to that finally's braces: it re-applies the last-seen original on
+    any interpreter shutdown path that still runs cleanup.  It cannot cover
+    SIGKILL/TerminateProcess — nothing can.
     """
+    global _foreground_lock_saved
     old = w.DWORD()
     got = _u32.SystemParametersInfoW(
         SPI_GETFOREGROUNDLOCKTIMEOUT, 0,
         ctypes.cast(ctypes.byref(old), ctypes.c_void_p), 0)
+    if got:
+        _foreground_lock_saved = old.value
     # The SET form takes the new value IN the pvParam slot, not a pointer to it.
     _u32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0,
                                ctypes.c_void_p(0), 0)
@@ -401,6 +422,20 @@ def _focus_unlock(hwnd):
         if got:
             _u32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0,
                                        ctypes.c_void_p(old.value), 0)
+
+
+_foreground_lock_saved = None   # last original timeout rung 3 observed
+
+
+def _restore_foreground_lock():
+    """atexit: re-apply the foreground lock timeout rung 3 last zeroed."""
+    saved = _foreground_lock_saved
+    if saved is not None:
+        _u32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0,
+                                   ctypes.c_void_p(saved), 0)
+
+
+atexit.register(_restore_foreground_lock)
 
 
 def _focus_switch(hwnd):
@@ -584,6 +619,19 @@ def wake():
     Note this cannot help against a LOCKING screensaver: the secure desktop is
     a boundary a user-mode process on the default desktop cannot cross, and
     should not.
+
+    Review finding #55 (2026-10-15): the "cannot do anything" claim above
+    was overstated. A Shift down/up landing while the user is mid-keystroke
+    elsewhere can CAPITALIZE a character being typed, and this is the one
+    action exempt from the armed check and reachable OUTSIDE Vibe Control,
+    injecting into whatever has focus. The mitigation is intent, not
+    enforcement: only ever call wake() when the display is actually blank
+    (screensaver running or power-profile blank), never as a routine
+    keepalive — a wake sent at a live desktop is the one that can capitalize
+    a keystroke. Gating on SPI_GETSCREENSAVERRUNNING was considered and NOT
+    added: a power-profile-blanked display (the case the mouse nudge covers)
+    is not a screensaver, so the gate would silently drop exactly the wakes
+    that matter.
     """
     events = (_key_events(VK_SHIFT)
               + _mouse_move_events(1, 0)
@@ -647,8 +695,10 @@ def press_continue():
 
 def press_digit(n):
     """A digit 1-9, for explicit selection from a numbered list."""
-    if not 1 <= n <= 9:
-        _log(f"REFUSED digit {n}: out of range")
+    # Review finding #74 (2026-10-15): `1 <= n <= 9` raised TypeError on a
+    # non-int (e.g. a string digit). Refuse loudly like the range check does.
+    if not isinstance(n, int) or not 1 <= n <= 9:
+        _log(f"REFUSED digit {n!r}: not an int 1-9")
         return False
     return _guarded_send([_key_events(VK_1 + (n - 1))], f"digit {n}")
 
@@ -665,11 +715,50 @@ def set_clipboard(text):
         if not h:
             return False
         ptr = _k32.GlobalLock(h)
-        ctypes.memmove(ptr, buf, size)
-        _k32.GlobalUnlock(h)
-        return bool(_u32.SetClipboardData(CF_UNICODETEXT, h))
+        # Review finding #56 (2026-10-15): GlobalLock has a pointer restype
+        # and can return NULL (the same hazard foreground_hwnd() normalizes
+        # for GetForegroundWindow) — memmove into NULL used to crash. And on
+        # a SetClipboardData failure the HGLOBAL is OURS to free (the system
+        # takes ownership only on success); it used to leak.
+        if not ptr:
+            _k32.GlobalFree(h)
+            return False
+        try:
+            ctypes.memmove(ptr, buf, size)
+        finally:
+            _k32.GlobalUnlock(h)
+        if not _u32.SetClipboardData(CF_UNICODETEXT, h):
+            _k32.GlobalFree(h)
+            return False
+        return True
     finally:
         _u32.CloseClipboard()
+
+
+def _sanitize_paste(text):
+    """Length-cap + control-character scrub for anything headed to Ctrl+V.
+
+    Review finding #34 (2026-10-15). Returns the cleaned text, or None
+    (after a REFUSED log line) when the input is unusable.
+
+    What survives: printable characters plus tab/CR/LF.  Everything else —
+    C0 controls, DEL, Unicode format/control characters (bidi overrides,
+    zero-width spaces, ...) — is stripped.  Newlines passing through
+    VERBATIM is the documented assumption, not an oversight: it is why the
+    latched target must be a text composer and never a shell (see below).
+    """
+    if not isinstance(text, str):
+        _log(f"REFUSED paste: not a string ({type(text).__name__})")
+        return None
+    if len(text) > PASTE_MAX_CHARS:
+        _log(f"REFUSED paste: {len(text)} chars exceeds cap of "
+             f"{PASTE_MAX_CHARS}")
+        return None
+    clean = "".join(ch for ch in text if ch in "\t\r\n" or ch.isprintable())
+    if clean != text:
+        _log(f"paste scrubbed: {len(text) - len(clean)} control char(s) "
+             f"removed")
+    return clean
 
 
 def paste_text(text):
@@ -687,7 +776,17 @@ def paste_text(text):
     silently, because a refusal is not something the speaker hears.  The same
     check also aborts rather than Ctrl+V'ing stale clipboard content if the
     write itself fails.
+
+    SAFETY (review finding #34, 2026-10-15): the text is length-capped and
+    scrubbed of control characters by _sanitize_paste(), but newlines and
+    tabs pass through VERBATIM — documented assumption.  The latched target
+    (SDK_VIBE_TARGET_*) must therefore be a text composer, never a shell:
+    pasted into a shell, each newline submits, and a misrecognized
+    transcription becomes command injection.
     """
+    text = _sanitize_paste(text)
+    if text is None:
+        return False
     if not text.strip():
         _log("REFUSED paste: empty text")
         return False
@@ -745,7 +844,14 @@ def paste_and_submit(text):
 
     The clipboard is written from before_send, so a refused injection does not
     clobber it — same as paste_text() above.
+
+    Fixed vocabulary literals go through the same _sanitize_paste() scrub as
+    dictation (review finding #34); the literals are short and clean, so this
+    changes nothing for them — it just keeps the two paste paths honest.
     """
+    text = _sanitize_paste(text)
+    if text is None:
+        return False
     if not text.strip():
         _log("REFUSED paste_and_submit: empty text")
         return False
@@ -765,6 +871,7 @@ def _report():
     print(f"escape gap     : {ESCAPE_GAP_S:.3f}s")
     print(f"continue gap   : {CONTINUE_GAP_S:.3f}s")
     print(f"paste gap      : {PASTE_GAP_S:.3f}s  (must be > 0 — see paste_and_submit)")
+    print(f"paste max chars: {PASTE_MAX_CHARS}  (review finding #34)")
     print(f"focus settle   : {FOCUS_SETTLE_S:.3f}s")
     # Large or INT_MAX means the "lock timeout has expired" grant never opens on
     # this machine, so rung 3 is the one carrying the feature.  Worth seeing

@@ -68,10 +68,27 @@ TARGET_CLASS = _cfg("SDK_VIBE_TARGET_CLASS", "CASCADIA_HOSTING_WINDOW_CLASS")
 # Claude Code upgrade — the title format is empirical, not contractual.
 TARGET_TITLE_RE = _cfg("SDK_VIBE_TARGET_TITLE_RE", r"^([^\x00-\x7F]\s|claude( code)?$)")
 REQUIRE_AGREEMENT = _cfg("SDK_VIBE_REQUIRE_AGREEMENT", "true").strip().lower() == "true"
-NAME_MAX_WORDS = int(_cfg("SDK_VIBE_NAME_MAX_WORDS", "6"))
+# Review finding #14 (2026-10-15): bare int() / re.compile() on env config
+# used to kill the server at import on a typo. Both now fall back loudly.
+try:
+    NAME_MAX_WORDS = int(_cfg("SDK_VIBE_NAME_MAX_WORDS", "6"))
+except (ValueError, TypeError):
+    print(f"[vibewin] WARNING: SDK_VIBE_NAME_MAX_WORDS="
+          f"{_cfg('SDK_VIBE_NAME_MAX_WORDS', '6')!r} is not a number -- using 6",
+          file=sys.stderr)
+    NAME_MAX_WORDS = 6
 UNNAMED = "an unnamed session"
 
-_title_re = re.compile(TARGET_TITLE_RE, re.IGNORECASE)
+_title_re = None
+try:
+    _title_re = re.compile(TARGET_TITLE_RE, re.IGNORECASE)
+except re.error as e:
+    # Review finding #14 (2026-10-15): a bad SDK_VIBE_TARGET_TITLE_RE used to
+    # raise at import and kill the server. Fall back to the documented
+    # default pattern instead.
+    print(f"[vibewin] WARNING: SDK_VIBE_TARGET_TITLE_RE is not a valid regex "
+          f"({e}) -- using default", file=sys.stderr)
+    _title_re = re.compile(r"^([^\x00-\x7F]\s|claude( code)?$)", re.IGNORECASE)
 
 # Titles that identify a session but carry no useful name to speak back.
 _ANONYMOUS_TITLES = {"", "claude", "claude code"}

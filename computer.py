@@ -91,6 +91,7 @@ import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -121,8 +122,38 @@ except ImportError:
 
 SetLogLevel(-1)   # silence Vosk's verbose initialization chatter
 
-PORT      = int(os.environ.get("SDK_SERVER_PORT", "1701"))
+def _int_env(key, default):
+    """int(os.environ.get(key, default)) that survives garbage values.
+
+    Review finding #14 (2026-10-15): a typo like SDK_SERVER_PORT=abc used to
+    raise ValueError at import and kill the whole server with a bare
+    traceback. Now it warns on stderr and falls back to the default.
+    """
+    try:
+        return int(os.environ.get(key, default))
+    except (ValueError, TypeError):
+        print(f"[computer] WARNING: {key}={os.environ.get(key)!r} is not a "
+              f"number -- using default {default}", file=sys.stderr)
+        return int(default)
+
+
+def _float_env(key, default):
+    """float(os.environ.get(key, default)) that survives garbage values."""
+    try:
+        return float(os.environ.get(key, default))
+    except (ValueError, TypeError):
+        print(f"[computer] WARNING: {key}={os.environ.get(key)!r} is not a "
+              f"number -- using default {default}", file=sys.stderr)
+        return float(default)
+
+
+PORT      = _int_env("SDK_SERVER_PORT", "1701")
 TIMEOUT_S = 10    # max wall-clock seconds to wait for speech before sending b'f'
+# Review finding #67 (2026-10-15): absolute deadline for the whole handshake
+# (tap byte + MAC + WAV header).  Each handshake recv inherits the long
+# per-recv timeout, so without this a client dribbling a byte every few
+# seconds holds a thread for ~4 minutes — with no cap on connection threads.
+HANDSHAKE_DEADLINE_S = 5
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +200,11 @@ CAPTAINSLOG_FILE = os.environ.get(
     "SDK_CAPTAINSLOG_FILE",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "captainslog.txt"))
 
+# Review finding #70 (2026-10-15): two simultaneous dictations appended with
+# no lock and could interleave lines.  Appends and the replay tail-read both
+# take this.
+captains_log_lock = threading.Lock()
+
 # End of dictation: seconds without a NEW recognized word.  Two different
 # values because the two features are spoken differently, both inherited from
 # the full system's measured tuning rather than guessed:
@@ -179,12 +215,12 @@ CAPTAINSLOG_FILE = os.environ.get(
 #
 #   A prompt is THOUGHT OUT WHILE SPEAKING.  You stop to consider the next
 #   clause, and 1.5 s would paste half a sentence into the terminal.  6 s.
-DICTATION_SILENCE_S = float(os.environ.get("SDK_DICTATION_SILENCE_S", "1.5"))
-PROMPT_SILENCE_S    = float(os.environ.get("SDK_PROMPT_SILENCE_S", "6"))
+DICTATION_SILENCE_S = _float_env("SDK_DICTATION_SILENCE_S", "1.5")
+PROMPT_SILENCE_S    = _float_env("SDK_PROMPT_SILENCE_S", "6")
 
 # Hard cap on one dictation, whatever the silence gate is doing — the backstop
 # for a room noisy enough to keep resetting it.
-DICTATION_MAX_S     = float(os.environ.get("SDK_DICTATION_MAX_S", "110"))
+DICTATION_MAX_S     = _float_env("SDK_DICTATION_MAX_S", "110")
 
 # Keepalive cadence during dictation.  MANDATORY, not an optimization:
 # listener.py stops recording RECORD_MAX_S (13 s) after the last byte from us,
@@ -207,6 +243,22 @@ DICTATION_KEEPALIVE_S = 4
 
 badges      = {}                  # MAC -> {"addr": (ip, port), "last_seen": epoch}
 badges_lock = threading.Lock()
+
+# Review finding #25 (2026-10-15): the registry grew forever — every
+# handshake inserts, nothing ever deleted, so transient/rogue MACs (port
+# scans with fake handshakes, renumbered badges) accumulated for the process
+# lifetime.  Entries not seen for a day are evicted on each insert.
+BADGES_EVICT_S = 24 * 3600
+
+
+def _register_badge(mac, addr):
+    """Insert/refresh one badge, evicting entries not seen for BADGES_EVICT_S."""
+    now = time.time()
+    cutoff = now - BADGES_EVICT_S
+    with badges_lock:
+        for m in [m for m, info in badges.items() if info["last_seen"] < cutoff]:
+            del badges[m]
+        badges[mac] = {"addr": addr, "last_seen": now}
 
 # ---------------------------------------------------------------------------
 # Downlink registry — the server's push path to each badge.
@@ -295,9 +347,9 @@ LOCATION_PHRASES = {
     "shuttle bay":        "in the shuttle bay",
     "cargo bay":          "in the cargo bay",
 }
-HAIL_SILENCE_S     = float(os.environ.get("SDK_HAIL_SILENCE_S", "1.5"))
+HAIL_SILENCE_S     = _float_env("SDK_HAIL_SILENCE_S", "1.5")
                                   # end-of-hail: seconds without new recognized words
-HAIL_ANSWER_S      = float(os.environ.get("SDK_HAIL_ANSWER_S", "30"))
+HAIL_ANSWER_S      = _float_env("SDK_HAIL_ANSWER_S", "30")
                                   # window for the target's user to tap and answer
 HAIL_MAX_CAPTURE_S = 20           # hard cap on hail capture (noisy-room backstop)
 
@@ -311,7 +363,7 @@ pending_hails_lock = threading.Lock()
 answered_elsewhere = {}
 ANSWERED_ELSEWHERE_S = 5
 
-CHANNEL_GAIN       = float(os.environ.get("SDK_CHANNEL_GAIN", "3"))
+CHANNEL_GAIN       = _float_env("SDK_CHANNEL_GAIN", "3")
                                   # per-chunk software gain on bridged mic PCM —
                                   # SCO mic level vs speaker level, the same
                                   # mismatch hail normalization fixes, applied
@@ -680,9 +732,54 @@ def load_piper():
     return f"TTS: Piper, {os.path.basename(PIPER_MODEL)} (loaded in {time.time() - t:.1f}s)"
 
 
+PIPER_SYNTH_TIMEOUT_S = 30  # one wedged synthesis must never wedge the server
+
+
 def _synth_piper(text, path):
-    with _piper_lock, wave.open(path, "wb") as w:
-        _piper["voice"].synthesize_wav(text, w)
+    # Review finding #12 (2026-10-15): synthesize_wav() used to run with NO
+    # timeout while holding the global _piper_lock — a lock every tap thread,
+    # every push_voice, every hail verdict and every onboarding prompt must
+    # acquire. One wedged synthesis (corrupt/slow model, pathological input)
+    # blocked the entire server forever: alive, but never answering again.
+    # espeak-ng and SAPI both had timeouts; Piper (the default engine) did
+    # not. Now the synthesis runs on a daemon worker bounded by
+    # PIPER_SYNTH_TIMEOUT_S, and the lock is held for at most that long, so
+    # the worst case is one slow tap, never a dead server. On timeout the
+    # voice is POISONED (set to None): a synthesis past 30 s is wedged, not
+    # slow (normal is <2 s), and an orphaned worker must never race the next
+    # synthesis on the same PiperVoice object. synth_wav() then falls back
+    # to espeak-ng/SAPI for the rest of the run, and the tap gets its
+    # answer instead of silence.
+    with _piper_lock:
+        voice = _piper["voice"]
+        if voice is None:
+            raise RuntimeError("Piper voice unavailable (poisoned after a timeout)")
+        w = wave.open(path, "wb")
+        try:
+            box = {}
+            done = threading.Event()
+
+            def _run():
+                try:
+                    voice.synthesize_wav(text, w)
+                except Exception as e:          # noqa: BLE001 — re-raised below
+                    box["error"] = e
+                finally:
+                    done.set()
+
+            threading.Thread(target=_run, name="piper-synth", daemon=True).start()
+            if not done.wait(timeout=PIPER_SYNTH_TIMEOUT_S):
+                _piper["voice"] = None
+                print(f"[computer] Piper synthesis exceeded {PIPER_SYNTH_TIMEOUT_S}s — "
+                      f"voice disabled for this run, falling back", file=sys.stderr)
+                raise RuntimeError(f"Piper synthesis timed out after {PIPER_SYNTH_TIMEOUT_S}s")
+            if "error" in box:
+                raise box["error"]
+        finally:
+            try:
+                w.close()
+            except Exception:
+                pass
 
 
 def _synth_sapi(text, path):
@@ -734,15 +831,20 @@ def synth_wav(text):
       -s 165     speech rate in words per minute (default ~160; 165 is natural)
       -w path    write output to WAV file (instead of playing through speakers)
     """
-    fd, path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    with _tts_cache_lock:
-        cached = _tts_cache.get(text)
-    if cached:
-        with open(path, "wb") as f:
-            f.write(cached)
-        return path
+    path = None
     try:
+        # Review finding #79 (2026-10-15): mkstemp() was OUTSIDE the try —
+        # disk-full/tmp-permission errors raised uncaught OSError and killed
+        # the tap with no signal byte, where every other TTS failure
+        # degrades gracefully to b'f'.
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        with _tts_cache_lock:
+            cached = _tts_cache.get(text)
+        if cached:
+            with open(path, "wb") as f:
+                f.write(cached)
+            return path
         if _piper["voice"] is not None:
             t = time.time()
             _synth_piper(text, path)
@@ -764,16 +866,26 @@ def synth_wav(text):
     except Exception as e:
         # Any engine, any failure: the caller sends b'f' (failure chirp).
         print(f"[computer] TTS failed: {e}", file=sys.stderr)
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
         return None
 
 
 # ---------------------------------------------------------------------------
 # Response framing and dispatch
 # ---------------------------------------------------------------------------
+
+# Review finding #45 (2026-10-15): the capture loops (_capture_words,
+# handle_large_vocab_phase, hail capture) set 0.2-0.3 s socket timeouts and
+# never restore them, so a later multi-KB WAV sendall under one of those
+# tripped socket.timeout on slow WiFi and killed the tap mid-dialogue.
+# Every voice-send block sets this explicit generous timeout first (and
+# restores the previous one after).
+VOICE_SEND_TIMEOUT_S = 30
+
 
 def send_voice(conn, text, mac=CONSOLE_MAC):
     """Synthesize `text` as a WAV and send it over the connection as a voice frame.
@@ -793,20 +905,34 @@ def send_voice(conn, text, mac=CONSOLE_MAC):
     If TTS synthesis fails, sends b'f' (failure signal) so the badge plays
     the error chirp instead of silently doing nothing.
     """
-    path = synth_wav(text)
-    if not path:
-        conn.sendall(b"f")   # TTS failed — badge will play failure chirp
-        return
     try:
-        with open(path, "rb") as f:
-            data = f.read()
-        conn.sendall(b"v")
-        conn.sendall(len(data).to_bytes(4, "big"))   # 4-byte big-endian size
-        conn.sendall(data)
-        print(f"[computer] [{mac}] sent voice response: {text!r} ({len(data)} bytes)")
+        previous = conn.gettimeout()
+    except OSError:
+        previous = None
+    try:
+        conn.settimeout(VOICE_SEND_TIMEOUT_S)
+    except OSError:
+        pass
+    try:
+        path = synth_wav(text)
+        if not path:
+            conn.sendall(b"f")   # TTS failed — badge will play failure chirp
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            conn.sendall(b"v")
+            conn.sendall(len(data).to_bytes(4, "big"))   # 4-byte big-endian size
+            conn.sendall(data)
+            print(f"[computer] [{mac}] sent voice response: {text!r} ({len(data)} bytes)")
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     finally:
         try:
-            os.unlink(path)
+            conn.settimeout(previous)
         except OSError:
             pass
 
@@ -834,10 +960,28 @@ def drain_connection(conn):
     same reason — see MAINCOMPUTER.md / RELAY-MOBILE.md "Windows-safe
     socket close".
     """
-    conn.settimeout(3)
     try:
+        # Review finding #71 (2026-10-15): settimeout() was OUTSIDE the try —
+        # on an already-closed socket it raised OSError itself, skipping
+        # close() and printing a traceback for a thread that was exiting
+        # anyway.
+        conn.settimeout(3)
         while conn.recv(4096):
             pass
+    except OSError:
+        pass
+
+
+def _send_fail(conn):
+    """Best-effort b'f' (failure chirp) on a tap connection.
+
+    Review finding #36 (2026-10-15): some dialogue paths ended the tap with
+    no signal byte at all, leaving the relay mid-stream waiting until
+    drain/EOF.  A failure chirp ends it cleanly; if the connection is already
+    gone there is nothing to signal.
+    """
+    try:
+        conn.sendall(b"f")
     except OSError:
         pass
 
@@ -865,31 +1009,39 @@ def load_aliases():
     """
     alias_to_mac   = {}
     mac_to_aliases = {}
-    if not os.path.isfile(ALIASES_FILE):
-        return alias_to_mac, mac_to_aliases
-    with open(ALIASES_FILE) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            mac_part, alias_part = line.split("=", 1)
-            file_mac = mac_part.strip().upper()
-            if not MAC_RE.match(file_mac):
-                print(f"[computer] aliases.conf: bad MAC {mac_part.strip()!r} — line skipped")
-                continue
-            names = [n for n in (" ".join(r.lower().split())
-                                 for r in alias_part.split(",")) if n]
-            for pos, alias in enumerate(names):
-                first = alias_to_mac.get(alias)
-                if first and first != file_mac:
-                    shared_location = (pos == 1 and len(mac_to_aliases.get(first, [])) > 1
-                                       and mac_to_aliases[first][1] == alias)
-                    if not shared_location:
-                        print(f"[computer] aliases.conf: {alias!r} maps to both "
-                              f"{first} and {file_mac} — keeping first")
-                else:
-                    alias_to_mac[alias] = file_mac
-                mac_to_aliases.setdefault(file_mac, []).append(alias)
+    # Review finding #27 (2026-10-15): (1) the bare open() used the platform
+    # default encoding — on Windows (cp1252) any non-ASCII callsign written
+    # as UTF-8 by _write_aliases came back mojibake, silently breaking hail
+    # matching for those badges; (2) reads took no lock, so a tap could read
+    # aliases.conf while _write_aliases had it truncated mid-rewrite and get
+    # an empty alias map.  Reads now take aliases_write_lock and UTF-8.
+    with aliases_write_lock:
+        if not os.path.isfile(ALIASES_FILE):
+            return alias_to_mac, mac_to_aliases
+        with open(ALIASES_FILE, encoding="utf-8") as fh:
+            content = fh.read()
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        mac_part, alias_part = line.split("=", 1)
+        file_mac = mac_part.strip().upper()
+        if not MAC_RE.match(file_mac):
+            print(f"[computer] aliases.conf: bad MAC {mac_part.strip()!r} — line skipped")
+            continue
+        names = [n for n in (" ".join(r.lower().split())
+                             for r in alias_part.split(",")) if n]
+        for pos, alias in enumerate(names):
+            first = alias_to_mac.get(alias)
+            if first and first != file_mac:
+                shared_location = (pos == 1 and len(mac_to_aliases.get(first, [])) > 1
+                                   and mac_to_aliases[first][1] == alias)
+                if not shared_location:
+                    print(f"[computer] aliases.conf: {alias!r} maps to both "
+                          f"{first} and {file_mac} — keeping first")
+            else:
+                alias_to_mac[alias] = file_mac
+            mac_to_aliases.setdefault(file_mac, []).append(alias)
     return alias_to_mac, mac_to_aliases
 
 
@@ -939,9 +1091,20 @@ def hail_phrases(caller_mac, alias_to_mac, mac_to_aliases):
 
 
 def match_hail(text, hails):
-    """Return (phrase, [target_mac, ...]) for the first hail phrase in `text`, or None."""
+    """Return (phrase, [target_mac, ...]) for the first hail phrase in `text`, or None.
+
+    Matched on TOKEN boundaries: "captain to bridge" must not fire inside
+    "captain to bridgewater".  Review finding #37 (2026-10-15): the old pure
+    `phrase in text` substring check let a longer alias merely containing a
+    hail phrase hijack the hail.  Padding both
+    sides with a space is exact for Vosk output (lowercase words, single
+    spaces, no punctuation) and stays correct for aliases containing
+    apostrophes, where a \\b regex would misfire.  Longest-first ordering of
+    `hails` still lets the most specific phrase win.
+    """
+    padded = f" {text} "
     for phrase, targets in hails:
-        if phrase in text:
+        if f" {phrase} " in padded:
             return phrase, targets
     return None
 
@@ -1065,6 +1228,13 @@ def prepare_hail_pcm(pcm_bytes, tag=""):
     HAIL_MAX_GAIN so dead air is never amplified into hiss.
     """
     samples = array.array("h")
+    # Review finding #9 (2026-10-15): pcm is a join of recv() chunks and TCP
+    # can return an odd byte count on the final chunk; frombytes() on an
+    # odd-length buffer raises ValueError, which used to escape
+    # handle_connection's `except OSError` and kill the hail mid-flight with
+    # no verdict.  Drop the dangling byte instead.
+    if len(pcm_bytes) % 2:
+        pcm_bytes = pcm_bytes[:-1]
     samples.frombytes(pcm_bytes)
     if not samples:
         return pcm_bytes
@@ -1143,7 +1313,11 @@ def active_commands():
     ~25-entry dict, so this is not a cost worth engineering around.
     """
     if vibekeys is not None and vibekeys.is_active():
-        return {**VIBE_COMMANDS, **COMMANDS}
+        # Review finding #28 (2026-10-15): this was {**VIBE_COMMANDS,
+        # **COMMANDS}, which gave COMMANDS the tie-break — the opposite of
+        # what the docstring above promises. VIBE_COMMANDS now merges last
+        # so its phrases win ties, as documented.
+        return {**COMMANDS, **VIBE_COMMANDS}
     return COMMANDS
 
 
@@ -1161,9 +1335,19 @@ def match_command(text, mac=CONSOLE_MAC):
     """
     for phrase, response in active_commands().items():
         if phrase in text:
-            if isinstance(response, NeedsMac):
-                return response.fn(mac)
-            return response() if callable(response) else response
+            try:
+                if isinstance(response, NeedsMac):
+                    return response.fn(mac)
+                return response() if callable(response) else response
+            except Exception as e:
+                # Review finding #10 (2026-10-15): command callables do file
+                # I/O (online_reply, replay_last_log) and GUI injection
+                # (vibekeys, clicker) — any of which can raise non-OSError.
+                # Uncaught, that killed the tap thread silently and the badge
+                # heard nothing.  Speak the failure instead of dying.
+                print(f"[computer] [{mac}] command {phrase!r} raised: {e}",
+                      file=sys.stderr)
+                return "That didn't work."
     return None
 
 
@@ -1298,8 +1482,11 @@ def handle_large_vocab_phase(conn, mac, pcm, trigger_type, phrase):
     sys.stdout.flush()
 
     rec = KaldiRecognizer(large_model, 16000)
+    carry = b""
     for chunk in pcm:
-        rec.AcceptWaveform(chunk)
+        chunk, carry = _even16(chunk, carry)   # finding #48
+        if chunk:
+            rec.AcceptWaveform(chunk)
 
     silence_s = PROMPT_SILENCE_S if trigger_type == "transcribe" else DICTATION_SILENCE_S
 
@@ -1307,7 +1494,13 @@ def handle_large_vocab_phase(conn, mac, pcm, trigger_type, phrase):
     start          = time.time()
     last_partial   = ""
     last_progress  = time.time()
-    last_keepalive = time.time()
+    # Review finding #44 (2026-10-15): 0.0, not now — the same fix the hail
+    # capture loop already carries (see its comment).  handle_connection's
+    # main loop sends no keepalives, so by trigger time the relay may have
+    # been streaming ~10 s already; waiting 4 s more for the first keepalive
+    # let the relay's 13 s RECORD_MAX_S deadline expire just as dictation
+    # started, truncating "captain's log ..." spoken late in the tap window.
+    last_keepalive = 0.0
 
     # The live-transcription line stays open across the whole loop, so every
     # exit has to close it BEFORE printing anything else — otherwise the
@@ -1353,6 +1546,9 @@ def handle_large_vocab_phase(conn, mac, pcm, trigger_type, phrase):
         if not data:
             break                    # stream ended
 
+        data, carry = _even16(data, carry)   # finding #48: whole samples only
+        if not data:
+            continue
         rec.AcceptWaveform(data)
         partial = json.loads(rec.PartialResult()).get("partial", "").strip()
         if partial and partial != last_partial:
@@ -1417,6 +1613,27 @@ _MONTHS = ("January", "February", "March", "April", "May", "June", "July",
            "August", "September", "October", "November", "December")
 
 
+def _last_log_line():
+    """Newest non-blank line of the captain's log, without reading the whole
+    file (review finding #70, 2026-10-15): replay only ever needs the last
+    entry, and the file grows unbounded over the years."""
+    try:
+        with captains_log_lock:
+            with open(CAPTAINSLOG_FILE, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                pos = f.tell()
+                start = max(0, pos - 8192)
+                f.seek(start)
+                data = f.read()
+    except OSError:
+        return None
+    lines = data.decode("utf-8", "replace").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]   # first line may be a truncated partial
+    lines = [ln.strip() for ln in lines if ln.strip()]
+    return lines[-1] if lines else None
+
+
 def replay_last_log():
     """Speak the most recent captain's log entry back, with its date and time.
 
@@ -1431,18 +1648,14 @@ def replay_last_log():
     would say it twice.  The full system's shell version has that stutter;
     there is no reason to port a wart.
     """
-    try:
-        with open(CAPTAINSLOG_FILE, "r", encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-    except OSError:
-        lines = []
-    if not lines:
+    line = _last_log_line()
+    if not line:
         return "There are no log entries on file."
 
     m = re.match(r"^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):\d{2}\]\s*(.*)$",
-                 lines[-1])
+                 line)
     if not m:
-        return lines[-1]   # unparseable stamp — speak the line as it stands
+        return line   # unparseable stamp — speak the line as it stands
     year, mon, day, hour, minute, entry = m.groups()
 
     for phrase in CAPTAINSLOG_PHRASES:
@@ -1480,8 +1693,11 @@ def finish_captains_log(conn, mac, text, body):
         return
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        with open(CAPTAINSLOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{stamp}] {text}\n")
+        # Finding #70: the append takes the log lock — two simultaneous
+        # dictations must not interleave lines.
+        with captains_log_lock:
+            with open(CAPTAINSLOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[{stamp}] {text}\n")
     except OSError as e:
         print(f"[computer] [{mac}] captain's log write failed: {e}")
         send_voice(conn, "Unable to record log.", mac)
@@ -1555,10 +1771,21 @@ ONBOARD_MAX_S         = 20   # cap on one answer, however noisy the room
 ONBOARD_KEEPALIVE_S   = 4    # b'k' while waiting: the listener gives up 13 s after
                              # the last byte from us (RECORD_MAX_S)
 ONBOARD_MAX_WORDS     = 3    # a callsign or location is a word or three, not a sentence
+# Review finding #68 (2026-10-15): the dialogue loop had no per-tap turn cap —
+# each answer is bounded (ONBOARD_MAX_S) but the `while True` wasn't, so a
+# badge left transmitting in a noisy room held the thread indefinitely, one
+# thread per tap.  The cap pauses the dialogue; the next tap resumes it.
+ONBOARD_MAX_TURNS     = 20
 # A CHANGE paused by a tap is resumed by the next tap only within this window;
 # after it the next tap is an ordinary command again, so an abandoned change
 # cannot capture the badge's taps.
 ONBOARD_EDIT_STALE_S  = 60
+# Review finding #26 (2026-10-15): "new"-mode states never expired — a badge
+# that started voice onboarding and vanished stayed in `onboarding` forever.
+# A live dialogue refreshes `touched` every turn, so an hour of silence means
+# abandoned; the next tap is then an ordinary one (a downlink reconnect
+# re-runs begin_onboarding and starts naming over).
+ONBOARD_NEW_STALE_S   = 3600
 ONBOARD_PAUSED        = "Onboarding paused. Tap to continue."
 PROMPT_CALLSIGN = "State your callsign."
 PROMPT_LOCATION = "State this badge's location."
@@ -1584,7 +1811,22 @@ ONBOARD_FILLER = {"the", "a", "uh", "um", "huh", "hmm", "ah", "oh"}
 
 onboarding         = {}   # MAC -> dialogue state, see _new_onboard_state()
 onboarding_lock    = threading.Lock()
+# Review finding #69 (2026-10-15): two concurrent taps from the same badge
+# shared one onboarding state object and interleaved _onboard_step mutations
+# (nothing prevents it server-side).  One dialogue at a time per badge; a
+# second concurrent tap is refused cleanly with b'f' instead of corrupting
+# the shared state.
+_dialogue_locks    = {}   # MAC -> Lock, guarded by onboarding_lock
 aliases_write_lock = threading.Lock()
+
+
+def _dialogue_lock(mac):
+    """This badge's dialogue lock (finding #69): serialize concurrent taps."""
+    with onboarding_lock:
+        lock = _dialogue_locks.get(mac)
+        if lock is None:
+            lock = _dialogue_locks[mac] = threading.Lock()
+        return lock
 
 
 def _new_onboard_state(mode, stage, callsign=None, location=None, extras=None):
@@ -1613,26 +1855,40 @@ def send_prompt(conn, text, mac=CONSOLE_MAC):
     The listener plays it, discards its own mic audio while it plays, and
     carries on streaming -- the tap cycle does not end.  Returns False if
     nothing could be sent (TTS failed, or the connection is gone)."""
-    path = synth_wav(text)
-    if not path:
-        return False
-    # AFTER synthesis, right before sending: nothing said before a question
-    # can be its answer.  Matters most for the first question of a change,
-    # where the uplink still holds the tail of "computer set callsign".
-    _drain_uplink(conn)
     try:
-        with open(path, "rb") as f:
-            data = f.read()
-        conn.sendall(b"V")
-        conn.sendall(len(data).to_bytes(4, "big"))
-        conn.sendall(data)
-        print(f"[computer] [{mac}] sent prompt (keep listening): {text!r}")
-        return True
+        previous = conn.gettimeout()
     except OSError:
-        return False
+        previous = None
+    try:
+        conn.settimeout(VOICE_SEND_TIMEOUT_S)   # finding #45: see send_voice
+    except OSError:
+        pass
+    try:
+        path = synth_wav(text)
+        if not path:
+            return False
+        # AFTER synthesis, right before sending: nothing said before a question
+        # can be its answer.  Matters most for the first question of a change,
+        # where the uplink still holds the tail of "computer set callsign".
+        _drain_uplink(conn)
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            conn.sendall(b"V")
+            conn.sendall(len(data).to_bytes(4, "big"))
+            conn.sendall(data)
+            print(f"[computer] [{mac}] sent prompt (keep listening): {text!r}")
+            return True
+        except OSError:
+            return False
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     finally:
         try:
-            os.unlink(path)
+            conn.settimeout(previous)
         except OSError:
             pass
 
@@ -1670,6 +1926,7 @@ def _capture_words(conn, model):
     conn.settimeout(0.3)
     start = last_progress = last_keepalive = time.time()
     last_heard, segments, ended = "", [], False
+    carry = b""   # odd-byte carry for _even16 (finding #48)
     while True:
         now = time.time()
         if last_heard and now - last_progress >= ONBOARD_SILENCE_S:
@@ -1695,6 +1952,9 @@ def _capture_words(conn, model):
         if not data:
             ended = True
             break
+        data, carry = _even16(data, carry)   # finding #48: whole samples only
+        if not data:
+            continue
         if rec.AcceptWaveform(data):
             seg = json.loads(rec.Result()).get("text", "")
             if seg:
@@ -1787,6 +2047,14 @@ def _onboard_accept(mac, state):
 
 
 def _onboard_finish(mac, state):
+    with onboarding_lock:
+        # Review finding #26 (2026-10-15): finish only OUR state.  A
+        # reconnect can install a newer dialogue (begin_onboarding) while
+        # this tap still holds the old one; the old one must neither write
+        # its stale names nor pop the new state.
+        if onboarding.get(mac) is not state:
+            print(f"[computer] [{mac}] onboarding: state superseded — not finishing")
+            return "Let's start over.", True
     names = _held(state)
     try:
         _write_aliases(mac, names)
@@ -1796,7 +2064,8 @@ def _onboard_finish(mac, state):
         state["stage"] = "more"
         return "Unable to save. Tap, then say Finish to try again.", True
     with onboarding_lock:
-        onboarding.pop(mac, None)
+        if onboarding.get(mac) is state:
+            del onboarding[mac]
     print(f"[computer] [{mac}] {'onboarding' if state['mode'] == 'new' else 'set ' + state['mode']} "
           f"complete: {mac} = {', '.join(names)}")
     # Read back everything that was set: hearing it confirms it was saved.
@@ -1880,16 +2149,36 @@ def onboarding_tap(conn, mac, model):
     (the tap is then an ordinary one), True once the tap has been handled."""
     with onboarding_lock:
         state = onboarding.get(mac)
-        if (state is not None and state["mode"] != "new"
-                and time.time() - state["touched"] > ONBOARD_EDIT_STALE_S):
-            # A change paused by a tap and never resumed: drop it, and this
-            # tap is an ordinary one.
-            onboarding.pop(mac, None)
-            print(f"[computer] [{mac}] set {state['mode']}: paused change dropped")
-            state = None
+        if state is not None:
+            # Review finding #26 (2026-10-15): stale *edit* states were
+            # dropped, but "new"-mode states never expired — a badge that
+            # started onboarding and vanished leaked its state forever.
+            stale_s = (ONBOARD_EDIT_STALE_S if state["mode"] != "new"
+                       else ONBOARD_NEW_STALE_S)
+            if time.time() - state["touched"] > stale_s:
+                # A dialogue paused and never resumed: drop it, and this tap
+                # is an ordinary one.
+                onboarding.pop(mac, None)
+                if state["mode"] == "new":
+                    print(f"[computer] [{mac}] onboarding: stale new-badge state dropped")
+                else:
+                    print(f"[computer] [{mac}] set {state['mode']}: paused change dropped")
+                state = None
     if state is None:
         return False
-    _onboard_converse(conn, mac, model, state)
+    lock = _dialogue_lock(mac)
+    if not lock.acquire(blocking=False):
+        # Review finding #69 (2026-10-15): another tap is already inside this
+        # badge's dialogue — sharing the state object would interleave
+        # mutations.  Refuse this tap cleanly instead of corrupting it.
+        print(f"[computer] [{mac}] onboarding: dialogue already in progress — "
+              f"refusing concurrent tap")
+        _send_fail(conn)
+        return True
+    try:
+        _onboard_converse(conn, mac, model, state)
+    finally:
+        lock.release()
     return True
 
 
@@ -1918,17 +2207,41 @@ def edit_tap(conn, mac, model, part):
                                    location=current[1] if len(current) > 1 else None)
     with onboarding_lock:
         onboarding[mac] = state
-    print(f"[computer] [{mac}] set {state['mode']}: was {', '.join(current) or '(no entry)'}")
-    if not send_prompt(conn, _prompt_for(state["stage"]), mac):
+    lock = _dialogue_lock(mac)
+    if not lock.acquire(blocking=False):
+        # A dialogue is already running for this badge (finding #69) — don't
+        # clobber its state with a second one.
         with onboarding_lock:
-            onboarding.pop(mac, None)
+            if onboarding.get(mac) is state:
+                del onboarding[mac]
+        _send_fail(conn)
         return
-    _onboard_converse(conn, mac, model, state)
+    try:
+        print(f"[computer] [{mac}] set {state['mode']}: was {', '.join(current) or '(no entry)'}")
+        if not send_prompt(conn, _prompt_for(state["stage"]), mac):
+            with onboarding_lock:
+                if onboarding.get(mac) is state:
+                    del onboarding[mac]
+            _send_fail(conn)   # Review finding #36 (2026-10-15)
+            return
+        _onboard_converse(conn, mac, model, state)
+    finally:
+        lock.release()
 
 
 def _onboard_converse(conn, mac, model, state):
     """Answer, reply, answer... on one tap, until finished or paused."""
+    turns = 0
     while True:
+        turns += 1
+        if turns > ONBOARD_MAX_TURNS:
+            # Review finding #68 (2026-10-15): unbounded dialogue — pause
+            # instead of holding the thread forever; progress is kept and
+            # the next tap resumes.
+            print(f"[computer] [{mac}] onboarding: turn cap ({ONBOARD_MAX_TURNS}) "
+                  f"reached — pausing")
+            send_voice(conn, ONBOARD_PAUSED, mac)
+            return
         heard, ended = _capture_words(conn, model)
         state["touched"] = time.time()
         print(f"[computer] [{mac}] onboarding ({state['mode']}/{state['stage']}): heard {heard!r}"
@@ -1953,7 +2266,47 @@ def _onboard_converse(conn, mac, model, state):
             send_voice(conn, reply if finished else reply + " Tap to continue.", mac)
             return
         if not send_prompt(conn, reply, mac):
+            _send_fail(conn)   # Review finding #36 (2026-10-15): the relay
+                               # is mid-stream waiting for b'v'/b'V'/b'f' —
+                               # end the tap with a failure chirp, not EOF.
             return
+
+
+def _even16(data, carry):
+    """Fold a dangling odd byte into the next chunk.
+
+    Review finding #48 (2026-10-15): TCP can return an odd byte count, and
+    feeding an odd-length buffer to KaldiRecognizer.AcceptWaveform()
+    misaligns the tail sample (or worse, raises in the binding — a
+    non-OSError that used to kill the thread).  The channel pump already
+    solved this with a carry; the recognition loops now do the same.
+    Returns (even_data, new_carry).
+    """
+    data = carry + data
+    cut = len(data) // 2 * 2
+    return data[:cut], data[cut:]
+
+
+def _wav_data_offset(header):
+    """Byte offset where PCM starts in a WAV header, or None if invalid.
+
+    Review finding #49 (2026-10-15): the server assumed a fixed 44-byte
+    header.  A standard PCM WAV is RIFF....WAVE followed by chunks, and the
+    `data` chunk's position is what matters — extra chunks (LIST, bext,
+    iXML, ...) push PCM past byte 44, and the old code would then have fed
+    header bytes to the recognizer as audio.  Returns None when the RIFF /
+    WAVE magic is wrong or no `data` chunk is found.
+    """
+    if len(header) < 12 or header[0:4] != b"RIFF" or header[8:12] != b"WAVE":
+        return None
+    pos = 12
+    while pos + 8 <= len(header):
+        chunk_id = header[pos:pos + 4]
+        chunk_size = int.from_bytes(header[pos + 4:pos + 8], "little")
+        if chunk_id == b"data":
+            return pos + 8
+        pos += 8 + chunk_size + (chunk_size & 1)   # chunks are word-aligned
+    return None
 
 
 def handle_connection(conn, addr, model):
@@ -1980,6 +2333,22 @@ def handle_connection(conn, addr, model):
       we call FinalResult() one last time to flush any buffered audio.
     """
     conn.settimeout(TIMEOUT_S + 5)   # outer safety net against hung connections
+    # Review finding #67 (2026-10-15): absolute handshake deadline — see
+    # HANDSHAKE_DEADLINE_S.  _handshake_recv() bounds every handshake read by
+    # the time left on it, so a slow loris can't hold a thread for minutes.
+    handshake_deadline = time.monotonic() + HANDSHAKE_DEADLINE_S
+
+    def _handshake_recv(n):
+        """One handshake read, bounded by the absolute handshake deadline."""
+        remaining = handshake_deadline - time.monotonic()
+        if remaining <= 0:
+            raise OSError("handshake deadline exceeded")
+        conn.settimeout(min(TIMEOUT_S + 5, remaining))
+        try:
+            return conn.recv(n)
+        finally:
+            conn.settimeout(TIMEOUT_S + 5)
+
     try:
         # --- read tap byte ---
         tap = conn.recv(1)
@@ -2000,7 +2369,7 @@ def handle_connection(conn, addr, model):
         # against the 44-byte header discard below.
         ident = b""
         while len(ident) < 17:
-            chunk = conn.recv(17 - len(ident))
+            chunk = _handshake_recv(17 - len(ident))
             if not chunk:
                 return   # connection closed mid-handshake
             ident += chunk
@@ -2017,8 +2386,7 @@ def handle_connection(conn, addr, model):
             print(f"[computer] [{mac}] no MAC handshake from {addr} — legacy client?")
 
         # Register/refresh this badge in the shared registry.
-        with badges_lock:
-            badges[mac] = {"addr": addr, "last_seen": time.time()}
+        _register_badge(mac, addr)
 
         # --- downlink registration (b'h') ---
         # This is not a tap: the relay is offering us a persistent push
@@ -2041,10 +2409,37 @@ def handle_connection(conn, addr, model):
         # (The 44-byte size is fixed for the ffmpeg output format we use.)
         header = b""
         while len(header) < header_remaining:
-            chunk = conn.recv(header_remaining - len(header))
+            chunk = _handshake_recv(header_remaining - len(header))
             if not chunk:
                 return   # connection closed before header was complete
             header += chunk
+
+        # Review finding #49 (2026-10-15): validate the WAV header instead of
+        # assuming 44 bytes.  The legacy no-MAC path already consumed the
+        # first 17 bytes as `ident`, so the full header is ident + header
+        # there.  If the `data` chunk starts later than the bytes already
+        # discarded (extra chunks), discard the rest — the recognizer must
+        # never see header bytes as audio.
+        full_header = header if header_remaining == 44 else ident + header
+        data_offset = _wav_data_offset(full_header)
+        if data_offset is None:
+            print(f"[computer] [{mac}] warning: unrecognized WAV header "
+                  f"({len(full_header)} bytes) — assuming "
+                  f"{header_remaining}-byte header as before")
+        elif data_offset > len(full_header):
+            extra = data_offset - len(full_header)
+            if extra > 65536:
+                print(f"[computer] [{mac}] warning: WAV data offset "
+                      f"{data_offset} implausible — assuming "
+                      f"{header_remaining}-byte header")
+            else:
+                print(f"[computer] [{mac}] WAV header {data_offset} bytes "
+                      f"({extra} extra) — discarding")
+                while extra > 0:
+                    chunk = _handshake_recv(min(extra, 4096))
+                    if not chunk:
+                        return
+                    extra -= len(chunk)
 
         # --- answer-tap check (pending inbound hail) ---
         # A tap from a badge with a pending hail is an ANSWER, not a
@@ -2106,6 +2501,7 @@ def handle_connection(conn, addr, model):
         # KaldiRecognizer(model, sample_rate): 16000 Hz matches the HFP SCO rate.
         rec         = KaldiRecognizer(model, 16000)
         start       = time.time()
+        carry       = b""   # odd-byte carry for _even16 (finding #48)
         pcm         = []   # every raw chunk since stream start — a hail
                            # replays the caller's actual voice, so the full
                            # utterance is kept from the very beginning
@@ -2135,6 +2531,11 @@ def handle_connection(conn, addr, model):
             if not data:
                 break   # listener.py closed the connection (end of speech or disconnect)
             pcm.append(data)
+            # Finding #48: Vosk gets whole 16-bit samples only; pcm keeps the
+            # raw bytes so the hail replay preserves the exact stream.
+            data, carry = _even16(data, carry)
+            if not data:
+                continue
 
             if rec.AcceptWaveform(data):
                 # Vosk finalized a segment — bank it and clear the partial.
@@ -2270,10 +2671,21 @@ def serve_connection(conn, addr, model):
 # ---------------------------------------------------------------------------
 
 def _recv_exact(conn, n):
-    """Exactly n bytes from conn, or raise OSError if it closes first."""
+    """Exactly n bytes from conn, or raise OSError if it closes or stalls.
+
+    Review finding #11 (2026-10-15): a socket.timeout here used to be caught
+    by run_downlink's keepalive handler, which sent b'k' and looped back to
+    recv(1) — abandoning the partial b'R' message and desyncing the parser
+    (leftover bytes parsed as stray downlink bytes).  A stall mid-message is
+    now fatal to the downlink: the thread breaks out, deregisters, and the
+    relay reconnects with a clean stream.
+    """
     got = b""
     while len(got) < n:
-        chunk = conn.recv(n - len(got))
+        try:
+            chunk = conn.recv(n - len(got))
+        except socket.timeout as e:
+            raise OSError(f"timed out mid-message ({len(got)}/{n} bytes)") from e
         if not chunk:
             raise OSError("connection closed mid-message")
         got += chunk
@@ -2407,6 +2819,15 @@ def push_voice(mac, text):
     """Synthesize `text` and push it to a badge — TTS front-end to
     push_frame().  Used by the console `hail` command and failure notices.
     """
+    # Review finding #72 (2026-10-15): the downlink check used to come AFTER
+    # synthesis — a hail to an offline badge burned a full TTS run (~0.5-2 s
+    # of CPU plus the global _piper_lock) for audio push_frame() then
+    # discarded.  Check first; the TOCTOU (downlink dying between here and
+    # push_frame) is handled gracefully there.
+    with downlinks_lock:
+        if mac not in downlinks:
+            print(f"[computer] [{mac}] no live downlink — skipping synthesis")
+            return False
     path = synth_wav(text)
     if not path:
         print(f"[computer] [{mac}] TTS failed — nothing pushed")
@@ -2438,7 +2859,7 @@ def push_voice(mac, text):
 # b'X' against in-flight frames.
 # ---------------------------------------------------------------------------
 
-CHANNEL_GATE_OPEN  = float(os.environ.get("SDK_CHANNEL_GATE", "50"))
+CHANNEL_GATE_OPEN  = _float_env("SDK_CHANNEL_GATE", "50")
                                   # AVERAGE |sample| per chunk at/above which
                                   # the gate OPENS (not peak: noise spikes
                                   # have high peaks but low average; speech
@@ -2506,7 +2927,7 @@ CHANNEL_GATE_OPEN  = float(os.environ.get("SDK_CHANNEL_GATE", "50"))
                                   # a 128 ms average smooths away clear the
                                   # bar outright).  TOS fixed this with a
                                   # fixed-interval window; the SDK has not.
-CHANNEL_GATE_CLOSE = float(os.environ.get("SDK_CHANNEL_GATE_CLOSE", "16"))
+CHANNEL_GATE_CLOSE = _float_env("SDK_CHANNEL_GATE_CLOSE", "16")
                                   # Hysteresis: once open, the gate stays
                                   # open until the average drops below THIS
                                   # (lower) threshold for CHANNEL_GATE_HOLD
@@ -2571,7 +2992,7 @@ if CHANNEL_GATE_CLOSE < CHANNEL_GATE_CLOSE_MIN:
           f"will seem dead. Raise SDK_CHANNEL_GATE instead if quiet speech is not "
           f"getting through. (Your room may differ; measure it.)")
 
-CHANNEL_GATE_HOLD  = float(os.environ.get("SDK_CHANNEL_GATE_HOLD", "0.5"))
+CHANNEL_GATE_HOLD  = _float_env("SDK_CHANNEL_GATE_HOLD", "0.5")
                                   # seconds the average must stay under CLOSE
                                   # before the gate actually shuts (replaces
                                   # the old CHANNEL_GATE_HANG hangover — same
@@ -2587,12 +3008,12 @@ CHANNEL_GATE_HOLD  = float(os.environ.get("SDK_CHANNEL_GATE_HOLD", "0.5"))
                                   # and post-transmission static dropped to
                                   # near zero.  0.4 is the measured floor —
                                   # below it, mid-sentence pauses get chopped.
-CHANNEL_GATE_FADE_MS = int(os.environ.get("SDK_CHANNEL_GATE_FADE_MS", "10"))
+CHANNEL_GATE_FADE_MS = _int_env("SDK_CHANNEL_GATE_FADE_MS", "10")
                                   # linear fade over the boundary chunk on
                                   # every gate open/close transition — avoids
                                   # the click that a hard silence->audio
                                   # (or audio->silence) edge produces
-CHANNEL_HALF_DUPLEX_MS = float(os.environ.get("SDK_CHANNEL_HALF_DUPLEX_MS", "150"))
+CHANNEL_HALF_DUPLEX_MS = _float_env("SDK_CHANNEL_HALF_DUPLEX_MS", "150")
                                   # HALF-DUPLEX mute: while the local badge's
                                   # speaker played peer audio within the last
                                   # N ms, its mic uplink is force-silenced
@@ -2636,7 +3057,7 @@ CHANNEL_HALF_DUPLEX_MS = float(os.environ.get("SDK_CHANNEL_HALF_DUPLEX_MS", "150
                                   # gate, the badges work within 3 ft and a
                                   # nearly-touching echo dies out on its own.
                                   # Proximity detection is shelved.
-CHANNEL_FLOOR_RELEASE_MS = float(os.environ.get("SDK_CHANNEL_FLOOR_RELEASE_MS", "400"))
+CHANNEL_FLOOR_RELEASE_MS = _float_env("SDK_CHANNEL_FLOOR_RELEASE_MS", "400")
                                   # FLOOR CONTROL (adjacent-badge / same-room
                                   # use, e.g. filming both ends): one talker at
                                   # a time — the first gate to open holds the
@@ -2681,12 +3102,20 @@ CHANNEL_FLOOR_RELEASE_MS = float(os.environ.get("SDK_CHANNEL_FLOOR_RELEASE_MS", 
                                   # then on-badge in the SDK.  1000 is what
                                   # starved replies; 400 does not.  0 still
                                   # disables floor control.
-CHANNEL_FLOOR_MAX_S = float(os.environ.get("SDK_CHANNEL_FLOOR_MAX_S", "12"))
+CHANNEL_FLOOR_MAX_S = _float_env("SDK_CHANNEL_FLOOR_MAX_S", "12")
                                   # cap on continuous floor hold — adjacent-
                                   # badge echo can pin the holder's gate open
                                   # past speech end; after this many seconds
                                   # the floor force-releases into the guard,
                                   # breaking any runaway.  0 = unlimited.
+
+# Review finding #46 (2026-10-15): the pump loop had no idle timeout — on a
+# half-open TCP connection every 0.5 s recv just timed out and `continue`d
+# forever, leaking two threads and two sockets per direction for the process
+# lifetime.  A live channel always has PCM flowing (the relay streams
+# continuously, silence included), so this long of a gap means the peer is
+# gone; the pump returns and the bridge teardown closes the channel.
+CHANNEL_IDLE_TIMEOUT_S = 60
 
 
 def _fade(samples, kind, n):
@@ -2767,6 +3196,7 @@ def _pump_audio(src, dst, dst_lock, stop, entry, my_side, peer_side):
                                           # fade in when we resume
     chunks = opened = hd_muted = fl_muted = 0
     last_avg = last_stat = 0.0
+    last_data = time.time()   # last recv that returned bytes (finding #46)
     while not stop.is_set():
         # Gate stats every 5 s — tuning instrument for the thresholds.
         if time.time() - last_stat >= 5:
@@ -2781,11 +3211,22 @@ def _pump_audio(src, dst, dst_lock, stop, entry, my_side, peer_side):
         try:
             data = src.recv(4096)
         except socket.timeout:
+            # Review finding #46 (2026-10-15): this used to `continue`
+            # forever on a half-open peer — two threads and two sockets per
+            # direction, spinning for the process lifetime.  A live channel
+            # always has PCM flowing, so CHANNEL_IDLE_TIMEOUT_S of silence
+            # means the peer is gone: return and let the bridge teardown
+            # close the channel.
+            if time.time() - last_data >= CHANNEL_IDLE_TIMEOUT_S:
+                print(f"[computer] channel: no audio from {my_side} for "
+                      f"{CHANNEL_IDLE_TIMEOUT_S}s — closing")
+                return
             continue
         except OSError:
             return
         if not data:
             return                       # this side hung up (close gesture)
+        last_data = time.time()
         data  = carry + data
         cut   = len(data) // 2 * 2
         data, carry = data[:cut], data[cut:]
@@ -2920,6 +3361,13 @@ def _close_channel(entry):
 active_channels      = []            # live bridge entries (console `close`)
 active_channels_lock = threading.Lock()
 
+# Review finding #23 (2026-10-15): MACs currently in a live intercom
+# channel. handle_hail refuses new hails to these ("X is on another call")
+# instead of delivering hail audio mid-conversation and corrupting both
+# calls. Maintained by run_channel_bridge; read under busy_badges_lock.
+busy_badges      = set()
+busy_badges_lock = threading.Lock()
+
 
 def run_channel_bridge(entry, caller_mac, target_mac):
     """Caller-thread half of the bridge.  Sends b'O' to both sides (the
@@ -2939,6 +3387,20 @@ def run_channel_bridge(entry, caller_mac, target_mac):
     entry["bridge_ready"].set()
     with active_channels_lock:
         active_channels.append(entry)
+    # Review finding #23 (2026-10-15): the pending_hails registration used
+    # to survive until the channel CLOSED (handle_hail's finally), so a hail
+    # landing on a badge already in a channel overwrote the entry mid-call,
+    # and a tap on that badge claimed the WRONG hail — both calls corrupted.
+    # The registration now dies the moment the bridge opens, and both
+    # parties are marked busy so handle_hail refuses new hails with
+    # "X is on another call" instead of delivering them mid-conversation.
+    with pending_hails_lock:
+        for m in (caller_mac, target_mac):
+            if pending_hails.get(m) is entry:
+                del pending_hails[m]
+    with busy_badges_lock:
+        busy_badges.add(caller_mac)
+        busy_badges.add(target_mac)
     try:
         _pump_audio(caller_conn, answer_conn, entry["lock_answer"], entry["stop"],
                     entry, my_side="caller", peer_side="answer")
@@ -2947,6 +3409,9 @@ def run_channel_bridge(entry, caller_mac, target_mac):
         with active_channels_lock:
             if entry in active_channels:
                 active_channels.remove(entry)
+        with busy_badges_lock:
+            busy_badges.discard(caller_mac)
+            busy_badges.discard(target_mac)
     print(f"[computer] CHANNEL CLOSED {caller_mac} <-> {target_mac}")
 
 
@@ -3008,9 +3473,17 @@ def claim_pending_hail(mac):
         if entry is None:
             return None
         losers = [m for m, e in pending_hails.items() if e is entry]
+        now = time.time()
+        # Review finding #24 (2026-10-15): answered_elsewhere entries were
+        # only removed when that badge next tapped, so a badge that never
+        # tapped again leaked its entry forever.  Sweep entries older than
+        # ANSWERED_ELSEWHERE_S on every insert.
+        for m in [m for m, (_, ts) in answered_elsewhere.items()
+                  if now - ts > ANSWERED_ELSEWHERE_S]:
+            del answered_elsewhere[m]
         for m in losers:
             del pending_hails[m]
-            answered_elsewhere[m] = (mac, time.time())
+            answered_elsewhere[m] = (mac, now)
     for m in losers:
         _downlink_signal(m, b"E")
     if losers:
@@ -3075,6 +3548,21 @@ def handle_hail(conn, caller_mac, targets, phrase, rec, pcm, mac_to_aliases):
     if len(reachable) < len(targets):
         print(f"[computer] [{caller_mac}] no downlink, not hailed: "
               f"{', '.join(m for m in targets if m not in reachable)}")
+
+    # --- 1b. targets already in a live channel? (review finding #23) ---
+    # A hail delivered mid-conversation plays over the call on the target's
+    # speaker AND overwrites pending_hails, so the target's next tap claims
+    # the wrong hail — both calls corrupted. Refuse with a spoken
+    # "X is on another call" instead of delivering.
+    with busy_badges_lock:
+        busy = [m for m in reachable if m in busy_badges]
+    if busy:
+        busy_names = ", ".join(badge_name(m, mac_to_aliases) for m in busy)
+        print(f"[computer] [{caller_mac}] hail target on another call: {', '.join(busy)}")
+        reachable = [m for m in reachable if m not in busy]
+        if not reachable:
+            send_voice(conn, f"{busy_names} is on another call.", caller_mac)
+            return
 
     # Prewarm the targets NOW: the caller is still speaking and the silence
     # gate hasn't run yet — several seconds the target relays can spend
@@ -3332,6 +3820,67 @@ def console_loop():
 # Entry point
 # ---------------------------------------------------------------------------
 
+# Review finding #47 (2026-10-15): no socket had SO_KEEPALIVE or a send
+# timeout — dead-peer detection on a half-open connection took minutes (TCP
+# retransmit timeouts), not seconds, and a pump thread stuck in sendall
+# under a per-socket lock could hang the console `close` too.  Every
+# accepted socket gets liveness tuning at accept time (this covers tap,
+# downlink, and channel sockets — they all originate there):
+#   SO_KEEPALIVE ... on, with conservative kernel probe timers, so a dead
+#                    peer is eventually probed and failed instead of held
+#                    half-open forever;
+#   SO_SNDTIMEO .... modest, so a send to a dead peer fails in seconds
+#                    instead of hanging.  This matters most in the window
+#                    before a phase installs its own timeout — e.g. the
+#                    b'M'/b'G' sends in run_downlink, which happen before
+#                    that path's settimeout(KEEPALIVE_S).
+# Per-phase settimeout() calls (which also set SO_SNDTIMEO) may widen the
+# send timeout afterwards; that is intended — this is the floor.
+_SNDTIMEO_S  = 10   # modest send timeout, seconds
+_KEEPIDLE_S  = 60   # idle seconds before the first keepalive probe
+_KEEPINTVL_S = 10   # seconds between probes
+_KEEPCNT     = 6    # failed probes before the peer is declared dead
+
+
+def _tune_socket(conn):
+    """Apply socket-level liveness tuning to a freshly accepted socket."""
+    try:
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass
+    # Conservative kernel keepalive probes (POSIX names; no-ops where the
+    # platform lacks them).  Worst case a dead peer is noticed after about
+    # _KEEPIDLE_S + _KEEPINTVL_S * _KEEPCNT of silence.
+    for opt, val in ((getattr(socket, "TCP_KEEPIDLE", None), _KEEPIDLE_S),
+                     (getattr(socket, "TCP_KEEPINTVL", None), _KEEPINTVL_S),
+                     (getattr(socket, "TCP_KEEPCNT", None), _KEEPCNT)):
+        if opt is None:
+            continue
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, opt, val)
+        except OSError:
+            pass
+    if sys.platform == "win32":
+        # Windows has no TCP_KEEPIDLE-style sockopts; SIO_KEEPALIVE_VALS
+        # takes (keepalive_time_ms, keepalive_interval_ms).
+        try:
+            conn.ioctl(socket.SIO_KEEPALIVE_VALS,
+                       (_KEEPIDLE_S * 1000, _KEEPINTVL_S * 1000))
+        except OSError:
+            pass
+    # Modest send timeout, packed per platform: struct timeval on POSIX,
+    # DWORD milliseconds on Windows.
+    try:
+        if sys.platform == "win32":
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
+                            struct.pack("I", _SNDTIMEO_S * 1000))
+        else:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
+                            struct.pack("ll", _SNDTIMEO_S, 0))
+    except OSError:
+        pass
+
+
 def main():
     global large_model
 
@@ -3368,12 +3917,20 @@ def main():
         sys.exit(f"Large model dir not found: {large_path}")
 
     print(f"[computer] loading Vosk model {model_path}...")
-    model = Model(model_path)   # takes ~1–3 s; model is reused for all connections
+    try:
+        model = Model(model_path)   # takes ~1–3 s; model is reused for all connections
+    except Exception as e:
+        # Review finding #78 (2026-10-15): a corrupt/incomplete model dir
+        # used to die here as an inscrutable traceback.  Say what's wrong.
+        sys.exit(f"Could not load Vosk model from {model_path}: {e}")
     if large_path:
         # Tens of seconds and gigabytes.  Announced because the server is
         # unresponsive while it happens and silence here looks like a hang.
         print(f"[computer] loading LARGE Vosk model {large_path} (slow, one time)...")
-        large_model = Model(large_path)
+        try:
+            large_model = Model(large_path)
+        except Exception as e:
+            sys.exit(f"Could not load large Vosk model from {large_path}: {e}")
         # Registered BEFORE the commands banner below, so it appears in it.
         # Playback needs no large model itself, but pairing it with the
         # recording half keeps the log commands appearing and disappearing
@@ -3443,8 +4000,16 @@ def main():
     # SO_REUSEADDR: allow restarting the server immediately after a crash or
     # Ctrl-C without waiting ~60 s for the OS to reclaim the port.
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", PORT))
-    srv.listen(8)   # room for several relays connecting/probing concurrently
+    try:
+        srv.bind(("0.0.0.0", PORT))
+    except OSError as e:
+        # Review finding #78 (2026-10-15): EADDRINUSE on Linux used to be a
+        # bare traceback.  Say what's wrong and how to fix it.
+        sys.exit(f"Could not bind port {PORT}: {e} "
+                 f"(another server running? set SDK_SERVER_PORT)")
+    srv.listen(64)  # Review finding #50 (2026-10-15): 8 was small for a
+                    # multi-relay fleet power-cycling at once (tap + downlink
+                    # per relay at boot) — backlog overflow meant RSTs.
     # 1 s timeout on accept() so Ctrl-C is delivered between accept attempts.
     # Without this, Winsock's accept() blocks indefinitely on Windows and
     # KeyboardInterrupt is never delivered.
@@ -3454,8 +4019,24 @@ def main():
         while True:
             try:
                 conn, addr = srv.accept()
+                try:
+                    _tune_socket(conn)   # Review finding #47 (2026-10-15):
+                                         # SO_KEEPALIVE + modest send timeout
+                                         # on every accepted socket.
+                except OSError:
+                    pass   # tuning is best-effort; the socket still works
             except socket.timeout:
                 continue   # no connection this second — loop back and check for Ctrl-C
+            except OSError as e:
+                # Review finding #8 (2026-10-15): on Windows a client RST
+                # sitting in the backlog makes accept() raise OSError
+                # (WSAECONNABORTED), which used to propagate out of main()
+                # and kill the whole server — every channel, every downlink.
+                # Log it, back off briefly so a port-scan storm can't spin
+                # the loop, and keep serving.
+                print(f"[computer] accept() failed ({e}) — continuing", file=sys.stderr)
+                time.sleep(0.1)
+                continue
             # One daemon thread per connection: multiple badges (PAN + BOX
             # transceivers, startup probes, future downlinks) are served
             # concurrently and never block each other.  Daemon threads die

@@ -216,6 +216,14 @@ def click(button=None):
     The reference target locks its destination on the button-DOWN edge, so the
     up event is protocol hygiene rather than part of the aim.
     """
+    # Review finding #73 (2026-10-15): (button or BUTTON).lower() raised
+    # AttributeError on a non-string from a miswired caller, escaping the
+    # voice-command handler. Refuse non-strings explicitly, consistent with
+    # the REFUSED pattern below.
+    if button is not None and not isinstance(button, str):
+        print(f"[clicker] REFUSED: button must be a string, got "
+              f"{type(button).__name__}")
+        return False
     button = (button or BUTTON).lower()
     if button not in BUTTONS:
         print(f"[clicker] REFUSED: {button!r} is not a known button")

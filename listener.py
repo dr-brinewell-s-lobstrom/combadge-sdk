@@ -54,17 +54,21 @@ loop plus the persistent downlink (sdk/INTERCOM.md Phase 2); while SCO is up,
 btmon watches for the tap that ends a recording or closes a channel (Phase 10).
 """
 import atexit
+import errno
 import fcntl
 import os
 import pty
 import re
 import select
+import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import traceback
 import wave
 
 import evdev   # pip install evdev  (Linux only — reads badge HID key events)
@@ -223,22 +227,77 @@ except OSError:
 _print    = print
 _log_lock = threading.Lock()
 
+# Review finding #58 (2026-10-15): the old code opened/appended/closed the
+# log file on EVERY print with no rotation -- a weeks-long listener on a
+# small disk filled it.  Now one persistent handle, line-flushed (so the
+# sshfs-served log stays live-readable from CUBE), rotated at
+# LOG_MAX_BYTES with one .1 generation kept.
+LOG_MAX_BYTES = 10 * 1024 * 1024
+
+_log_fp    = None
+_log_bytes = 0
+
+
+def _log_open():
+    global _log_fp, _log_bytes
+    try:
+        _log_fp = open(LOG_FILE, "a")
+        _log_fp.seek(0, os.SEEK_END)
+        _log_bytes = _log_fp.tell()
+    except OSError:
+        _log_fp, _log_bytes = None, 0
+
+
+def _log_rotate():
+    global _log_fp, _log_bytes
+    if _log_fp is None:
+        _log_open()
+        if _log_fp is None:
+            return
+    if _log_bytes < LOG_MAX_BYTES:
+        return
+    try:
+        _log_fp.close()
+    except OSError:
+        pass
+    try:
+        os.replace(LOG_FILE, LOG_FILE + ".1")
+    except OSError:
+        pass
+    _log_fp, _log_bytes = None, 0
+    _log_open()
+
 
 def print(*args, **kwargs):   # noqa: A001 — deliberate shadow, see above
+    global _log_fp, _log_bytes   # the OSError path below resets the handle
     line    = " ".join(str(a) for a in args)
     stamped = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [{BADGE_MAC}] {line}"
     _print(stamped, **kwargs)
     with _log_lock:
+        _log_rotate()
+        if _log_fp is None:
+            return
         try:
-            with open(LOG_FILE, "a") as f:
-                f.write(stamped + "\n")
+            _log_fp.write(stamped + "\n")
+            _log_fp.flush()
+            _log_bytes += len(stamped.encode("utf-8")) + 1
         except OSError:
-            pass
+            try:
+                _log_fp.close()
+            except OSError:
+                pass
+            _log_fp = None
 
 
 # ---------------------------------------------------------------------------
 # Timing constants
 # ---------------------------------------------------------------------------
+# Review finding #65 (2026-10-15): every deadline/debounce/interval in this
+# file uses time.monotonic(), not wall-clock time.time().  An NTP step (or a
+# manual clock change) used to stretch/compress RECORD_MAX_S, the tap
+# debounce windows, the prewarm/hail/channel timers, and the SCO hold
+# linger.  Wall clock survives only in log timestamps (time.strftime) and
+# the onboarding flag file -- never in interval math.
 
 # Ignore taps that arrive within this many seconds of the previous tap.
 # The badge can emit spurious key events when the SCO link tears down; 2 s
@@ -332,10 +391,13 @@ SCO_HOLD_MS = 5000
 HOLD_TAP_GUARD_S = 0.5
 # An AT+CHUP inside this many seconds of btmon starting for a cycle is the tap
 # that STARTED the cycle, reported once more, rather than a tap meaning "stop".
-# btmon starts as soon as the capture is live, which is also the moment a tap
-# stops being a key event and becomes AT+CHUP -- so without this guard the
-# starting tap could end its own cycle, and with btmon started later (as it
-# was before 2026-09-13) a tap in between was seen by nobody at all.
+# RETIRED by review finding #60 (2026-10-15): the 0.3 s "the tap that started
+# this cycle" window is gone -- it swallowed genuine second taps.  The
+# starting tap is now excluded by IDENTITY: it is always consumed before the
+# cycle's btmon loop runs (an evdev key event on the cold path; poll_taps()
+# or _play_cuttable plus claim()'s drain on the reuse paths), so any tap
+# the loop sees is genuine.  Kept as a named constant (unused) so old logs
+# and docs referencing the value still resolve.
 TAP_CANCEL_GUARD_S = 0.3
 # How long a REUSED cycle waits before playing "Listening.", so the badge's
 # own chirp is out of the way first.
@@ -422,6 +484,12 @@ PUSH_VOLUME = float(os.environ.get("SDK_PUSH_VOLUME", "1.0"))
 # hold another badge's announcement. Waits at most ANNOUNCE_WAIT_S: a listener
 # stuck mid-playback must not silence the rest. Not used for a prewarmed hail
 # (hot path, already live).
+#
+# Review finding #42 (2026-10-15): SDK_ANNOUNCE_LOCK MUST POINT AT A LOCAL
+# FILESYSTEM (the /tmp default is fine).  fcntl.flock is advisory-only and
+# unreliable over sshfs/NFS -- worst case two hosts' badges talk over each
+# other -- and a hung network-filesystem call in __enter__ is NOT bounded
+# by ANNOUNCE_WAIT_S below.  Never point this at the shared sdk/ mount.
 ANNOUNCE_LOCK_FILE = os.environ.get("SDK_ANNOUNCE_LOCK", "/tmp/sdk_announce.lock")
 ANNOUNCE_WAIT_S = 20.0
 
@@ -435,13 +503,13 @@ class host_announce_turn:
         except OSError as e:
             print(f"[listener] announcement lock unavailable ({e}) -- playing anyway")
             return self
-        deadline = time.time() + ANNOUNCE_WAIT_S
+        deadline = time.monotonic() + ANNOUNCE_WAIT_S
         while True:
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return self
             except BlockingIOError:
-                if time.time() > deadline:
+                if time.monotonic() > deadline:
                     print(f"[listener] another badge held the announcement turn "
                           f"over {ANNOUNCE_WAIT_S:.0f} s -- playing anyway")
                     return self
@@ -483,6 +551,93 @@ downlink_up = threading.Event()   # set while the downlink is established
 # Audio playback helpers
 # ---------------------------------------------------------------------------
 
+def run_cmd(args, **kwargs):
+    """subprocess.run() that treats a timeout as a logged failure, not a crash.
+
+    Review finding #1 (2026-10-15): every subprocess.run(..., timeout=...)
+    call in this file could raise subprocess.TimeoutExpired, which is NOT an
+    OSError, so none of the surrounding except-OSError handlers caught it.
+    When PipeWire wedges or pactl hangs (common on Bluetooth adapter resets),
+    the timeout killed the whole listener process (or the downlink thread).
+
+    Now a timeout returns a CompletedProcess with returncode -1 and whatever
+    partial output was captured, so callers can react the same way they react
+    to a nonzero exit. Nothing here raises for a slow child anymore.
+    """
+    try:
+        return subprocess.run(args, **kwargs)
+    except subprocess.TimeoutExpired as e:
+        cmd = " ".join(args) if isinstance(args, (list, tuple)) else str(args)
+        print(f"[listener] COMMAND TIMEOUT — {cmd} exceeded "
+              f"{kwargs.get('timeout')}s; treating as failure, continuing",
+              file=sys.stderr)
+        out, err = e.stdout, e.stderr
+        if kwargs.get("text") or kwargs.get("universal_newlines"):
+            # TimeoutExpired captures raw BYTES even when the child ran in
+            # text mode (verified on Python 3.12); decode so text=True
+            # callers (the HFP sink poll below) get the str they expect and
+            # don't blow up on `SINK in r.stdout`.
+            out = (out or b"").decode("utf-8", "replace")
+            err = (err or b"").decode("utf-8", "replace")
+        return subprocess.CompletedProcess(args, -1, stdout=out, stderr=err)
+
+
+# ---------------------------------------------------------------------------
+# Temp WAV files (finding #65, 2026-10-15)
+# ---------------------------------------------------------------------------
+# play_silence() and read_voice_payload() buffer WAVs to temp files (pw-play
+# needs a path) and unlink them in a finally -- but a SIGKILL between
+# mkstemp and unlink leaves them in /tmp forever, and SIGKILL can't be
+# caught.  So each process makes its temp WAVs in its own
+# /tmp/combadge-wav-<pid>/ dir, and at startup we reap the dirs of pids
+# that no longer exist.  A live sibling listener's dir is never touched
+# (its pid answers os.kill(pid, 0)).
+def _wav_tmpdir():
+    d = os.path.join(tempfile.gettempdir(), f"combadge-wav-{os.getpid()}")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return tempfile.gettempdir()   # fall back to shared /tmp, unreaped
+    return d
+
+
+def _reap_stale_wav_tmpdirs():
+    tmp = tempfile.gettempdir()
+    try:
+        names = os.listdir(tmp)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith("combadge-wav-"):
+            continue
+        try:
+            pid = int(name.rsplit("-", 1)[1])
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass                       # dead -- reap below
+        except OSError:
+            continue                   # alive (or unjudgeable) -- leave it
+        else:
+            continue                   # alive -- leave it
+        d = os.path.join(tmp, name)
+        try:
+            for fn in os.listdir(d):
+                if fn.endswith(".wav"):
+                    try:
+                        os.unlink(os.path.join(d, fn))
+                    except OSError:
+                        pass
+            os.rmdir(d)
+            print(f"[listener] reaped stale temp-WAV dir {d}")
+        except OSError:
+            pass
+
+
 def play_silence(ms):
     """Play `ms` milliseconds of 16 kHz mono silence through the badge speaker.
 
@@ -501,7 +656,7 @@ def play_silence(ms):
     if ms <= 0:
         return
     samples = int(16000 * ms / 1000)
-    fd, path = tempfile.mkstemp(suffix=".wav")
+    fd, path = tempfile.mkstemp(suffix=".wav", dir=_wav_tmpdir())
     os.close(fd)
     try:
         with wave.open(path, "w") as wf:
@@ -509,9 +664,9 @@ def play_silence(ms):
             wf.setsampwidth(2)       # 16-bit signed PCM samples
             wf.setframerate(16000)   # 16 kHz sample rate (HFP standard)
             wf.writeframes(b"\x00\x00" * samples)
-        subprocess.run(["pw-play", "--target", SINK,
-                        "--media-role=communication", path],
-                       check=False, capture_output=True, timeout=5)
+        run_cmd(["pw-play", "--target", SINK,
+                 "--media-role=communication", path],
+                check=False, capture_output=True, timeout=5)
     finally:
         try:
             os.unlink(path)
@@ -540,10 +695,10 @@ def play_wav(path, prime=True, volume=0.5):
     if prime:
         play_silence(PRIME_MS)
     t0 = time.monotonic()
-    r = subprocess.run(["pw-play", "--target", SINK,
-                        "--media-role=communication",
-                        "--volume", str(volume), path],
-                       check=False, capture_output=True, timeout=15)
+    r = run_cmd(["pw-play", "--target", SINK,
+                 "--media-role=communication",
+                 "--volume", str(volume), path],
+                check=False, capture_output=True, timeout=15)
     check_playback(path, time.monotonic() - t0, r)
 
 
@@ -650,6 +805,29 @@ def play_wav_cold(path, volume=0.5):
         terminate_ffmpeg(ffmpeg)
 
 
+def _read_wav_header(proc, timeout_s):
+    """Read ffmpeg's 44-byte WAV header with a select() timeout.
+
+    Review finding #4 (2026-10-15): the tap cycle used to read the header
+    with a bare blocking read(44 - len) and no timeout -- if ffmpeg hung
+    without exiting and without writing 44 bytes (e.g. blocked writing
+    PulseAudio errors to its stderr pipe), the read blocked FOREVER while
+    holding audio_lock.  Now the wait is bounded: a stall returns b"" and
+    the capture fails instead of wedging the badge.  Shared by
+    start_sco_capture() and the tap cycle.
+    """
+    header = b""
+    while len(header) < 44:
+        r, _, _ = select.select([proc.stdout], [], [], timeout_s)
+        if not r:
+            return b""          # timeout: ffmpeg stalled
+        chunk = proc.stdout.read(44 - len(header))
+        if not chunk:
+            return b""          # EOF: ffmpeg exited
+        header += chunk
+    return header
+
+
 def start_sco_capture(timeout_s=10):
     """Open ffmpeg against the badge mic and wait for SCO to come up.
 
@@ -668,19 +846,15 @@ def start_sco_capture(timeout_s=10):
         ["ffmpeg", "-f", "pulse", "-i", SOURCE,
          "-ar", "16000", "-ac", "1", "-f", "wav",
          "-loglevel", "quiet", "pipe:1"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        # Review finding #4 (2026-10-15): stderr was a PIPE nobody ever
+        # read -- ffmpeg blocked writing PulseAudio errors could stall the
+        # header wait below forever.  DEVNULL: nothing consumes it.
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
-    header = b""
-    while len(header) < 44:
-        r, _, _ = select.select([ffmpeg.stdout], [], [], timeout_s)
-        if not r:
-            terminate_ffmpeg(ffmpeg)
-            return None
-        chunk = ffmpeg.stdout.read(44 - len(header))
-        if not chunk:
-            terminate_ffmpeg(ffmpeg)
-            return None
-        header += chunk
+    header = _read_wav_header(ffmpeg, timeout_s)
+    if len(header) < 44:
+        terminate_ffmpeg(ffmpeg)
+        return None
     # Kept on the process: a prewarmed hail hands this capture to the SCO hold,
     # and the next cycle sends the header ahead of its PCM as if it had just
     # opened the source (the server discards the first 44 bytes either way).
@@ -717,7 +891,7 @@ def tap_blocked_reason(now=None):
     about a link-drop re-fire arriving in milliseconds, the debounce about a
     second press inside a ten-second voice cycle.
     """
-    now = now or time.time()
+    now = now or time.monotonic()
     if now - _tap_clock["teardown"] < TEARDOWN_TAP_GUARD_S:
         return (f"within {TEARDOWN_TAP_GUARD_S}s of the hold's teardown, read as a "
                 f"link-drop re-fire")
@@ -779,12 +953,30 @@ class _ScoHold:
             self.timer = None
 
     def _stop_drain(self):
+        """Signal the drain thread to exit and wait up to 1 s for it.
+
+        Returns True when the drain thread has exited (or was never
+        running), False when it is still stuck.
+
+        Review finding #62 (2026-10-15): the old code joined with a timeout
+        and then carried on regardless.  A _pump stuck in a blocking read
+        (ffmpeg stalled, not dead) survived the join, and claim() handed
+        the pipe to the new cycle while the old pump was still reading --
+        PCM bytes split between two readers, corrupted audio to the server.
+        Callers now check the return: drop()/begin() close the pipe first
+        (the proc is being reaped, so that is safe) to unblock the reader;
+        claim() refuses to hand over a poisoned pipe and drops the hold
+        instead, so the tap takes the full cold path.
+        """
         if self._stop is not None:
             self._stop.set()
         if self._drain is not None and self._drain is not threading.current_thread():
             self._drain.join(timeout=1)
+            if self._drain.is_alive():
+                return False    # stuck in a blocking read -- see finding #62
         self._stop = None
         self._drain = None
+        return True
 
     def _pump(self, proc, stop):
         while not stop.is_set():
@@ -811,19 +1003,27 @@ class _ScoHold:
             self.btmon = (None, None)
             print(f"[listener] SCO hold: capture ended on its own after {held:.0f}ms "
                   f"(badge dropped the link?) -- resyncing with a teardown")
-            _tap_clock["teardown"] = time.time()
+            _tap_clock["teardown"] = time.monotonic()
             force_sco_teardown()
 
     def begin(self, proc, header, btmon, btmon_buf):
         """Take the cycle's live capture and btmon; linger SCO_HOLD_MS."""
         with self.lock:
             self._cancel_timer()
-            self._stop_drain()
             if self.proc is not None and self.proc is not proc:
+                # Finding #62: the old capture is being reaped -- close its
+                # pipe first so a _pump blocked in read unblocks and exits;
+                # the join in _stop_drain then reaps it instead of leaving a
+                # second reader on a pipe nobody owns anymore.
+                try:
+                    self.proc.stdout.close()
+                except (OSError, ValueError):
+                    pass
+                self._stop_drain()
                 terminate_ffmpeg(self.proc)
             self.proc, self.header = proc, header
             self.btmon, self.btmon_buf = btmon, btmon_buf
-            self.began = time.time()
+            self.began = time.monotonic()
             self.up_at = time.monotonic()
             self._stop = threading.Event()
             self._drain = threading.Thread(target=self._pump, args=(proc, self._stop),
@@ -844,9 +1044,37 @@ class _ScoHold:
                 return None
             self.idle.clear()
             self._cancel_timer()
-            self._stop_drain()
+            # Finding #62: the new cycle takes over reading this pipe, so
+            # the fd must stay open -- but a drain stuck in a blocking read
+            # would then split PCM with the new cycle.  If it won't stop,
+            # the pipe is poisoned: drop the hold instead of handing it
+            # over, and the tap takes the full cold path.
+            if not self._stop_drain():
+                print("[listener] SCO hold: drain thread would not stop -- "
+                      "dropping the hold rather than handing over a pipe "
+                      "with two readers")
+                self.drop("drain would not stop")
+                return None
             proc, self.proc = self.proc, None
             btmon, self.btmon = self.btmon, (None, None)
+            # Review finding #60 (2026-10-15): the tap that started this
+            # cycle was already consumed -- via poll_taps() on the hold-tap
+            # path, or via _play_cuttable on the hail-answer path -- so any
+            # bytes still queued on the btmon fd predate the new cycle and
+            # can only re-fire the STARTING tap (a line split across two pty
+            # reads, or an undrained backlog past poll_taps()' 64 KB cap).
+            # Drain them here: TAP IDENTITY, not a time window, decides what
+            # belongs to this cycle.  A genuinely new tap arrives after the
+            # claim and is seen by the cycle's own drains.
+            fd = btmon[1]
+            if fd is not None:
+                try:
+                    while select.select([fd], [], [], 0)[0]:
+                        if not os.read(fd, 65536):
+                            break
+                except OSError:
+                    pass
+            self.btmon_buf = ""
             held = (time.monotonic() - self.up_at) * 1000 if self.up_at else 0
             self.up_at = None
             print(f"[listener] SCO hold: reused after {held:.0f}ms -- no bring-up cost")
@@ -868,6 +1096,13 @@ class _ScoHold:
             self._cancel_timer()
             if self.proc is None:
                 return
+            # Finding #62: close the pipe first so a _pump blocked in read
+            # on a stalled ffmpeg unblocks and exits; _stop_drain's join then
+            # reaps it instead of abandoning a second reader on the pipe.
+            try:
+                self.proc.stdout.close()
+            except (OSError, ValueError):
+                pass
             self._stop_drain()
             terminate_ffmpeg(self.proc)
             self.proc = None
@@ -877,7 +1112,7 @@ class _ScoHold:
             self.up_at = None
             print(f"[listener] SCO hold: released after {held:.0f}ms ({reason})")
             if teardown:
-                _tap_clock["teardown"] = time.time()
+                _tap_clock["teardown"] = time.monotonic()
                 force_sco_teardown()
 
 
@@ -891,6 +1126,12 @@ atexit.register(_sco_hold.drop, "shutdown")
 # main() runs the cycle on the live link the downlink left in the hold.
 _answer_r, _answer_w = os.pipe()
 os.set_blocking(_answer_r, False)
+# Review finding #63 (2026-10-15): the write end was blocking while the
+# read end was not.  Single-byte writes never block in practice, but if the
+# consumer ever stalls with a full pipe, a blocking write here would wedge
+# the downlink thread mid-hail.  Both ends non-blocking now; the write site
+# treats BlockingIOError as "a wakeup is already pending".
+os.set_blocking(_answer_w, False)
 
 
 def _discard_backlog(proc):
@@ -929,8 +1170,21 @@ def force_sco_teardown():
     hold is reaped first.
     """
     _sco_hold.drop("teardown", teardown=False)
-    subprocess.run(["pactl", "set-card-profile", CARD, "off"],
-                   capture_output=True, timeout=5)
+    # Review finding #21 (2026-10-15): the drop above runs with
+    # teardown=False, so _tap_clock["teardown"] was never bumped here —
+    # only the hold's own teardown path set it. Spurious key events the
+    # teardown emits AFTER the device is closed sailed past the stale
+    # TAP_DEBOUNCE and started ghost tap cycles (chirp plays, silence
+    # streamed). Bump the clock so the teardown guard swallows them.
+    _tap_clock["teardown"] = time.monotonic()
+    run_cmd(["pactl", "set-card-profile", CARD, "off"],
+            capture_output=True, timeout=5)
+
+
+# How long ensure_hfp_profile() waits for the HFP sink to reappear after the
+# profile switch (finding #40): slow USB adapters / loaded Pis need longer
+# than the old fixed 7.5 s.  Configurable via SDK_HFP_WAIT_S.
+HFP_WAIT_S = float(os.environ.get("SDK_HFP_WAIT_S", "7.5"))
 
 
 def ensure_hfp_profile():
@@ -951,17 +1205,25 @@ def ensure_hfp_profile():
       via D-Bus and the sink appears shortly after.  Polling for the sink
       every 0.5 s returns as soon as it's ready rather than wasting time on
       a fixed sleep that may be too short or unnecessarily long.
+
+    Review finding #40 (2026-10-15): the old fixed 7.5 s budget was too
+    short for slow USB adapters / loaded Pis, and -- worse -- a False
+    return let the cycle continue anyway, so the chirp routed to the
+    DEFAULT sink (possibly another badge's, or laptop speakers) with only
+    a WARNING.  The budget is now SDK_HFP_WAIT_S (default 7.5 s), and the
+    tap cycle ABORTS on False instead of playing to the wrong device.
     """
-    subprocess.run(["pactl", "set-card-profile", CARD, "headset-head-unit"],
-                   capture_output=True, timeout=5)
-    for _ in range(15):   # up to 7.5 s total wait
-        r = subprocess.run(["pactl", "list", "sinks", "short"],
-                           capture_output=True, text=True, timeout=5)
+    run_cmd(["pactl", "set-card-profile", CARD, "headset-head-unit"],
+            capture_output=True, timeout=5)
+    tries = max(1, int(HFP_WAIT_S / 0.5))
+    for _ in range(tries):   # up to HFP_WAIT_S total
+        r = run_cmd(["pactl", "list", "sinks", "short"],
+                    capture_output=True, text=True, timeout=5)
         if r.returncode == 0 and SINK in r.stdout:
             return True
         time.sleep(0.5)
-    print("[listener] WARNING: HFP sink did not reappear after profile switch",
-          file=sys.stderr)
+    print(f"[listener] WARNING: HFP sink did not reappear within {HFP_WAIT_S:.1f}s "
+          f"of the profile switch", file=sys.stderr)
     return False
 
 
@@ -989,26 +1251,56 @@ def find_badge_input():
     Note: this function requires the process to be in the `input` group
     (arranged by transceiver.py via `sg input`) to open HID devices.
     """
+    fallback = []   # finding #41: unscoped fallback candidates, decided below
     for path in evdev.list_devices():
         try:
             dev = evdev.InputDevice(path)
         except OSError:
             continue   # device vanished or we lack permission; skip it
-        if BADGE_ADAPTER and (dev.phys or "").strip().lower() != BADGE_ADAPTER:
-            continue   # another adapter's device -- possibly the other badge
-        if "TNG COMBADGE" in dev.name.upper():
-            return path
-        # Fallback: identify by the key codes the badge emits on single-tap.
-        caps = dev.capabilities(verbose=False)
-        keys = caps.get(evdev.ecodes.EV_KEY, [])
-        if evdev.ecodes.KEY_PAUSECD in keys or 200 in keys:
-            return path
-    return None
+        try:
+            if BADGE_ADAPTER and (dev.phys or "").strip().lower() != BADGE_ADAPTER:
+                continue   # another adapter's device -- possibly the other badge
+            if "TNG COMBADGE" in dev.name.upper():
+                return path
+            # Fallback: identify by the key codes the badge emits on single-tap.
+            caps = dev.capabilities(verbose=False)
+            keys = caps.get(evdev.ecodes.EV_KEY, [])
+            if evdev.ecodes.KEY_PAUSECD in keys or 200 in keys:
+                if BADGE_ADAPTER:
+                    return path   # phys already matched above; unambiguous
+                fallback.append(path)
+        finally:
+            # Finding #65: don't leak the fd -- the caller reopens by path.
+            try:
+                dev.close()
+            except OSError:
+                pass
+    # Review finding #41 (2026-10-15): with BADGE_ADAPTER unset the old
+    # fallback latched onto the FIRST device reporting KEY_PAUSECD/keycode
+    # 200 -- on a two-badge host that could be the OTHER badge's node, so
+    # taps triggered the wrong badge's cycle.  The phys match is already
+    # enforced above whenever the adapter is known; when it isn't, refuse
+    # to guess between multiple candidates rather than pick wrong.
+    if len(fallback) > 1:
+        print(f"[listener] REFUSING unscoped input fallback: {len(fallback)} "
+              f"candidates ({', '.join(fallback)}) -- set BADGE_ADAPTER",
+              file=sys.stderr)
+        return None
+    return fallback[0] if fallback else None
 
 
 # ---------------------------------------------------------------------------
 # Voice response reception
 # ---------------------------------------------------------------------------
+
+# Review finding #57 (2026-10-15): read_voice_payload() trusted the 4-byte
+# size header unconditionally -- a corrupt/malicious server could send a
+# huge length and the relay would spool it to a temp file until the disk
+# filled or the connection dropped.  Cap: 16 kHz mono 16-bit is 32 KB/s,
+# so 8 MB is ~4 minutes of audio -- far past the 15-30 s these frames
+# carry, far short of a disk-fill.
+VOICE_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
+
 
 def read_voice_payload(sock):
     """Read one framed voice payload from a socket into a temp WAV file.
@@ -1020,8 +1312,11 @@ def read_voice_payload(sock):
     Returns the temp file path (caller is responsible for deleting it), or
     None if the connection closed before the size header completed.  A
     payload cut short by a premature close still returns the partial file —
-    play whatever arrived.  Shared by the tap-cycle voice response and the
-    downlink's pushed-audio path, which play through different sequences.
+    play whatever arrived.  Raises ValueError if the declared size exceeds
+    VOICE_PAYLOAD_MAX_BYTES (finding #57) -- callers treat that as a
+    protocol error, not a playable payload.  Shared by the tap-cycle voice
+    response and the downlink's pushed-audio path, which play through
+    different sequences.
     """
     size_hdr = b""
     while len(size_hdr) < 4:
@@ -1030,9 +1325,13 @@ def read_voice_payload(sock):
             return None   # connection closed before we got the full header
         size_hdr += chunk
     remaining = int.from_bytes(size_hdr, "big")
+    if remaining > VOICE_PAYLOAD_MAX_BYTES:
+        raise ValueError(
+            f"voice payload declares {remaining} bytes, over the "
+            f"{VOICE_PAYLOAD_MAX_BYTES}-byte cap -- refusing (finding #57)")
 
     # Buffer the WAV payload to a temp file (pw-play requires a file path).
-    fd, path = tempfile.mkstemp(suffix=".wav")
+    fd, path = tempfile.mkstemp(suffix=".wav", dir=_wav_tmpdir())
     os.close(fd)
     with open(path, "wb") as f:
         while remaining > 0:
@@ -1059,7 +1358,7 @@ def _discard_btmon(watch):
 
 
 def _play_cuttable(path, watch, volume=0.5, max_s=15):
-    """Play a spoken answer that a tap can cut off.  Returns the time.time()
+    """Play a spoken answer that a tap can cut off.  Returns the time.monotonic()
     of the cutting tap, or 0.0 if the answer played to the end.
 
     Also plays a prewarmed HAIL (volume=PUSH_VOLUME, a longer cap -- a hail
@@ -1088,7 +1387,7 @@ def _play_cuttable(path, watch, volume=0.5, max_s=15):
 
     if tapped(0):
         print("[listener] tap — answer cut off before it began")
-        return time.time()
+        return time.monotonic()
     t0 = time.monotonic()
     proc = subprocess.Popen(["pw-play", "--target", SINK,
                              "--media-role=communication",
@@ -1103,7 +1402,7 @@ def _play_cuttable(path, watch, volume=0.5, max_s=15):
                 proc.wait()
             break
         if tapped(0.05):
-            cut_at = time.time()
+            cut_at = time.monotonic()
             terminate_ffmpeg(proc)   # SIGTERM, escalated to SIGKILL -- any process
             print(f"[listener] tap — answer cut off after {time.monotonic() - t0:.2f}s")
             return cut_at
@@ -1131,7 +1430,16 @@ def receive_voice_response(sock, watch=None):
       first ~200 ms of the voice response.  A single pw-play with no prime
       eliminates that gap entirely.
     """
-    path = read_voice_payload(sock)
+    path = None
+    try:
+        path = read_voice_payload(sock)
+    except ValueError as e:
+        # Review finding #57 (2026-10-15): over-cap frame from a corrupt/
+        # malicious server.  Log it, play nothing, and let the cycle end
+        # normally (it closes this socket right after) -- a bad frame must
+        # not kill the listener process.
+        print(f"[listener] voice response rejected: {e}", file=sys.stderr)
+        return 0.0
     if not path:
         return 0.0
     try:
@@ -1195,15 +1503,54 @@ def health_watch():
             text = ""
         if text == reported:
             continue
-        reported = text
         if not text:
+            reported = text
             continue                              # healthy: nothing to say
         data = text.encode("utf-8")[:65535]
+        # Review finding #64 (2026-10-15): the downlink socket carries a 15 s
+        # timeout, so a stalled server used to pin this reporter for the full
+        # timeout on EVERY 3 s poll.  Only send when the socket is immediately
+        # writable; otherwise defer to the next poll.  `reported` is updated
+        # only on a successful send, so a deferred report is retried.
+        try:
+            _, writable, _ = select.select([], [sock], [], 0)
+        except (OSError, ValueError):
+            writable = []
+        if not writable:
+            print("[listener] health report deferred -- downlink not writable")
+            continue
         try:
             sock.sendall(b"R" + len(data).to_bytes(2, "big") + data)
+            reported = text
             print(f"[listener] transceiver health reported: {text}")
         except OSError as e:
             print(f"[listener] health report not sent: {e}")
+
+
+def _supervise(name, fn):
+    """Run a daemon thread body forever, restarting it if it dies.
+
+    Review finding #20 (2026-10-15): downlink_loop and health_watch are
+    daemon threads, and any uncaught non-OSError (the TimeoutExpired cases
+    from finding #1, a release_warm -> force_sco_teardown raise, ...) used
+    to kill the thread with only a stderr traceback -- no hails, no
+    reconnect attempts, no offline announce, while taps kept working so the
+    badge LOOKED alive.  Now the body is wrapped: the death is logged with
+    a traceback and the loop restarts after 5 s.  The callers' try/finally
+    blocks (audio_lock, findings #2/#3) run before the exception reaches
+    here, so a restart never inherits a held lock.
+    """
+    while True:
+        try:
+            fn()
+            # A clean return shouldn't happen (both bodies loop forever),
+            # but if it does, don't spin: wait, then start over.
+            print(f"[listener] supervisor: {name} returned -- restarting in 5 s")
+        except BaseException as e:            # noqa: BLE001 -- the supervisor must survive anything
+            print(f"[listener] supervisor: {name} died: {e!r} -- restarting in 5 s",
+                  file=sys.stderr)
+            traceback.print_exc()
+        time.sleep(5)
 
 
 def downlink_loop():
@@ -1225,6 +1572,8 @@ def downlink_loop():
     restart is audible on the badge with no tap — the same behavior the
     mobile relay gets from its liveness poll.
     """
+    announced_startup_offline = False   # finding #18: announce once when the
+                                        # server is down at boot, not never
     while True:
         # --- connect + handshake ---
         sock = None
@@ -1236,6 +1585,17 @@ def downlink_loop():
             if sock:
                 sock.close()
             print(f"[listener] downlink unavailable ({e}); retry in {DOWNLINK_RETRY_S} s")
+            if not announced_startup_offline:
+                # Review finding #18 (2026-10-15): a server-down-at-boot
+                # relay used to sit here silently forever -- no taps (main()
+                # waited on downlink_up) and no offline announce (the
+                # UP->DOWN edge below only fires after a connect).  Announce
+                # once, then keep retrying quietly.
+                announced_startup_offline = True
+                try:
+                    play_pushed_voice(MAINCOMPUTER_OFFLINE_WAV, volume=0.5)
+                except Exception as e2:                  # noqa: BLE001 -- the retry loop must survive this
+                    print(f"[listener] startup offline announce failed: {e2}")
             time.sleep(DOWNLINK_RETRY_S)
             continue
 
@@ -1270,8 +1630,17 @@ def downlink_loop():
             first = None
             terse_greeting = True
             print("[listener] named badge — the server greets it by name")
-        else:
+        elif first is not None:
             play_pushed_voice(MAINCOMPUTER_ONLINE_WAV, volume=0.5)
+        else:
+            # Review finding #65 (2026-10-15): `first` is None on greeting
+            # timeout OR a dead socket.  The old code played the "online"
+            # announce anyway, then the service loop hit the dead socket and
+            # played the "offline" announce right after -- a double-announce
+            # flap.  Stay quiet instead: a live-but-slow socket just misses
+            # one announce; a dead socket gets its offline announce from the
+            # UP->DOWN edge below.
+            print("[listener] no greeting byte -- skipping the online announce")
 
         # Prewarm state: on b'W' the server says "audio is coming for this
         # badge in a few seconds" (a hail is being captured).  We bring SCO
@@ -1296,7 +1665,7 @@ def downlink_loop():
         # --- service loop ---
         try:
             while True:
-                if warm and time.time() > warm_expires:
+                if warm and time.monotonic() > warm_expires:
                     print("[listener] prewarm expired — releasing badge")
                     release_warm()
                 if first:
@@ -1310,14 +1679,26 @@ def downlink_loop():
                     continue          # keepalive — the recv above reset the timeout
                 if sig == b"W":
                     if warm:
-                        warm_expires = time.time() + PREWARM_MAX_S
+                        warm_expires = time.monotonic() + PREWARM_MAX_S
                         continue      # already warm — just extend the window
                     print("[listener] prewarm — bringing SCO up")
                     audio_lock.acquire()
-                    ensure_hfp_profile()
-                    warm = start_sco_capture()
+                    try:
+                        # Review finding #2 (2026-10-15): this acquire was
+                        # manual, so an exception from ensure_hfp_profile()
+                        # or start_sco_capture() skipped the release below
+                        # and leaked audio_lock forever — every future tap
+                        # cycle blocks on it and the downlink thread dies.
+                        # A setup exception is now a failed prewarm: release
+                        # the lock and take the cold path.
+                        ensure_hfp_profile()
+                        warm = start_sco_capture()
+                    except Exception as e:          # noqa: BLE001 — prewarm must never wedge the badge
+                        print(f"[listener] prewarm setup raised {e!r} — "
+                              f"will fall back to cold path")
+                        warm = None
                     if warm:
-                        warm_expires = time.time() + PREWARM_MAX_S
+                        warm_expires = time.monotonic() + PREWARM_MAX_S
                     else:
                         print("[listener] prewarm failed — will fall back to cold path")
                         force_sco_teardown()
@@ -1354,7 +1735,7 @@ def downlink_loop():
                     # send either; older listeners log them as unknown bytes
                     # and keep chirping.
                     if sig == b"H":
-                        hail_pending["until"] = time.time() + HAIL_PENDING_MAX_S
+                        hail_pending["until"] = time.monotonic() + HAIL_PENDING_MAX_S
                         print("[listener] hail pending -- next tap answers it")
                     else:
                         hail_pending["until"] = 0.0
@@ -1386,26 +1767,60 @@ def downlink_loop():
                                 # teardown chirp to wait through first.
                                 print("[listener] pushed voice received — playing "
                                       "(prewarmed); a tap now answers it")
-                                bpid, bfd = _start_btmon()
-                                watch = {"fd": bfd, "buf": ""}
-                                cut_at = _play_cuttable(path, watch,
-                                                        volume=PUSH_VOLUME, max_s=30)
-                                if watch.get("dead"):
-                                    _stop_btmon(bpid, bfd)
-                                    bpid = bfd = None
-                                proc, warm = warm, None
-                                if proc.poll() is None:
-                                    _discard_backlog(proc)
-                                    _sco_hold.begin(proc, getattr(proc, "sdk_header", b""),
-                                                    (bpid, bfd), watch["buf"])
-                                else:
-                                    _stop_btmon(bpid, bfd)
-                                    force_sco_teardown()
-                                audio_lock.release()
+                                bpid = bfd = None
+                                handed_off = False
+                                try:
+                                    bpid, bfd = _start_btmon()
+                                    watch = {"fd": bfd, "buf": ""}
+                                    cut_at = _play_cuttable(path, watch,
+                                                            volume=PUSH_VOLUME, max_s=30)
+                                    if watch.get("dead"):
+                                        _stop_btmon(bpid, bfd)
+                                        bpid = bfd = None
+                                    proc, warm = warm, None
+                                    if proc.poll() is None and bfd is not None:
+                                        _discard_backlog(proc)
+                                        _sco_hold.begin(proc, getattr(proc, "sdk_header", b""),
+                                                        (bpid, bfd), watch["buf"])
+                                        handed_off = True   # the hold owns btmon now
+                                    else:
+                                        # Review finding #19 (2026-10-15): when
+                                        # btmon failed to start, the old code
+                                        # parked a DEAF 5 s hold anyway -- no
+                                        # evdev key events while SCO is up and
+                                        # watch_fd() None, so a tap during the
+                                        # linger was silently swallowed.  Mirror
+                                        # the cycle's hold decision (which
+                                        # requires btmon_fd is not None): no
+                                        # btmon, no hold -- tear down instead.
+                                        if bfd is None:
+                                            print("[listener] hail hot path: btmon "
+                                                  "unavailable — tearing down, "
+                                                  "no deaf hold")
+                                        _stop_btmon(bpid, bfd)
+                                        force_sco_teardown()
+                                finally:
+                                    # Review finding #3 (2026-10-15): the
+                                    # release below used to be skipped when the
+                                    # hot path raised, leaking audio_lock
+                                    # forever and wedging every future tap
+                                    # cycle. The hold owns the btmon child
+                                    # only after begin(), so stop it here
+                                    # unless it was handed off.
+                                    if not handed_off:
+                                        _stop_btmon(bpid, bfd)
+                                    audio_lock.release()
                                 if cut_at:
                                     print("[listener] tap during the hail — answering")
                                     _tap_clock["last"] = cut_at
-                                    os.write(_answer_w, b"a")
+                                    try:
+                                        os.write(_answer_w, b"a")
+                                    except BlockingIOError:
+                                        # Finding #63: the write end is
+                                        # non-blocking now.  A full pipe means
+                                        # main() is already about to wake --
+                                        # the byte's only job -- so drop it.
+                                        pass
                             elif terse_greeting:
                                 terse_greeting = False
                                 print("[listener] greeting received — playing")
@@ -1422,6 +1837,11 @@ def downlink_loop():
                 print(f"[listener] unknown downlink byte: {sig!r}")
         except socket.timeout:
             print("[listener] downlink keepalive timeout — reconnecting")
+        except ValueError as e:
+            # Review finding #57 (2026-10-15): read_voice_payload() refused
+            # an over-cap frame -- the socket is now desynced, so drop it
+            # and reconnect rather than misparsing the rest of the stream.
+            print(f"[listener] downlink protocol error ({e}) — reconnecting")
         except OSError as e:
             print(f"[listener] downlink error: {e} — reconnecting")
         finally:
@@ -1444,7 +1864,10 @@ def downlink_loop():
                     play_pushed_voice(MAINCOMPUTER_OFFLINE_WAV, volume=0.5)
                 except Exception as e:                        # noqa: BLE001
                     print(f"[listener] offline announce failed: {e}")
-        time.sleep(1)   # brief pause, then the reconnect loop takes over
+        # Review finding #18 (2026-10-15): this was time.sleep(1), not the
+        # documented "retry every 5 s" (README §0) -- only the
+        # never-connected path used DOWNLINK_RETRY_S.  Now both do.
+        time.sleep(DOWNLINK_RETRY_S)   # brief pause, then the reconnect loop takes over
 
 
 # ---------------------------------------------------------------------------
@@ -1452,6 +1875,12 @@ def downlink_loop():
 # ---------------------------------------------------------------------------
 
 CHANNEL_TAP_GRACE_S = 1.0   # ignore badge taps in the first second of a channel
+# Review finding #43 (2026-10-15): a quiet-but-alive channel with no
+# keepalives must not be killed by a stale socket timeout -- but a truly
+# dead peer must not hold the channel forever either.  The socket timeout
+# is cleared on entry (below) and liveness is judged by an explicit idle
+# deadline instead: 6 missed 5 s server keepalives means the peer is gone.
+CHANNEL_IDLE_S = 30
 
 # Taps while SCO is up.  Neither gesture is an evdev event then; both arrive
 # on the HFP control channel, so btmon (under a pty) watches for them -- the
@@ -1466,6 +1895,37 @@ BTMON_HANGUP  = "AT+CHUP"
 _ANSI_RE      = re.compile(r"\x1b\[[0-9;]*m")
 
 
+def _resolve_hci_index():
+    """Return the current hci index (hci0/hci1/...) for BADGE_ADAPTER.
+
+    Review finding #39 (2026-10-15): a Bluetooth adapter replug/reset can
+    renumber hci0 -> hci1 while its ADDRESS stays stable.  The BADGE_HCI
+    captured at listener start then goes stale, `btmon -i <stale>` exits
+    immediately, and tap-to-end/tap-to-close is silently disabled ("tap-to-
+    end unavailable this cycle").  Resolve the index from the address fresh
+    at every _start_btmon(); on any failure fall back to BADGE_HCI (the old
+    behavior) rather than refusing to monitor at all.
+    """
+    if not BADGE_ADAPTER:
+        return BADGE_HCI
+    try:
+        r = run_cmd(["hciconfig", "-a"], capture_output=True, text=True,
+                    timeout=5)
+    except OSError:
+        return BADGE_HCI
+    if r.returncode != 0:
+        return BADGE_HCI
+    current = None
+    for line in (r.stdout or "").splitlines():
+        m = re.match(r"^(hci\d+):", line)
+        if m:
+            current = m.group(1)
+        elif current and "bd address:" in line.lower() \
+                and BADGE_ADAPTER in line.lower():
+            return current
+    return BADGE_HCI
+
+
 def _start_btmon():
     """Spawn btmon under a pty (line-buffered via stdbuf).  Returns
     (pid, master_fd) or (None, None) if unavailable.  The master fd is
@@ -1477,7 +1937,10 @@ def _start_btmon():
     if pid == 0:   # child
         # -i: this badge's adapter only.  Bare btmon sees every adapter, and a
         # hang-up tap on the other badge would end this badge's recording.
-        scope = ["-i", BADGE_HCI] if BADGE_HCI else []
+        # The index is resolved from the adapter ADDRESS here (finding #39):
+        # the address survives adapter resets, the hciN index does not.
+        hci = _resolve_hci_index()
+        scope = ["-i", hci] if hci else []
         try:
             os.execvp("stdbuf", ["stdbuf", "-oL", "btmon", *scope])
         except Exception:
@@ -1486,17 +1949,41 @@ def _start_btmon():
 
 
 def _stop_btmon(pid, fd):
+    # Review finding #6 (2026-10-15): the old single os.waitpid(WNOHANG)
+    # after SIGTERM essentially never reaped the child in the same
+    # microsecond it was signaled, so every tap cycle (and every channel,
+    # every prewarmed hail) left one <defunct> btmon zombie for the life
+    # of the listener. Now: give the child up to ~1 s to exit after
+    # SIGTERM, escalate to SIGKILL, and reap blocking so no zombie
+    # survives this call.
     if fd is not None:
         try:
             os.close(fd)
         except OSError:
             pass
-    if pid:
+    if not pid:
+        return
+    try:
+        os.kill(pid, 15)
+    except (OSError, ChildProcessError):
+        pass
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
         try:
-            os.kill(pid, 15)
-            os.waitpid(pid, os.WNOHANG)
-        except (OSError, ChildProcessError):
-            pass
+            wpid, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return                        # already reaped
+        if wpid == pid:
+            return                        # reaped
+        time.sleep(0.05)
+    try:
+        os.kill(pid, 9)                   # didn't exit: escalate
+    except (OSError, ChildProcessError):
+        pass
+    try:
+        os.waitpid(pid, 0)                # blocking reap — no zombie left
+    except (OSError, ChildProcessError):
+        pass
 
 
 def _btmon_taps(fd, buf):
@@ -1551,6 +2038,18 @@ def run_channel(sock, ffmpeg, btmon=(None, None), tap_at=0.0):
 
     Returns when the channel ends; the caller's normal teardown runs.
     """
+    # Review finding #43 (2026-10-15): this socket arrives with the tap
+    # cycle's 18 s settimeout (RECORD_MAX_S + 5).  A quiet-but-alive channel
+    # with no keepalives for 18 s used to raise socket.timeout, which the
+    # caller mislogged as "input device error" and killed a healthy channel.
+    # Clear it: the loop below select()s with a 0.5 s cadence and judges
+    # liveness by an explicit idle deadline (CHANNEL_IDLE_S), not by the
+    # socket timeout.
+    try:
+        sock.settimeout(None)
+    except OSError:
+        pass
+    last_rx = time.monotonic()
     # Player stderr goes to a log file (not DEVNULL) and its stdin pipe is
     # switched to NON-BLOCKING: a blocking write into a full pipe (pw-cat
     # dead or stalled) would freeze this whole loop — no uplink, no tap
@@ -1586,15 +2085,24 @@ def run_channel(sock, ffmpeg, btmon=(None, None), tap_at=0.0):
     # file with nothing saying which badge's player wrote them.
     pwcat_log_path = os.path.join(
         LOG_DIR, f"pwcat_{BADGE_MAC.replace(':', '_')}.log")
+    PWCAP_MAX_BYTES = 5 * 1024 * 1024   # finding #58: rotate past 5 MB
 
     def _pump_player_output(pipe):
         # Drain player output to pwcat.log via transient opens — handing the
         # child a file handle would keep the log locked (unreadable to other
         # processes when the dir is served over sshfs) for the child's whole
         # lifetime. Thread exits on player EOF.
+        #
+        # Review finding #58 (2026-10-15): this log used to accumulate
+        # forever.  Cap it: rotate to .1 past PWCAP_MAX_BYTES.
         try:
             for line in iter(pipe.readline, b''):
                 try:
+                    try:
+                        if os.path.getsize(pwcat_log_path) >= PWCAP_MAX_BYTES:
+                            os.replace(pwcat_log_path, pwcat_log_path + ".1")
+                    except OSError:
+                        pass   # missing log or rotate failed -- just append
                     with open(pwcat_log_path, "ab") as f:
                         f.write(line)
                 except OSError:
@@ -1657,20 +2165,31 @@ def run_channel(sock, ffmpeg, btmon=(None, None), tap_at=0.0):
     # meanwhile. 0.0 = nothing to wait for (the caller; a cold tap, since the
     # badge does not chirp on link-up).
     def _announce():
-        if tap_at:
-            _play_after_tap_chirp(CHANNEL_OPEN_WAV, tap_at, "Channel open.")
-        else:
-            play_wav(CHANNEL_OPEN_WAV, prime=False)
-        announce_mute_until[0] = time.time() + ANNOUNCE_TAIL_S
+        try:
+            if tap_at:
+                _play_after_tap_chirp(CHANNEL_OPEN_WAV, tap_at, "Channel open.")
+            else:
+                play_wav(CHANNEL_OPEN_WAV, prime=False)
+            announce_mute_until[0] = time.monotonic() + ANNOUNCE_TAIL_S
+        finally:
+            # Review finding #22 (2026-10-15): announce_mute_until started
+            # at +inf and only this thread lowered it after "Channel open."
+            # played -- if the thread died first (pw-play hang/raise), the
+            # channel loop kept sending SILENCE upstream forever, both sides
+            # hearing nothing, no error logged.  If the thread never got far
+            # enough to set the value, unmute now: the clip may not have
+            # played, so there is no tail to guard.
+            if announce_mute_until[0] == float("inf"):
+                announce_mute_until[0] = time.monotonic()
 
     threading.Thread(target=_announce, daemon=True).start()
-    opened  = time.time()
+    opened  = time.monotonic()
     closing = False
     close_tap_at = 0.0   # set when a TAP here closes the channel
     buf     = b""
     up_b = down_b = dropped_b = 0
     player_dead = False
-    last_beat   = time.time()
+    last_beat   = time.monotonic()
     # Uplink LEVEL, in the same unit the server's gate compares against
     # SDK_CHANNEL_GATE (mean |sample| of 16-bit PCM).
     #
@@ -1690,8 +2209,16 @@ def run_channel(sock, ffmpeg, btmon=(None, None), tap_at=0.0):
     lvl_nth = 0
     try:
         while True:
+            # Idle policy (finding #43): the socket timeout is None now, so
+            # a dead peer is detected by silence, not by exception.  The
+            # server keepalives every ~5 s; CHANNEL_IDLE_S of total silence
+            # means it is gone even if TCP hasn't noticed.
+            if time.monotonic() - last_rx > CHANNEL_IDLE_S:
+                print(f"[listener] channel: idle {CHANNEL_IDLE_S}s, no "
+                      f"keepalive -- peer presumed dead, closing")
+                break
             # Heartbeat: proves the loop is alive and shows audio movement.
-            if time.time() - last_beat >= 5:
+            if time.monotonic() - last_beat >= 5:
                 _avg = lvl_sum / lvl_n if lvl_n else 0.0
                 print(f"[listener] channel: up {up_b//1024}KB "
                       f"down {down_b//1024}KB dropped {dropped_b//1024}KB "
@@ -1699,7 +2226,7 @@ def run_channel(sock, ffmpeg, btmon=(None, None), tap_at=0.0):
                 lvl_sum = 0.0
                 lvl_n = 0
                 lvl_peak = 0
-                last_beat = time.time()
+                last_beat = time.monotonic()
             if not player_dead and player.poll() is not None:
                 print(f"[listener] channel: player exited rc={player.returncode} "
                       f"(see log/pwcat.log)")
@@ -1731,10 +2258,10 @@ def run_channel(sock, ffmpeg, btmon=(None, None), tap_at=0.0):
                     btmon_pid = btmon_fd = None
                     print("[listener] channel: btmon ended — tap close disabled")
                 elif (tapped and not closing
-                        and time.time() - opened > CHANNEL_TAP_GRACE_S):
+                        and time.monotonic() - opened > CHANNEL_TAP_GRACE_S):
                     print("[listener] channel close requested (tap)")
                     closing = True
-                    close_tap_at = time.time()
+                    close_tap_at = time.monotonic()
                     try:
                         sock.shutdown(socket.SHUT_WR)
                     except OSError:
@@ -1750,11 +2277,11 @@ def run_channel(sock, ffmpeg, btmon=(None, None), tap_at=0.0):
                 for ev in events:
                     if (ev.type == evdev.ecodes.EV_KEY
                             and ev.code in (200, 201) and ev.value == 1
-                            and time.time() - opened > CHANNEL_TAP_GRACE_S
+                            and time.monotonic() - opened > CHANNEL_TAP_GRACE_S
                             and not closing):
                         print("[listener] channel close requested (tap)")
                         closing = True
-                        close_tap_at = time.time()
+                        close_tap_at = time.monotonic()
                         try:
                             sock.shutdown(socket.SHUT_WR)
                         except OSError:
@@ -1786,7 +2313,7 @@ def run_channel(sock, ffmpeg, btmon=(None, None), tap_at=0.0):
                     try:
                         # Silence, same length, while "Channel open." plays
                         # and rings -- keeps the stream's timing intact.
-                        sock.sendall(data if time.time() >= announce_mute_until[0]
+                        sock.sendall(data if time.monotonic() >= announce_mute_until[0]
                                      else bytes(len(data)))
                     except OSError:
                         break
@@ -1810,6 +2337,7 @@ def run_channel(sock, ffmpeg, btmon=(None, None), tap_at=0.0):
                 data = sock.recv(4096)
                 if not data:
                     break                    # server closed — channel over
+                last_rx = time.monotonic()
                 buf += data
                 done = False
                 while buf:
@@ -1840,9 +2368,14 @@ def run_channel(sock, ffmpeg, btmon=(None, None), tap_at=0.0):
                             except OSError:
                                 pass         # player died; poll() logs it
                         continue
-                    print(f"[listener] channel: unexpected byte {kind!r}")
-                    done = True
-                    break
+                    # Review finding #59 (2026-10-15): any unexpected byte used
+                    # to tear down a live intercom (done = True) -- a future
+                    # server byte, or a single corrupt byte, killed the
+                    # channel.  Skip unknown single bytes like b'k' does;
+                    # framing resyncs on the next known byte.
+                    print(f"[listener] channel: unexpected byte {kind!r} -- skipping")
+                    buf = buf[1:]
+                    continue
                 if done:
                     break
     finally:
@@ -1913,11 +2446,11 @@ def _play_after_tap_chirp(path, tap_at, label, watch=None):
     only the tap that ended the recording, which must not cut its own
     answer.  A second tap made during the wait is lost with it, as on TOS.
     """
-    wait = tap_at + WARM_CHIRP_WAIT_S - time.time()
+    wait = tap_at + WARM_CHIRP_WAIT_S - time.monotonic()
     if wait > 0:
         time.sleep(wait)
     print(f"[listener] after the tap chirp: {label} at "
-          f"+{(time.time() - tap_at) * 1000:.0f}ms")
+          f"+{(time.monotonic() - tap_at) * 1000:.0f}ms")
     play_silence(PRIME_MS_LISTENING)
     if watch is None:
         play_wav(path, prime=False)
@@ -1943,9 +2476,9 @@ def _finish_tapped_recording(sock, tap_at, watch=None):
         sock.shutdown(socket.SHUT_WR)
     except OSError:
         pass
-    deadline = time.time() + TAP_FINALIZE_WAIT_S
+    deadline = time.monotonic() + TAP_FINALIZE_WAIT_S
     while True:
-        remaining = deadline - time.time()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             print(f"[listener] no verdict within {TAP_FINALIZE_WAIT_S}s")
             return None, 0.0
@@ -2015,7 +2548,14 @@ def _stream_and_handle_response(reuse=None):
         # --- Step 1: re-establish HFP profile ---
         # Fast no-op on first tap (profile already active from transceiver.py).
         # On subsequent taps, restores the profile that force_sco_teardown() disabled.
-        ensure_hfp_profile()
+        # Review finding #40 (2026-10-15): when the sink never reappears the
+        # cycle used to continue anyway and the chirp routed to the DEFAULT
+        # sink -- possibly another badge's, or the laptop speakers.  Abort
+        # the cycle instead of playing to the wrong device.
+        if not ensure_hfp_profile():
+            print("[listener] cycle ABORTED: HFP sink never appeared -- "
+                  "not playing to the wrong device", file=sys.stderr)
+            return
 
         # --- Step 2: start ffmpeg BEFORE playing the chirp ---
         # Opening bluez_input (the badge microphone) triggers SCO negotiation from
@@ -2027,7 +2567,11 @@ def _stream_and_handle_response(reuse=None):
             ["ffmpeg", "-f", "pulse", "-i", SOURCE,
              "-ar", "16000", "-ac", "1", "-f", "wav",
              "-loglevel", "quiet", "pipe:1"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            # Review finding #4 (2026-10-15): stderr=PIPE here was never
+            # read -- a stall writing to it wedged the header wait below
+            # forever.  DEVNULL, and the wait is select()-bounded (shared
+            # helper above) instead of a bare blocking read.
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
 
         # --- Step 3: wait for the 44-byte WAV header ---
@@ -2035,25 +2579,23 @@ def _stream_and_handle_response(reuse=None):
         # Its arrival means the SCO input path is live and pw-play will route to
         # the badge.  If ffmpeg exits early (badge disconnected), read() returns b""
         # and we fall through with an empty wav_header; the pipeline still runs
-        # but the chirp may not route to the badge.
-        wav_header = b""
-        while len(wav_header) < 44:
-            chunk = ffmpeg.stdout.read(44 - len(wav_header))
-            if not chunk:
-                break
-            wav_header += chunk
+        # but the chirp may not route to the badge.  Bounded by a select()
+        # timeout (finding #4) -- a stalled ffmpeg can no longer wedge the
+        # badge while holding audio_lock.
+        wav_header = _read_wav_header(ffmpeg, 10)
 
     # --- Step 3b: start watching for taps, BEFORE the chirp ---
     # The link is live from here, and a tap on a live link is AT+CHUP on
     # btmon, never a key event.  btmon used to start after the chirp (step 5b
     # until 2026-09-13), so a tap in between -- measured on TOS hardware at
     # +749 and +744 ms, well inside this stretch -- was seen by nobody.
-    # TAP_CANCEL_GUARD_S keeps the tap that started this cycle from ending it.
+    # (The old TAP_CANCEL_GUARD_S window that used to guard the starting tap
+    # here was retired by finding #60: the starting tap is excluded by
+    # identity now, not by a time window.)
     # A reused cycle already has the hold's btmon, still running.
     if not reused:
         btmon_pid, btmon_fd = (None, None) if game_mode.is_set() else _start_btmon()
         btmon_buf = ""
-    btmon_started = time.time()
     tap_ended = False
     tap_at = 0.0
     answer_cut = False   # a tap cut the spoken answer off; the cycle ends as a cancel
@@ -2074,7 +2616,7 @@ def _stream_and_handle_response(reuse=None):
     # b'O' and the channel announces itself with "Channel open."; a
     # "listening" first would promise a command that is not coming.  The tap
     # consumes the pending mark either way.
-    answering = time.time() < hail_pending["until"]
+    answering = time.monotonic() < hail_pending["until"]
     hail_pending["until"] = 0.0
     if answering:
         print("[listener] answering hail -- no listening chirp")
@@ -2085,7 +2627,7 @@ def _stream_and_handle_response(reuse=None):
         # clip had been played -- pw-play's own result is discarded here. A
         # figure near zero means it bailed; ~830 ms (160 ms prime + a 671 ms
         # clip) means it ran and the question is acoustic, not logical.
-        _t_chirp = time.time()
+        _t_chirp = time.monotonic()
         if reused:
             # Wait out the badge's own tap chirp -- see WARM_CHIRP_WAIT_S. The
             # recording is already live throughout, so this delays the CUE and
@@ -2093,7 +2635,7 @@ def _stream_and_handle_response(reuse=None):
             time.sleep(WARM_CHIRP_WAIT_S)
         play_silence(PRIME_MS_LISTENING)
         play_wav(LISTENING_WAV, prime=False)
-        print(f"[listener] listening chirp: {(time.time() - _t_chirp) * 1000:.0f}ms "
+        print(f"[listener] listening chirp: {(time.monotonic() - _t_chirp) * 1000:.0f}ms "
               f"({'reused link, after a ' + str(WARM_CHIRP_WAIT_S) + 's wait' if reused else 'cold link'})")
 
     # --- Step 5: connect to server ---
@@ -2121,8 +2663,11 @@ def _stream_and_handle_response(reuse=None):
         # way to produce corrupted-packet floods. The finally block below
         # already reaps properly; this early exit did not.
         terminate_ffmpeg(ffmpeg)
-        if reused:
-            _stop_btmon(btmon_pid, btmon_fd)   # the hold's btmon came with the capture
+        # Review finding #7 (2026-10-15): the btmon started at step 3b was
+        # only stopped for reused captures. A normal cycle's btmon leaked
+        # on EVERY failed connect — i.e. every tap while computer.py is
+        # down. Always stop it here (no-op when (None, None)).
+        _stop_btmon(btmon_pid, btmon_fd)
         return
 
     # --- Step 6: select() loop — stream audio and watch for server response ---
@@ -2137,9 +2682,9 @@ def _stream_and_handle_response(reuse=None):
     # If we try to send another audio chunk first, we get BrokenPipeError and
     # miss the signal.  select() tells us which fd is readable — check sock first.
     signal_byte = None
-    deadline = time.time() + RECORD_MAX_S
+    deadline = time.monotonic() + RECORD_MAX_S
     try:
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             fds = [ffmpeg.stdout, sock]
             if btmon_fd is not None:
                 fds.append(btmon_fd)
@@ -2155,7 +2700,7 @@ def _stream_and_handle_response(reuse=None):
                     # answer hold while the hailed badge decides).  Slide
                     # the recording deadline and keep streaming — the next
                     # non-keepalive byte is still the terminal signal.
-                    deadline = time.time() + RECORD_MAX_S
+                    deadline = time.monotonic() + RECORD_MAX_S
                     continue
                 if sig == b"V":
                     # NON-TERMINAL voice (voice onboarding, 2026-09-26): say
@@ -2191,7 +2736,7 @@ def _stream_and_handle_response(reuse=None):
                                 os.unlink(path)
                             except OSError:
                                 pass
-                    deadline = time.time() + RECORD_MAX_S
+                    deadline = time.monotonic() + RECORD_MAX_S
                     continue
                 if sig == b"O":
                     # Answered hail — this socket becomes the live intercom.
@@ -2236,13 +2781,17 @@ def _stream_and_handle_response(reuse=None):
                     btmon_pid = btmon_fd = None
                     print("[listener] btmon ended — tap-to-end unavailable this cycle")
                 elif tapped:
-                    if time.time() - btmon_started < TAP_CANCEL_GUARD_S:
-                        print("[listener] tap IGNORED — within "
-                              f"{TAP_CANCEL_GUARD_S}s of the cycle starting, read "
-                              f"as the tap that started it")
-                        continue
+                    # Review finding #60 (2026-10-15): the old
+                    # TAP_CANCEL_GUARD_S time window is gone.  It misread a
+                    # genuine second tap -- e.g. one landing just after
+                    # _play_cuttable returned on the hail-answer path -- as
+                    # "the tap that started the cycle" and swallowed it.
+                    # The starting tap is always consumed before this loop
+                    # runs (an evdev key event on the cold path; poll_taps()
+                    # or _play_cuttable plus claim()'s drain on the reuse
+                    # paths), so any tap seen here is genuine by identity.
                     tap_ended = True
-                    tap_at = time.time()
+                    tap_at = time.monotonic()
                     _drain_capture(ffmpeg)   # the link outlives the tap by one sound
                     watch = {"fd": btmon_fd, "buf": btmon_buf}
                     signal_byte, cut_at = _finish_tapped_recording(sock, tap_at, watch)
@@ -2383,10 +2932,65 @@ def _stream_and_handle_response(reuse=None):
 # Main loop
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Clean shutdown — review finding #5 (2026-10-15)
+# ---------------------------------------------------------------------------
+#
+# The old code caught only KeyboardInterrupt, and the atexit-registered
+# _sco_hold.drop() does NOT run on SIGTERM under the default disposition —
+# so systemd/sudo kills orphaned ffmpeg (badge mic stays live, SCO link
+# held open, badge battery drains), btmon children, and left the downlink
+# socket half-open on computer.py's side.  Tear the audio down explicitly
+# in the handler, then raise SystemExit: atexit handlers DO run on
+# SystemExit, so the registered drop() gets a second (no-op) pass.
+# _ScoHold.drop() takes an RLock, so calling it here is safe even if the
+# main thread currently holds that lock.
+_shutdown_requested = threading.Event()
+
+
+def _handle_term(signum, frame):
+    print(f"\n[listener] signal {signum} — shutting down cleanly")
+    _shutdown_requested.set()
+    try:
+        _sco_hold.drop("signal shutdown", teardown=True)
+    except Exception as e:                      # noqa: BLE001 — must not fail the shutdown path
+        print(f"[listener] teardown during signal shutdown failed: {e}")
+    raise SystemExit(0)
+
+
 def main():
+    # SIGTERM/SIGHUP arrive from systemd, sudo, kill, and the transceiver
+    # supervisor; give them the same clean teardown Ctrl+C gets.
+    signal.signal(signal.SIGTERM, _handle_term)
+    signal.signal(signal.SIGHUP, _handle_term)
+    signal.signal(signal.SIGINT, _handle_term)
     print(f"[listener] badge={BADGE_MAC}  server={SERVER_HOST}:{SERVER_PORT}")
     print(f"[listener] source={SOURCE}")
     print(f"[listener] sink={SINK}")
+
+    # Review finding #38 (2026-10-15): this file hard-assumes PipeWire --
+    # pw-play, pactl, and the bluez_input.<MAC> / bluez_output.<..>.1 /
+    # bluez_card.<..> naming are PipeWire(+pipewire-pulse)-specific.  On
+    # pure PulseAudio (or PipeWire without pipewire-pulse) pw-play doesn't
+    # exist and every announce/chirp was silently skipped while cycles ran
+    # "successfully" with no audio.  Probe at startup and fail fast with a
+    # clear message instead of degrading silently.
+    if shutil.which("pw-play") is None:
+        sys.exit("[listener] FATAL: pw-play not found -- this listener needs "
+                 "PipeWire (with pipewire-pulse for the pactl/bluez_* "
+                 "naming).  Install pipewire / pipewire-pulse and retry.")
+    _pactl_probe = run_cmd(["pactl", "info"], capture_output=True, timeout=5)
+    if _pactl_probe.returncode != 0:
+        sys.exit("[listener] FATAL: `pactl info` failed -- is the PipeWire/"
+                 "pipewire-pulse session running for this user?  Refusing "
+                 "to run deaf.")
+    del _pactl_probe
+
+    # Review finding #65 (2026-10-15): reap temp-WAV dirs left by listeners
+    # that died to SIGKILL (which can't run cleanup).  Live siblings' dirs
+    # are never touched.
+    _reap_stale_wav_tmpdirs()
+
     if BADGE_ADAPTER:
         print(f"[listener] adapter={BADGE_ADAPTER} ({BADGE_HCI or 'hci unknown'})")
     else:
@@ -2400,19 +3004,43 @@ def main():
 
     # Establish the persistent downlink (background thread).  It plays
     # maincomputeronline.wav on every successful (re)connect and services
-    # server-pushed audio for the life of the session.  The badge should
-    # not appear ready before there is a server, so wait for the first
-    # connect here before accepting taps.
-    threading.Thread(target=downlink_loop, daemon=True).start()
-    threading.Thread(target=health_watch, daemon=True).start()
-    print(f"[listener] waiting for downlink to {SERVER_HOST}:{SERVER_PORT} — "
-          f"start computer.py on that host if it isn't running...")
-    downlink_up.wait()
+    # server-pushed audio for the life of the session.
+    #
+    # Review finding #18 (2026-10-15): tap acceptance is NOT gated on the
+    # first downlink connect anymore.  The old downlink_up.wait() made a
+    # server-down-at-boot relay a brick -- no taps, no announcement, ever.
+    # Now taps work immediately (a tap with the server down just fails its
+    # connect and returns), and the downlink thread announces "main
+    # computer offline" once on startup failure, then every 5 s retry.
+    #
+    # Review finding #20 (2026-10-15): the daemon threads are supervised --
+    # _supervise() restarts a dead body with a logged traceback instead of
+    # letting it die silently -- and main()'s outer loop below watchdogs
+    # the supervisors themselves.
+    _daemons = {}
+    for _dname, _dfn in (("downlink", downlink_loop), ("health", health_watch)):
+        _t = threading.Thread(target=_supervise, args=(_dname, _dfn),
+                              daemon=True, name=f"listener-{_dname}")
+        _t.start()
+        _daemons[_dname] = _t
     print(f"[listener] tap badge once → chirp → speak a command")
 
     last_path = None
 
     while True:
+        # Watchdog (finding #20): the supervisors above restart dead bodies
+        # on their own, but if a supervisor thread itself ever dies, bring
+        # it back here rather than running half-blind.
+        for _dname, _t in list(_daemons.items()):
+            if not _t.is_alive():
+                print(f"[listener] watchdog: {_dname} supervisor dead -- restarting")
+                _nt = threading.Thread(
+                    target=_supervise,
+                    args=(_dname,
+                          downlink_loop if _dname == "downlink" else health_watch),
+                    daemon=True, name=f"listener-{_dname}")
+                _nt.start()
+                _daemons[_dname] = _nt
         # Re-discover the badge input device each iteration.  The /dev/input/
         # path can change on Bluetooth reconnection, so we look it up fresh.
         path = find_badge_input()
@@ -2420,7 +3048,12 @@ def main():
             if last_path:
                 print("[listener] badge input lost, searching...")
                 last_path = None
-            time.sleep(0.5)
+            # Review finding #65 (2026-10-15): the old 0.5 s poll re-ran the
+            # full /dev/input/eventX scan -- opening every node -- twice a
+            # second while the badge was gone.  Back off to 5 s; a badge
+            # reconnect takes seconds anyway, and the scan still runs every
+            # pass once a device is present.
+            time.sleep(5)
             continue
         if path != last_path:
             print(f"[listener] badge input at {path}, waiting for tap...")
@@ -2444,7 +3077,22 @@ def main():
                 # here too, on this same thread.
                 hold_fd = _sco_hold.watch_fd()
                 fds = [dev.fd, _answer_r] + ([hold_fd] if hold_fd is not None else [])
-                r, _, _ = select.select(fds, [], [], 0.5)
+                try:
+                    r, _, _ = select.select(fds, [], [], 0.5)
+                except OSError as e:
+                    # Review finding #61 (2026-10-15): hold_fd is snapshotted
+                    # before select, but the hold's timer thread can drop()
+                    # (closing that fd) mid-select -> EBADF.  Worse, the fd
+                    # NUMBER can be reused by another thread's new file/pty,
+                    # making select watch the wrong stream.  Re-read and
+                    # validate liveness: if the hold's fd changed or went
+                    # away, the fd set is stale -- rebuild it next pass.  A
+                    # genuinely bad fd propagates to the handler below.
+                    if e.errno != errno.EBADF:
+                        raise
+                    if _sco_hold.watch_fd() != hold_fd:
+                        continue   # stale fd set -- re-snapshot next pass
+                    raise
                 if not r:
                     continue   # no events in 0.5 s — loop back to select
 
@@ -2471,7 +3119,7 @@ def main():
                         continue
                     if not tapped:
                         continue
-                    if time.time() - _sco_hold.began < HOLD_TAP_GUARD_S:
+                    if time.monotonic() - _sco_hold.began < HOLD_TAP_GUARD_S:
                         print(f"[listener] tap IGNORED — within {HOLD_TAP_GUARD_S}s of "
                               f"the hold starting, read as a bounce of the tap that "
                               f"ended the cycle")
@@ -2481,7 +3129,7 @@ def main():
                         print("[listener] tap on a hold that has gone — taking the "
                               "full path on the next key event")
                         continue
-                    _tap_clock["last"] = time.time()
+                    _tap_clock["last"] = time.monotonic()
                     print("[listener] tap (held link)")
                     stream_and_handle_response(reuse)
                     break      # close and reopen the device, as after any cycle
@@ -2506,7 +3154,7 @@ def main():
                         if blocked:
                             print(f"[listener] tap IGNORED — {blocked}")
                             continue
-                        _tap_clock["last"] = time.time()
+                        _tap_clock["last"] = time.monotonic()
                         print("[listener] tap")
                         stream_and_handle_response()
                         # NOTE: we do NOT reset last_tap back to 0 here.

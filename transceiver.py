@@ -53,8 +53,23 @@ Adapters are identified by ADDRESS.  `hciN` numbering is not stable across
 boots with identical dongles; it is looked up fresh, and only used where a
 tool demands it (btmon -i).
 
-Usage:
-    sudo SDK_USER=$USER python3 transceiver.py [/path/to/listener.py]
+Usage (Review finding #29 (2026-10-15): the old example here,
+`sudo SDK_USER=$USER python3 transceiver.py`, re-introduced the exact sudo
+env-stripping footgun README section 0 warns about — SDK_SERVER_HOST was
+silently dropped and listeners waited on localhost instead of the real
+server; point at transceiver.sh, which forwards the vars inline):
+    ./transceiver.sh                        # SDK_USER inferred from SUDO_USER
+    SDK_SERVER_HOST=192.168.1.10 ./transceiver.sh
+    # optional overrides alongside it:
+    SDK_DETECT_INTERVAL=1 SDK_PAGE_GAP=10 ./transceiver.sh
+
+SUDO STRIPS THE ENVIRONMENT: every SDK_* variable must be given INLINE on
+the sudo command line, or handed to sudo by a launcher that does (this is
+what transceiver.sh does). An EXPORTED variable set before sudo vanishes,
+so e.g. `export SDK_SERVER_HOST=...; sudo python3 transceiver.py` leaves
+the listeners silently waiting on localhost instead of the real server
+(README §0). A bare `sudo SDK_USER=$USER python3 transceiver.py` forwards
+only SDK_USER — inline any other SDK_* vars you need the same way.
 
 Environment variables:
     SDK_USER            — the username to run listener.py as (required if not
@@ -124,21 +139,39 @@ import pty
 import pwd
 import re
 import select
+import shlex
 import signal
 import subprocess
 import sys
 import threading
 import time
 
+def _float_env(key, default):
+    """float(os.environ.get(key, default)) that survives garbage values.
+
+    Review finding #14 (2026-10-15): a typo like SDK_DETECT_INTERVAL=2s used
+    to raise ValueError at import and kill the transceiver (every badge
+    down) with a bare traceback. Now it warns on stderr and falls back to
+    the default.
+    """
+    try:
+        return float(os.environ.get(key, default))
+    except (ValueError, TypeError):
+        print(f"[transceiver] WARNING: {key}={os.environ.get(key)!r} is not "
+              f"a number -- using default {default}", file=sys.stderr)
+        return float(default)
+
+
+
 # How often the coordinator checks connectivity. This is the reconnect latency
 # you actually feel. See "Battery" above before setting it below 0.5.
-DETECT_INTERVAL = max(0.0, float(os.environ.get("SDK_DETECT_INTERVAL", "2")))
+DETECT_INTERVAL = max(0.0, _float_env("SDK_DETECT_INTERVAL", "2"))
 
 # How long the PAGE loop waits between sweeps while a badge is away. Each
 # attempt against an absent badge costs ~5 s of page timeout regardless of
 # this value, so the effective retry period is roughly 5 s per absent badge +
 # SDK_PAGE_GAP.
-PAGE_GAP = max(0.0, float(os.environ.get("SDK_PAGE_GAP", "5")))
+PAGE_GAP = max(0.0, _float_env("SDK_PAGE_GAP", "5"))
 
 # The pre-flight survey re-runs whenever BlueZ's object tree changes (cheap to
 # check every pass), and at least this often regardless, which is what catches
@@ -523,6 +556,12 @@ def enforce(assigned, evict, paired, live):
 HEALTH_FILE   = os.path.join(SCRIPT_DIR, "health.txt")
 _POWER_FAULTS = set()        # adapter addrs that would not power on (survey)
 _seen_adapters = set()       # every adapter present at some point this run
+# Review finding #75 (2026-10-15): consecutive-pass absence counts. One empty
+# busctl tree (a transient bluetoothd hiccup) used to mark adapters "lost"
+# permanently, flapping the spoken health sentence every time they reappeared.
+# An adapter is only declared lost after this many consecutive absences.
+_LOST_AFTER   = 3
+_lost_counts  = {}           # adapter addr -> consecutive passes absent
 _health_text  = None         # last sentence written (None = never written)
 
 
@@ -533,8 +572,17 @@ def _count_word(n):
 def update_health(adapters, orphans):
     """Recompute the health sentence; write HEALTH_FILE if it changed."""
     global _health_text
-    _seen_adapters.update(adapters)
-    lost = _seen_adapters - set(adapters) - _POWER_FAULTS
+    present = set(adapters)
+    _seen_adapters.update(present)
+    # Review finding #75 (2026-10-15): a single absent pass no longer marks
+    # an adapter lost — require _LOST_AFTER consecutive absences so a
+    # transient empty busctl tree doesn't flap the health sentence.
+    for a in _seen_adapters - present - _POWER_FAULTS:
+        _lost_counts[a] = _lost_counts.get(a, 0) + 1
+    for a in present | _POWER_FAULTS:
+        _lost_counts.pop(a, None)
+    lost = {a for a in _seen_adapters - present - _POWER_FAULTS
+            if _lost_counts.get(a, 0) >= _LOST_AFTER}
     parts = []
     if _POWER_FAULTS:
         n = len(_POWER_FAULTS)
@@ -595,8 +643,22 @@ def run_as_user(username, cmd):
     wrong session. If `pactl` works for you in a terminal but returns nothing
     here, this is why.
     """
+    # Review finding #33 (2026-10-15): XDG_RUNTIME_DIR alone is not enough.
+    # pactl/systemctl resolution used to depend on runuser's PATH handling
+    # and libdbus's XDG fallbacks — the exact "no cards, no error"
+    # silent-misdiagnosis mode this docstring warns about, one distro
+    # behavior change away. Pass the full explicit session env, the same
+    # set build_session_env() hands the listener.
+    pw  = pwd.getpwnam(username)
+    xdg = f"/run/user/{pw.pw_uid}"
     return run([RUNUSER, "-u", username, "--"] + cmd,
-               env={"XDG_RUNTIME_DIR": session_xdg(username)})
+               env={"XDG_RUNTIME_DIR":         xdg,
+                    "DBUS_SESSION_BUS_ADDRESS": f"unix:path={xdg}/bus",
+                    "HOME":                    pw.pw_dir,
+                    "USER":                    username,
+                    "LOGNAME":                 username,
+                    "PATH":                    os.environ.get(
+                        "PATH", "/usr/local/bin:/usr/bin:/bin")})
 
 
 _audio_services_ready = False
@@ -861,20 +923,37 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x01\x02\r]")
 _MACPAT = r"((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})"
 
 
+class _ClaimAbort(Exception):
+    """Raised when the claim session must stop (refused agent prompt)."""
+
+
+def _mac_forms(mac):
+    """The forms a MAC might take in bluetoothctl output: colons (interactive
+    lines, command echo) or underscores (object paths), either case."""
+    mac = mac.upper()
+    return (mac, mac.lower(),
+            mac.replace(":", "_"), mac.replace(":", "_").lower())
+
+
 def onboarding_disabled():
     return os.path.exists(ONBOARDING_OFF_FILE)
 
 
 class Bluetoothctl:
     """One interactive bluetoothctl session under a pty. Agent prompts --
-    which the NoInputNoOutput agent should never raise -- are answered "yes"
-    and logged loudly, since silence is the point of the design."""
+    which the NoInputNoOutput agent should never raise -- are answered only
+    when they name the badge being claimed, and refused otherwise."""
 
     def __init__(self):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.execvp(BTCTL_BIN, [BTCTL_BIN])
         self.buf = ""
+        self.target_mac = None   # set once claim_on knows which MAC to claim
+        self.seen = ""           # rolling window of ALL session output, for
+                                 # prompt gating (review #35): lines() consumes
+                                 # completed lines out of self.buf, so the MAC
+                                 # evidence would be gone by prompt time.
 
     def send(self, cmd):
         os.write(self.fd, (cmd + "\n").encode())
@@ -886,9 +965,14 @@ class Bluetoothctl:
             if not r:
                 continue
             try:
-                self.buf += os.read(self.fd, 4096).decode("utf-8", "replace")
+                chunk = os.read(self.fd, 4096).decode("utf-8", "replace")
             except OSError:
                 break
+            self.buf += chunk
+            # Bounded rolling window of everything the session has said (the
+            # prompt gate below needs it: completed lines are consumed out of
+            # self.buf, so the MAC evidence would be gone by prompt time).
+            self.seen = (self.seen + chunk)[-8192:]
             while "\n" in self.buf:
                 line, self.buf = self.buf.split("\n", 1)
                 line = _ANSI.sub("", line).strip()
@@ -896,9 +980,31 @@ class Bluetoothctl:
                     out.append(line)
             tail = _ANSI.sub("", self.buf)
             if re.search(r"\(yes/no\):\s*$", tail):
-                print(f"[transceiver] claim: AGENT PROMPT {tail.strip()!r} -- answering yes")
-                self.buf = ""
-                self.send("yes")
+                # Review finding #35 (2026-10-15): never blanket-yes a pairing
+                # prompt. The NoInputNoOutput agent should never raise one,
+                # but if a prompt arrives for some OTHER nearby device (a
+                # second badge mid-pair, a spoofed name), answering yes would
+                # pair it. Rules: (1) if the prompt itself names a device that
+                # is not the target -> refuse; (2) otherwise, only confirm
+                # when the session context references the badge being claimed
+                # (our `pair <MAC>` echo, bluetoothctl's replies); anything
+                # else -> refuse and abort the claim.
+                prompt_macs = {m.upper() for m in re.findall(_MACPAT, tail)}
+                names_stranger = bool(prompt_macs - {self.target_mac.upper()}
+                                      ) if self.target_mac else bool(prompt_macs)
+                if not names_stranger and self.target_mac and any(
+                        form in self.seen for form in _mac_forms(self.target_mac)):
+                    print(f"[transceiver] claim: AGENT PROMPT {tail.strip()!r} "
+                          "-- names the target badge, answering yes")
+                    self.buf = ""
+                    self.send("yes")
+                else:
+                    print(f"[transceiver] claim: AGENT PROMPT {tail.strip()!r} "
+                          "-- does NOT reference the target badge; refusing "
+                          "and aborting the claim")
+                    self.buf = ""
+                    self.send("no")
+                    raise _ClaimAbort("agent prompt for unknown device")
         return out
 
     def expect(self, patterns, timeout):
@@ -925,8 +1031,29 @@ class Bluetoothctl:
             os.close(self.fd)
         except OSError:
             pass
+        # Review finding #52 (2026-10-15): the old blocking waitpid(self.pid, 0)
+        # wedged the whole claim loop forever when bluetoothctl ignored SIGTERM
+        # (wedged on a stuck D-Bus call) — no further claiming for the rest of
+        # the run, silently. Poll with WNOHANG, escalate to SIGKILL (which a
+        # process cannot ignore), and only then wait blocking.
         try:
             os.kill(self.pid, signal.SIGTERM)
+        except OSError:
+            pass   # already gone; still reap it below
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            try:
+                pid, _ = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if pid:
+                return
+            time.sleep(0.1)
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
             os.waitpid(self.pid, 0)
         except (OSError, ChildProcessError):
             pass
@@ -957,6 +1084,12 @@ def claim_on(adapter, known):
         s.lines(0.5)
         if not found:
             return None
+        # Review #35: gate any agent prompt on this MAC, with a fresh context
+        # window — the scan output already listed this MAC (that's how we
+        # found it), so only the pair-phase context (our `pair <MAC>` echo,
+        # bluetoothctl's replies) may authorize a yes.
+        s.target_mac = found
+        s.seen = ""
         print(f"[transceiver] claim: new badge {found} seen on {adapter} -- claiming it")
         s.send(f"pair {found}")
         if s.expect([r"Pairing successful", r"Failed to pair", r"AlreadyExists"], 40) \
@@ -997,9 +1130,20 @@ def claim_loop():
             with _state_lock:
                 free = sorted(a for a in ADAPTERS if a not in ASSIGNED.values())
                 known = set(PAIRED)
+                live_badges = bool(LIVE)
             if not free:
                 say_once("claim", "[transceiver] claiming: every adapter has its badge -- "
                          "not scanning.")
+                time.sleep(CLAIM_GAP_S)
+                continue
+            if live_badges:
+                # Review finding #53 (2026-10-15): a 20 s inquiry scan is the
+                # most radio-aggressive Bluetooth activity there is, and the
+                # claim loop ran it on any free adapter with no check that
+                # other adapters weren't carrying live SCO audio. Hold the
+                # scan off while any badge is live; the next window retries.
+                say_once("claim", "[transceiver] claiming: holding off -- a badge "
+                         "is live and inquiry scans contend with live audio.")
                 time.sleep(CLAIM_GAP_S)
                 continue
             say_once("claim", f"[transceiver] claiming: open -- scanning {', '.join(free)} "
@@ -1071,20 +1215,46 @@ def launch_listener(mac, username, listener_path, env):
     # -u: unbuffered, so the listener's lines reach the console as they
     # happen. Block-buffered, a killed listener takes its last few KB of
     # output with it -- which is exactly the part that explains the kill.
+    # start_new_session=True (review finding #16, 2026-10-15): the whole
+    # runuser -> sg -> sh -c -> listener.py chain becomes its own process
+    # group, so _stop() can killpg() the entire tree.
+    # Review finding #32 (2026-10-15): this string goes through sh, so quote
+    # both parts — an unquoted path with spaces/metacharacters silently
+    # produced a garbled command: Popen reported success while no listener
+    # ever appeared.
     cmd = [RUNUSER, "-u", username, "--", "sg", "input", "-c",
-           f"{sys.executable} -u {listener_path}"]
+           f"{shlex.quote(sys.executable)} -u {shlex.quote(listener_path)}"]
     print(f"[transceiver] launching listener.py for {mac} on "
           f"{env['BADGE_ADAPTER']} ({env['BADGE_HCI']}) as {username}")
-    return subprocess.Popen(cmd, env=env)
+    return subprocess.Popen(cmd, env=env, start_new_session=True)
 
 
 def _stop(proc):
+    """Kill the whole listener process tree, not just the runuser parent.
+
+    Review finding #16 (2026-10-15): launch_listener() puts the runuser/sg/
+    sh/python chain in its own process group (start_new_session=True), so a
+    killpg here reaches every grandchild. The old proc.terminate() only
+    signaled the direct runuser child and orphaned the listener — still holding
+    /dev/input/eventX and the badge's audio — while the supervisor launched a
+    second listener for the same badge.
+    """
     if proc and proc.poll() is None:
-        proc.terminate()
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except OSError:
+            pass
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 class BadgeSupervisor(threading.Thread):
@@ -1106,6 +1276,12 @@ class BadgeSupervisor(threading.Thread):
         self.stop_evt = threading.Event()
         self.proc     = None
         self.adapter  = None   # adapter the running listener was scoped to
+        # Review finding #31 (2026-10-15): backoff state. A listener that
+        # dies instantly on every launch (missing module, bad perms, evdev
+        # error) used to be relaunched every DETECT_INTERVAL forever — fork
+        # churn + log spam burying the real error.
+        self._failures    = 0    # consecutive launches that died fast
+        self._launched_at = 0.0  # time of the most recent launch
 
     def _launch(self, adapter):
         with _state_lock:
@@ -1113,6 +1289,7 @@ class BadgeSupervisor(threading.Thread):
         env = build_session_env(self.mac, adapter, hci, self.username)
         self.proc    = launch_listener(self.mac, self.username, self.listener_path, env)
         self.adapter = adapter
+        self._launched_at = time.time()
         with _state_lock:
             RUNNING.add(self.mac)
 
@@ -1158,13 +1335,46 @@ class BadgeSupervisor(threading.Thread):
                             bz_call(path, DEVICE_IF, "Disconnect")
                         quarantine(mac)
                     else:
-                        ensure_no_badge_default(self.username)
-                        self._launch(adapter)
+                        # Review finding #51 (2026-10-15): ensure_audio_ready
+                        # can take ~30 s, during which the coordinator may
+                        # have re-assigned the badge (adapter flap). Re-read
+                        # the LIVE/ASSIGNED snapshot before launching and
+                        # abort if the badge is no longer live on THIS
+                        # adapter — otherwise the listener launches scoped to
+                        # the wrong adapter (stale BADGE_ADAPTER/BADGE_HCI:
+                        # wrong tap node, wrong btmon scope) and gets torn
+                        # down and relaunched next pass: churn plus a window
+                        # of mistargeted input.
+                        with _state_lock:
+                            live_now, mine_now = LIVE.get(mac), ASSIGNED.get(mac)
+                        adapter_now = (live_now
+                                       if live_now and live_now == mine_now else None)
+                        if adapter_now != adapter:
+                            print(f"[transceiver] {mac}: assignment changed "
+                                  f"during audio setup ({adapter} -> "
+                                  f"{adapter_now}); not launching")
+                            self._halt("assignment changed")
+                        else:
+                            ensure_no_badge_default(self.username)
+                            self._failures = 0   # fresh link, not a retry
+                            self._launch(adapter)
                 elif self.proc and self.proc.poll() is not None:
+                    # Review finding #31 (2026-10-15): exponential backoff
+                    # (capped at 5 min) on the crash loop. A listener that
+                    # stays up 60 s+ was healthy, so the counter resets; the
+                    # wait is stop_evt-aware so shutdown stays prompt.
+                    quick = time.time() - self._launched_at < 60
+                    self._failures = (self._failures + 1) if quick else 1
+                    backoff = max(0.5, min(DETECT_INTERVAL * 2 ** (self._failures - 1),
+                                           300.0))
                     print(f"[transceiver] {mac}: listener.py exited "
-                          f"({self.proc.returncode}); restarting")
-                    self._launch(adapter)
-                self.stop_evt.wait(DETECT_INTERVAL)
+                          f"({self.proc.returncode}); retrying in {backoff:.0f}s "
+                          f"(failure {self._failures})")
+                    self.stop_evt.wait(backoff)
+                    if not self.stop_evt.is_set():
+                        self._launch(adapter)
+                else:
+                    self.stop_evt.wait(DETECT_INTERVAL)
         except Exception as e:
             print(f"[transceiver] {mac}: supervisor error: {e}")
         finally:
@@ -1191,6 +1401,18 @@ def main():
     username = os.environ.get("SUDO_USER") or os.environ.get("SDK_USER")
     if not username:
         sys.exit("Set SDK_USER=<your user> or run via sudo (which sets SUDO_USER).")
+
+    # Review finding #15 (2026-10-15): validate the username ONCE, here in
+    # main() — not inside the supervisor threads. build_session_env() calls
+    # pwd.getpwnam(username), so a typo'd SDK_USER raised KeyError inside each
+    # supervisor, got swallowed by its keep-alive guard, and the coordinator
+    # respawned the thread every DETECT_INTERVAL: an infinite traceback
+    # storm with the badge never getting a listener. Fail loudly and once.
+    try:
+        pwd.getpwnam(username)
+    except KeyError:
+        sys.exit(f"[transceiver] unknown user {username!r} -- set SDK_USER to "
+                 "a valid username.")
 
     # Default: look for listener.py in the same directory as this script.
     listener_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
@@ -1227,63 +1449,81 @@ def main():
 
     try:
         while True:
-            tree = bluez_tree()
-            if tree is None:
-                say_once("bluez", "[transceiver] BlueZ is not answering on D-Bus "
-                                  "(is bluetoothd running?)")
+            try:
+                tree = bluez_tree()
+                if tree is None:
+                    say_once("bluez", "[transceiver] BlueZ is not answering on D-Bus "
+                                      "(is bluetoothd running?)")
+                    time.sleep(max(DETECT_INTERVAL, 1.0))
+                    continue
+                unsay("bluez")
+
+                # Pre-flight: on any change to BlueZ's objects, and periodically.
+                if tree != last_tree or time.time() - last_survey > SURVEY_INTERVAL:
+                    adapters, paired = survey(tree)
+                    last_tree, last_survey = tree, time.time()
+                    say_once("adapters", "[transceiver] adapters: " + (
+                        ", ".join(f"{a} ({v['hci']})" for a, v in sorted(adapters.items()))
+                        or "NONE"))
+
+                live = observe(paired)
+                with _state_lock:
+                    previous, running = dict(ASSIGNED), set(RUNNING)
+                assigned, evict, orphans = assign(adapters, paired, live, previous, running)
+                with _state_lock:
+                    ADAPTERS.clear(); ADAPTERS.update(adapters)
+                    PAIRED.clear();   PAIRED.update(paired)
+                    ASSIGNED.clear(); ASSIGNED.update(assigned)
+                    LIVE.clear();     LIVE.update(live)
+
+                say_once("assign", "[transceiver] assignment: "
+                         + _fmt_assignment(assigned, adapters))
+                if orphans:
+                    say_once("orphans", f"[transceiver] no adapter of its own for "
+                             f"{', '.join(orphans)} ({len(paired)} badges paired, "
+                             f"{len(adapters)} adapters) -- left unconnected. Two "
+                             "badges never share an adapter.")
+                else:
+                    unsay("orphans")
+                update_health(adapters, orphans)
+                if not adapters:
+                    say_once("idle", "[transceiver] no Bluetooth adapter is available.")
+                elif not paired:
+                    say_once("idle", "[transceiver] no TNG COMBADGE is paired to any "
+                                     "adapter on this host.")
+                else:
+                    unsay("idle")
+
+                if enforce(assigned, evict, paired, live):
+                    last_tree = None    # BlueZ changed under us: survey next pass
+
+                # One supervisor per assigned badge; retire the rest.
+                # Review finding #17 (2026-10-15): retire FIRST and join the
+                # retired supervisors (bounded) before spawning replacements.
+                # A re-assigned badge otherwise got a second supervisor while
+                # the old one was still inside ensure_audio_ready (up to ~30 s
+                # of sleeps), and both threads could _launch — two listener.py
+                # processes for one badge.
+                for mac in [m for m in supervisors if m not in assigned]:
+                    old = supervisors.pop(mac)
+                    old.stop_evt.set()
+                    old.join(timeout=2 * DETECT_INTERVAL)
+                for mac in assigned:
+                    if mac not in supervisors or not supervisors[mac].is_alive():
+                        supervisors[mac] = BadgeSupervisor(mac, username, listener_path)
+                        supervisors[mac].start()
+
+                time.sleep(DETECT_INTERVAL)
+
+            except Exception as e:      # noqa: BLE001 — the coordinator must never die
+                # Review finding #13 (2026-10-15): this was the ONE loop
+                # without a keep-alive guard — any unexpected exception in
+                # survey/observe/assign/enforce/supervisor bookkeeping took
+                # down the whole transceiver (every badge down). It now logs
+                # and continues, like the page/claim/supervisor loops.
+                say_once("coordinator-crash",
+                         f"[transceiver] coordinator pass failed ({e!r}) — continuing")
                 time.sleep(max(DETECT_INTERVAL, 1.0))
-                continue
-            unsay("bluez")
-
-            # Pre-flight: on any change to BlueZ's objects, and periodically.
-            if tree != last_tree or time.time() - last_survey > SURVEY_INTERVAL:
-                adapters, paired = survey(tree)
-                last_tree, last_survey = tree, time.time()
-                say_once("adapters", "[transceiver] adapters: " + (
-                    ", ".join(f"{a} ({v['hci']})" for a, v in sorted(adapters.items()))
-                    or "NONE"))
-
-            live = observe(paired)
-            with _state_lock:
-                previous, running = dict(ASSIGNED), set(RUNNING)
-            assigned, evict, orphans = assign(adapters, paired, live, previous, running)
-            with _state_lock:
-                ADAPTERS.clear(); ADAPTERS.update(adapters)
-                PAIRED.clear();   PAIRED.update(paired)
-                ASSIGNED.clear(); ASSIGNED.update(assigned)
-                LIVE.clear();     LIVE.update(live)
-
-            say_once("assign", "[transceiver] assignment: "
-                     + _fmt_assignment(assigned, adapters))
-            if orphans:
-                say_once("orphans", f"[transceiver] no adapter of its own for "
-                         f"{', '.join(orphans)} ({len(paired)} badges paired, "
-                         f"{len(adapters)} adapters) -- left unconnected. Two "
-                         "badges never share an adapter.")
-            else:
-                unsay("orphans")
-            update_health(adapters, orphans)
-            if not adapters:
-                say_once("idle", "[transceiver] no Bluetooth adapter is available.")
-            elif not paired:
-                say_once("idle", "[transceiver] no TNG COMBADGE is paired to any "
-                                 "adapter on this host.")
-            else:
-                unsay("idle")
-
-            if enforce(assigned, evict, paired, live):
-                last_tree = None    # BlueZ changed under us: survey next pass
-
-            # One supervisor per assigned badge; retire the rest.
-            for mac in assigned:
-                if mac not in supervisors or not supervisors[mac].is_alive():
-                    supervisors[mac] = BadgeSupervisor(mac, username, listener_path)
-                    supervisors[mac].start()
-            for mac in [m for m in supervisors if m not in assigned]:
-                supervisors.pop(mac).stop_evt.set()
-
-            time.sleep(DETECT_INTERVAL)
-
     except KeyboardInterrupt:
         print("[transceiver] shutting down")
         for sup in supervisors.values():
